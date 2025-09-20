@@ -15,6 +15,23 @@ import gc
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 
+# 设置模型别名前缀对应的开头与结尾提示
+MODEL_PROMPT_FORMATS = {
+    'qwen': ('<|im_start|>user\n', '<|im_end|>'),
+    'codellama': ('[INST]', '[/INST]'),
+    'llama': ('[INST]', '[/INST]'),
+    'mistral': ('[INST]', '[/INST]'),
+    'starchat': ('<|system|>\n<|end|>\n<|user|>', '<|end|>\n<|assistant|>'),
+}
+
+def get_prompt_format(model_key):
+    """根据模型key获取prompt格式"""
+    for key in MODEL_PROMPT_FORMATS:
+        if model_key.lower().startswith(key):
+            return MODEL_PROMPT_FORMATS[key]
+    # 默认格式
+    return '[INST]', '[/INST]'
+
 # 内存优化设置
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -22,10 +39,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, pipeline
 from peft import LoraConfig, get_peft_model, PeftModel, PeftConfig, prepare_model_for_kbit_training
-
-# Chain of LoRA代码已删除，使用标准LoRA
 
 # =========================
 # 数据加载
@@ -64,33 +79,72 @@ class CodeDataset(Dataset):
 # 工具：文本质量评估
 # =========================
 
-# 代码提取正则表达式
-CODE_FENCE_RE = re.compile(r'```(?:java|python|c\+\+|cpp|c|javascript|js)?\s*\n(.*?)\n```', re.DOTALL | re.IGNORECASE)
+def extract_first_cpp_code(s: str) -> str:
+    """从生成的文本中提取C++代码块，增强版本处理格式不规范的情况"""
+    # 首先尝试标准的```cpp格式
+    matches = re.findall(r'```cpp(.*?)```', s, re.DOTALL)
+    
+    # 如果没有标准格式，尝试```c++格式
+    if not matches:
+        matches = re.findall(r'```c\+\+(.*?)```', s, re.DOTALL)
+    
+    # 如果还没有，尝试纯```格式
+    if not matches:
+        matches = re.findall(r'```(.*?)```', s, re.DOTALL)
+    
+    if not matches:
+        # 最后尝试：如果没有代码块但包含#include，可能是裸代码
+        if '#include' in s:
+            return s.strip()
+        return ""
+    
+    def is_valid_cpp_code(code):
+        """判断是否为有效的C++代码"""
+        code = code.strip()
+        if not code:
+            return False
+        # 包含C++特征
+        cpp_features = ['#include', 'using namespace', 'int main', 'void ', 'class ', 'struct ']
+        return any(feature in code for feature in cpp_features)
+    
+    def clean_code(code):
+        """清理代码格式"""
+        lines = code.strip().split('\n')
+        # 移除空白行和过多的空格
+        cleaned_lines = []
+        for line in lines:
+            line = line.rstrip()  # 移除行尾空格
+            if line or (cleaned_lines and cleaned_lines[-1]):  # 保留有意义的空行
+                cleaned_lines.append(line)
+        return '\n'.join(cleaned_lines)
+    
+    # 尝试每个匹配的代码块
+    for i, code in enumerate(matches):
+        cleaned = clean_code(code)
+        if is_valid_cpp_code(cleaned):
+            return cleaned
+    
+    # 如果所有代码块都不理想，返回第一个清理后的代码
+    if matches:
+        return clean_code(matches[0])
+    
+    return ""
 
 def extract_code(text: str) -> str:
-    """从生成的文本中提取代码"""
+    """从生成的文本中提取代码，兼容原有逻辑"""
     # 确保输入是字符串
     text = str(text) if text is not None else ''
     
-    # 首先尝试标准的代码块提取
+    # 首先尝试使用新的C++代码块提取
+    cpp_code = extract_first_cpp_code(text)
+    if cpp_code:
+        return cpp_code
+    
+    # 如果没有C++代码块，尝试其他格式
+    CODE_FENCE_RE = re.compile(r'```(?:c\+\+|cpp|c)?\s*\n(.*?)\n```', re.DOTALL | re.IGNORECASE)
     matches = CODE_FENCE_RE.findall(text)
     if matches:
         return matches[0].strip()
-    
-    # 如果没有完整的代码块，尝试提取```cpp开头到```结尾的内容
-    if '```cpp' in text:
-        start_idx = text.find('```cpp') + 6  # 跳过```cpp
-        # 跳过换行符
-        while start_idx < len(text) and text[start_idx] in ['\n', '\r']:
-            start_idx += 1
-        
-        # 寻找结束的```
-        end_idx = text.find('```', start_idx)
-        if end_idx == -1:
-            code_part = text[start_idx:].strip()
-        else:
-            code_part = text[start_idx:end_idx].strip()
-        return code_part
     
     # 如果包含#include，可能是直接的C++代码
     if '#include' in text:
@@ -227,8 +281,8 @@ def compute_text_quality(ref_text: str, cand_text: str) -> Tuple[float, float, f
 # =========================
 @dataclass
 class CurriculumCfg:
-    start_temp: float = 1.0
-    end_temp: float = 0.6
+    start_temp: float = 1.2
+    end_temp: float = 0.8
     start_top_p: float = 0.95
     end_top_p: float = 0.8
     start_num: int = 6
@@ -258,8 +312,6 @@ def concat_and_prepare(tokenizer, prompt: str, candidate: str, device: torch.dev
     # 一次性上GPU
     input_ids = input_ids.to(device)
     return input_ids, cand_len
-
-# sequence_logprob 函数已删除，因为移除参考模型后不再需要
 
 def cleanup_cuda_memory(aggressive=False):
     """轻量清理：释放未引用缓存，避免碎片；不打印日志。"""
@@ -500,7 +552,7 @@ class TrainArgs:
     # 适合小数据集(1500条)的训练配置 - 内存优化版
     sft_epochs: int = 5          # 增加epoch补偿小batch size
     grpo_epochs: int = 3         # 增加GRPO训练轮数
-    sft_lr: float = 5e-5         # 提高学习率，加快收敛
+    sft_lr: float = 3e-5         # 适中学习率，小数据集+小batch
     grpo_lr: float = 1.5e-5      # 适中GRPO学习率
     sft_batch: int = 2           # 减小batch size节省显存
     
@@ -510,7 +562,7 @@ class TrainArgs:
     lora_dropout: float = 0.1      # 防过拟合的dropout
     
     # 生成和优化固定配置
-    max_new_tokens: int = 400
+    max_new_tokens: int = 1024
     kl_coef: float = 0.05
     grad_clip: float = 1.0
     seed: int = 42
@@ -545,6 +597,11 @@ class SFT_GRPO_Trainer:
     def __init__(self, args: TrainArgs):
         self.args = args
         random.seed(args.seed); torch.manual_seed(args.seed)
+        
+        # 获取模型的prompt格式
+        self.BOF, self.EOF = get_prompt_format(args.model_name)
+        print(f"🎯 Using prompt format for {args.model_name}: '{self.BOF}' ... '{self.EOF}'")
+        
         self.tokenizer = AutoTokenizer.from_pretrained(args.base_model)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -604,6 +661,11 @@ class SFT_GRPO_Trainer:
         )
         self.model = get_peft_model(base, lora)  # 不移动已经用device_map分布的模型
         print(f"✓ Standard LoRA applied to {len(target_modules)} module types")
+        
+        # 创建用于GRPO推理的pipeline，模仿d4j.py的做法
+        print("🚀 Creating inference pipeline for GRPO generation...")
+        self.inference_pipe = pipeline("text-generation", model=self.model, tokenizer=self.tokenizer)
+        print("✓ Inference pipeline ready")
         
         # 显示设备映射信息
         if hasattr(base, 'hf_device_map'):
@@ -760,7 +822,7 @@ class SFT_GRPO_Trainer:
         
         # 学习率调度器：warmup + cosine decay
         total_steps = self.args.sft_epochs * len(dataset) // self.args.sft_batch
-        warmup_steps = int(0.05 * total_steps)   # 5% warmup，快速到达目标学习率
+        warmup_steps = int(0.15 * total_steps)   # 15% warmup，小数据集需要更温和的启动
         
         def lr_scheduler_fn(step):
             if step < warmup_steps:
@@ -834,7 +896,7 @@ class SFT_GRPO_Trainer:
                             # 计算实际处理的样本数
                             actual_samples = global_step * accumulation_steps
                             actual_epoch = actual_samples / len(loader)
-                            print(f"[SFT] ep{ep} step{global_step}/{total_steps} (样本:{actual_samples}, 实际ep:{actual_epoch:.1f}) "
+                            print(f"[SFT] ep{ep} step{step+1}/{len(loader)} global_step{global_step}/{total_steps} (样本:{actual_samples}, 实际ep:{actual_epoch:.1f}) "
                                   f"loss={loss.item() * accumulation_steps:.4f} "
                                   f"lr={current_lr:.2e} grad_norm={grad_norm:.3f}")
                 
@@ -1088,9 +1150,15 @@ class SFT_GRPO_Trainer:
             epoch_reward = 0.0
             epoch_steps = 0
             
+            print(f"[GRPO] Starting epoch {ep}/{self.args.grpo_epochs}")
+            
             for step, sample in enumerate(loader):
                 try:
                     sample = sample[0] if isinstance(sample, list) else sample
+                    
+                    # 简单进度输出
+                    if step % 50 == 0:
+                        print(f"[GRPO] ep{ep} step{step}/{len(loader)}")
                     
                     # 课程学习进度
                     epoch_ratio = (ep + step / max(1, len(loader))) / max(1, self.args.grpo_epochs)
@@ -1184,6 +1252,22 @@ class SFT_GRPO_Trainer:
         
         print("[GRPO] GRPO phase completed successfully!")
 
+    def _generate_d4j_style(self, prompt: str, max_new_tokens: int = 1024, temperature: float = 1.0) -> str:
+        """使用d4j.py的风格生成单个候选，确保稳定性"""
+        try:
+            # 完全模仿d4j.py的调用方式
+            output = self.inference_pipe(
+                prompt, 
+                max_new_tokens=max_new_tokens, 
+                temperature=temperature, 
+                do_sample=True
+            )
+            full_text = output[0]['generated_text']
+            return full_text
+        except Exception as e:
+            print(f"[GRPO] Error in d4j-style generation: {e}")
+            return ""
+
     def _generate_candidate_group(self, sample: Dict, temp: float, top_p: float, K: int) -> Dict:
         """生成候选组"""
         prompt = sample['prompt']
@@ -1191,76 +1275,80 @@ class SFT_GRPO_Trainer:
         # 确保prompt是字符串
         prompt = str(prompt) if prompt is not None else ''
         
-        # 引导模型生成完整的C++代码块格式
+        # GRPO阶段增强的prompt设计，使用模型特定的前缀后缀
+        # 参考d4j.py的做法，添加BOF和EOF
         prompt = (
-    prompt.strip()
-    + "\n\nPlease output only the fixed C++ code inside a fenced block:\n"
-    + "```cpp\n"
-    + "// Your fixed code here\n"
-    + "```"
+    self.BOF 
+    + "\n" + prompt.strip()
+    + "\nYou are an expert software engineer. Please carefully analyze the incorrect code and provide a correct, clean implementation. "
+    + "Generate ONLY the corrected C++ code inside a code block, without any explanation or comments outside the code.\n"
+    + self.EOF + "\n```cpp\n"
 )
 
+        
+        # 打印完整的 prompt
+        print(f"[GRPO] Input prompt:")
+        print(f"--- Prompt ---")
+        print(prompt)
+        print(f"--- End Prompt ---")
         
         # 样本开始前轻量清理
         cleanup_cuda_memory()
         
-        # 输入编码
-        gen_in = self.tokenizer(
-            prompt, 
-            return_tensors='pt', 
-            padding=True, 
-            truncation=True,
-            max_length=512
-        ).to(self.args.device)
-        
-        # 逐个生成候选，避免并行生成的内存压力
+        # 使用d4j风格的pipeline生成，不需要手动tokenize
         texts = []
-        prompt_len = gen_in['input_ids'].shape[1]
         
         # 增加重试机制，确保生成足够的候选
         max_attempts = K + 2  # 允许额外的重试
         attempt = 0
         
-        while len(texts) < max(2, K // 2) and attempt < max_attempts:
+        while len(texts) < max(2, K) and attempt < max_attempts:
             try:
                 # 每个候选前轻量清理
                 cleanup_cuda_memory()
                 
-                with torch.no_grad():
-                    # 每次只生成1个候选，使用更稳定的参数
-                    gen_out = self.model.generate(
-                        **gen_in,
-                        do_sample=True,
-                        temperature=temp,                 # 完全使用课程学习的温度
-                        top_p=top_p,                  # 完全使用课程学习的top_p
-                        top_k=50,                    # 添加top_k限制
-                        num_return_sequences=1,      # 一次只生成1个
-                        max_new_tokens=self.args.max_new_tokens,
-                        pad_token_id=self.tokenizer.eos_token_id,
-                        eos_token_id=self.tokenizer.eos_token_id,
-                        repetition_penalty=1.05,     # 降低重复惩罚
-                        length_penalty=1.0,
-                        use_cache=False,             # 禁用缓存节省内存
-                        early_stopping=True,        # 早停减少计算
-                        no_repeat_ngram_size=3       # 避免重复n-gram
-                    )
+                # 使用d4j风格生成
+                full_text = self._generate_d4j_style(
+                    prompt, 
+                    max_new_tokens=self.args.max_new_tokens, 
+                    temperature=temp
+                )
                 
-                # 解码当前候选
-                generated_part = gen_out[0][prompt_len:]
-                text = self.tokenizer.decode(generated_part, skip_special_tokens=True)
+                if not full_text:
+                    attempt += 1
+                    continue
+                
+                # 提取生成的部分（去除原始prompt）
+                # 模仿d4j.py的处理方式
+                if self.EOF in full_text:
+                    text = full_text.split(self.EOF)[1].strip()
+                else:
+                    # 如果没有找到EOF，尝试从prompt之后提取
+                    original_prompt_part = prompt.split(self.EOF)[0] if self.EOF in prompt else prompt
+                    if original_prompt_part in full_text:
+                        text = full_text.replace(original_prompt_part, "").strip()
+                    else:
+                        text = full_text.strip()
                 
                 # 确保从源头就是字符串
                 text = str(text).strip()
                 
-                # 最简检查：只要包含C++特征即可
-                if '#include' not in text:
+                # 打印模型生成的输出
+                print(f"[GRPO] Generated candidate {len(texts)+1}:")
+                print(f"--- Generated Text ---")
+                print(text)
+                print(f"--- End Generated Text ---")
+                
+                # 使用新的C++代码抓取逻辑（已内置质量检查）
+                extracted_code = extract_first_cpp_code(text)
+                if not extracted_code:
+                    print(f"[GRPO] Candidate rejected: no valid C++ code block found")
                     continue
                 
-                texts.append(text)
+                print(f"[GRPO] Candidate accepted: extracted {len(extracted_code)} chars of C++ code")
+                texts.append(text)  # 保存原始生成文本，不只是代码部分
                 
-                # 每生成一个候选后轻量清理
-                del gen_out
-                del generated_part
+                # 每生成一个候选后轻量清理  
                 cleanup_cuda_memory()
                 
             except Exception as e:
@@ -1278,13 +1366,12 @@ class SFT_GRPO_Trainer:
             attempt += 1
         
         if len(texts) == 0:
-            print(f"[GRPO] All candidate generation failed")
+            print(f"[GRPO] All candidate generation failed after {attempt} attempts")
             return {}
-            
+        
         return {
             'texts': texts,
-            'prompt': prompt,
-            'prompt_len': prompt_len
+            'prompt': prompt
         }
 
     def _compute_rewards_and_probs(self, sample: Dict, candidates_data: Dict, 
@@ -1347,6 +1434,7 @@ class SFT_GRPO_Trainer:
                     continue
             
             if len(rewards) < 2:
+                print(f"[GRPO] Insufficient valid rewards: got {len(rewards)} rewards, need at least 2")
                 return {}
             
             # 转换为tensor
@@ -1555,6 +1643,11 @@ def main():
             )
             trainer.model = get_peft_model(merged_model, lora_config)
             
+            # 创建新的pipeline用于GRPO生成
+            print("🚀 Creating fresh inference pipeline for GRPO...")
+            trainer.inference_pipe = pipeline("text-generation", model=trainer.model, tokenizer=trainer.tokenizer)
+            print("✓ Fresh inference pipeline ready")
+            
             # 修复：手动设置LoRA参数为可训练
             trainable_count = 0
             for name, param in trainer.model.named_parameters():
@@ -1603,7 +1696,7 @@ def main():
     print("-" * 60)
     # 使用固定的课程学习和奖励配置
     curriculum_cfg = CurriculumCfg(
-        start_temp=1.0, end_temp=0.6,
+        start_temp=1.2, end_temp=0.8,
         start_top_p=0.95, end_top_p=0.8,
         start_num=4, end_num=2  # 平衡候选数量和内存使用
     )
@@ -1637,5 +1730,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-
