@@ -131,33 +131,23 @@ def extract_first_cpp_code(s: str) -> str:
     return ""
 
 def extract_code(text: str) -> str:
-    """从生成的文本中提取代码，兼容原有逻辑"""
+    """从生成的文本中提取代码"""
     # 确保输入是字符串
     text = str(text) if text is not None else ''
     
-    # 首先尝试使用新的C++代码块提取
+    # 使用增强的C++代码提取逻辑
     cpp_code = extract_first_cpp_code(text)
     if cpp_code:
         return cpp_code
     
-    # 如果没有C++代码块，尝试其他格式
-    CODE_FENCE_RE = re.compile(r'```(?:c\+\+|cpp|c)?\s*\n(.*?)\n```', re.DOTALL | re.IGNORECASE)
-    matches = CODE_FENCE_RE.findall(text)
-    if matches:
-        return matches[0].strip()
-    
-    # 如果包含#include，可能是直接的C++代码
-    if '#include' in text:
-        return text.strip()
-    
-    # 如果没有代码块，返回整个文本（去除多余空行）
+    # 如果没有找到代码块，返回整个文本（去除空行）
     return '\n'.join(line for line in text.splitlines() if line.strip())
 
 def run_code_with_testcases(code: str, testcases: List[Dict], timeout: float = 5.0) -> float:
     """
     执行C++代码并运行测试用例，返回通过率
     testcases格式: [{"input": "...", "output": "...", "testcase_id": ..., ...}, ...]
-    支持你的格式：包含testcase_id, complexity, features等额外字段
+    支持包含testcase_id, complexity, features等额外字段
     """
     if not testcases:
         return 0.0
@@ -175,27 +165,21 @@ def run_code_with_testcases(code: str, testcases: List[Dict], timeout: float = 5
         else:
             exe_file = cpp_file.replace('.cpp', '')
         
-        # 尝试不同的编译器
-        compilers = ['g++', 'gcc', 'clang++']
-        compile_success = False
-        
-        for compiler in compilers:
-            try:
-                compile_result = subprocess.run(
-                    [compiler, '-o', exe_file, cpp_file, '-std=c++17'],
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout
-                )
-                if compile_result.returncode == 0:
-                    compile_success = True
-                    break
-            except FileNotFoundError:
-                # 编译器不存在，尝试下一个
-                continue
+        # 使用g++编译器
+        try:
+            compile_result = subprocess.run(
+                ['g++', '-o', exe_file, cpp_file, '-std=c++17'],
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            compile_success = compile_result.returncode == 0
+        except FileNotFoundError:
+            # g++编译器不存在
+            compile_success = False
         
         if not compile_success:
-            # 所有编译器都失败，清理文件并返回
+            # 编译失败，清理文件并返回
             try:
                 os.unlink(cpp_file)
             except:
@@ -208,9 +192,13 @@ def run_code_with_testcases(code: str, testcases: List[Dict], timeout: float = 5
         for i, test in enumerate(testcases):
             try:
                 # 提取输入输出（兼容各种格式）
-                input_data = test.get('input', '')
-                expected_output = test.get('output', '').strip()
-                testcase_id = test.get('testcase_id', i)  # 使用testcase_id或索引
+                input_data = str(test.get('input', ''))
+                expected_output = str(test.get('output', '')).strip()
+                testcase_id = test.get('testcase_id', i)
+                
+                # 确保输入数据格式正确
+                if input_data and not input_data.endswith('\n'):
+                    input_data += '\n'
                 
                 # 执行编译后的程序
                 result = subprocess.run(
@@ -225,19 +213,12 @@ def run_code_with_testcases(code: str, testcases: List[Dict], timeout: float = 5
                     actual_output = result.stdout.strip()
                     if actual_output == expected_output:
                         passed += 1
-                    # 可以添加详细日志（调试时启用）
-                    # else:
-                    #     print(f"[Test] Testcase {testcase_id} failed: expected '{expected_output}', got '{actual_output}'")
-                # else:
-                #     print(f"[Test] Testcase {testcase_id} execution error: {result.stderr}")
                         
             except subprocess.TimeoutExpired:
-                # 超时
-                # print(f"[Test] Testcase {testcase_id} timeout")
+                # 测试用例超时
                 continue
             except Exception as e:
                 # 其他执行错误
-                # print(f"[Test] Testcase {testcase_id} error: {e}")
                 continue
         
         # 清理临时文件
@@ -255,25 +236,47 @@ def run_code_with_testcases(code: str, testcases: List[Dict], timeout: float = 5
 def compute_text_quality(ref_text: str, cand_text: str) -> Tuple[float, float, float]:
     """
     计算生成文本与参考文本的质量评估
-    返回 (retention, diff_ratio, score)，其中
-    - retention = l/k，k 为候选行数，l 为匹配行总长度
-    - diff_ratio = 1 - similarity（越大表示改动越多）
-    - score = retention - diff_ratio
-    参考文本 ref_text 使用 ground-truth（样本的 chosen）。
+    返回 (retention, diff_ratio, score)，其中：
+    - retention = l/k，l为候选代码中与参考代码匹配的行数，k为候选代码总行数（越高越好）
+    - diff_ratio = 1 - similarity，整体差异程度（越小越好，表示改动越少）
+    - score = retention - diff_ratio，综合质量评分
     """
     # 确保输入是字符串
     ref_text = str(ref_text) if ref_text is not None else ''
     cand_text = str(cand_text) if cand_text is not None else ''
     
-    ref_lines = (ref_text or '').splitlines()
-    cand_lines = (cand_text or '').splitlines()
+    # 特殊情况处理
+    if not cand_text.strip():
+        return 0.0, 1.0, -1.0
+    if not ref_text.strip():
+        return 0.0, 0.0, 0.0
+    
+    # 按行分割进行比较
+    ref_lines = ref_text.splitlines()
+    cand_lines = cand_text.splitlines()
+    
+    k = len(cand_lines)  # 候选代码总行数
+    if k == 0:
+        return 0.0, 1.0, -1.0
+    
+    # 使用difflib计算匹配
     matcher = difflib.SequenceMatcher(None, ref_lines, cand_lines)
-    l = sum(b.size for b in matcher.get_matching_blocks())
-    k = max(1, len(cand_lines))
+    
+    # l = 匹配的行数（匹配块的大小之和）
+    matching_blocks = matcher.get_matching_blocks()
+    l = sum(block.size for block in matching_blocks if block.size > 0)
+    
+    # retention = l/k：候选代码中与参考代码匹配的行数比例
     retention = l / k
+    
+    # diff_ratio = 1 - similarity：整体差异程度，越小表示改动越少
     similarity = matcher.ratio()
     diff_ratio = 1.0 - similarity
+    
+    # score = retention - diff_ratio：综合评分
+    # 高保留率好，低差异度好
     score = retention - diff_ratio
+    
     return retention, diff_ratio, score
 
 # =========================
@@ -287,116 +290,151 @@ class CurriculumCfg:
     end_top_p: float = 0.8
     start_num: int = 6
     end_num: int = 2
-    # 移除测试用例权重，现在只基于文本质量
 
     def interp(self, ratio: float) -> Tuple[float, float, int]:
-        """仅返回生成参数（温度、top_p、候选数量）"""
+        """返回生成参数（温度、top_p、候选数量）"""
         ratio = min(max(ratio, 0.0), 1.0)
         temp = self.start_temp + (self.end_temp - self.start_temp) * ratio
         top_p = self.start_top_p + (self.end_top_p - self.start_top_p) * ratio
         num = int(round(self.start_num + (self.end_num - self.start_num) * ratio))
         return temp, top_p, max(1, num)
 
+class PromptScheduler:
+    """分早晚期的多元化prompt调度器"""
+    
+    def __init__(self, model_key: str):
+        self.model_key = model_key
+        
+        # 创新型修复：鼓励大胆改动和多种方案
+        self.innovative_prompts = [
+            "Please try to propose multiple different repair methods, which can have major changes, but ensure that the code can be compiled and run:",
+            "Explore completely different approaches to fix this code. Consider major refactoring or alternative algorithms:",
+            "Think creatively and propose a significantly different solution. Major code restructuring is acceptable:",
+            "Generate an innovative fix using a different programming paradigm or data structure:",
+            "Approach this problem from a completely new angle. Feel free to make substantial changes:",
+        ]
+        
+        # 保守型修复：最小化改动，保持原有结构  
+        self.conservative_prompts = [
+            "Please generate a minimal repair patch that preserves the original code structure and only modifies the necessary parts to fix the error:",
+            "Provide the smallest possible fix that maintains the existing code structure:",
+            "Generate a minimal patch - change only what's absolutely necessary to fix the bug:",
+            "Create a conservative fix that preserves the original design and makes minimal changes:",
+            "Deliver a targeted fix that keeps the original code structure intact:",
+        ]
+        
+        # 通用的任务描述
+        self.base_instruction = (
+            "You are an expert software engineer. Analyze the incorrect code carefully and provide a correct implementation. "
+            "Generate ONLY the corrected C++ code inside a code block, without explanations outside the code."
+        )
+    
+    def get_diverse_prompt(self, base_prompt: str, epoch_ratio: float, candidate_idx: int = 0) -> str:
+        """根据训练进度生成创新型或保守型修复prompt"""
+        # 获取模型特定的前缀后缀
+        BOF, EOF = get_prompt_format(self.model_key)
+        
+        # 早期使用创新型，晚期使用保守型
+        if epoch_ratio < 0.6:  # 早期：创新型修复
+            strategy_prompts = self.innovative_prompts
+            strategy_type = "innovative"
+        else:  # 晚期：保守型修复
+            strategy_prompts = self.conservative_prompts
+            strategy_type = "conservative"
+        
+        # 从对应策略中选择prompt变体
+        prompt_idx = candidate_idx % len(strategy_prompts)
+        diversity_instruction = strategy_prompts[prompt_idx]
+        
+        # 构建完整prompt
+        full_prompt = (
+            BOF + "\n" + 
+            base_prompt.strip() + "\n\n" +
+            diversity_instruction + "\n" +
+            self.base_instruction + "\n" +
+            EOF + "\n```cpp\n"
+        )
+        
+        return full_prompt, strategy_type
+    
+    def get_exploration_boost(self, epoch_ratio: float) -> float:
+        """获取探索增强系数（用于调整温度）"""
+        if epoch_ratio < 0.3:
+            return 0.2  # 早期大幅增强探索
+        elif epoch_ratio < 0.6:
+            return 0.1  # 中期适度增强
+        else:
+            return 0.0  # 晚期不增强
+
 # =========================
 # 概率/损失相关：logprob、KL、优势
 # =========================
-@torch.no_grad()
-def concat_and_prepare(tokenizer, prompt: str, candidate: str, device: torch.device):
-    # 先在CPU上完成分词与拼接，最后一次性移动到GPU，减少GPU碎片
-    prompt_ids = tokenizer(prompt, return_tensors='pt').input_ids
-    cand_ids = tokenizer(candidate, return_tensors='pt').input_ids
-    # 拼接：prompt + candidate（CPU上）
-    input_ids = torch.cat([prompt_ids, cand_ids], dim=1)
-    # 只对 candidate 部分计算 logprob
-    cand_len = cand_ids.size(1)
-    # 一次性上GPU
-    input_ids = input_ids.to(device)
-    return input_ids, cand_len
+def compute_log_probs(model, tokenizer, prompts, responses, device=None):
+    """计算序列对数概率（无梯度）"""
+    if device is None:
+        device = next(model.parameters()).device
+    
+    log_probs = []
+    batch_size = len(prompts)
+    
+    for i in range(batch_size):
+        prompt = prompts[i] if isinstance(prompts, list) else prompts
+        response = responses[i] if isinstance(responses, list) else responses
+        
+        prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
+        response_tokens = tokenizer.encode(response, add_special_tokens=False)
+        full_tokens = prompt_tokens + response_tokens
+        input_ids = torch.tensor([full_tokens], dtype=torch.long, device=device)
+        
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids)
+            logits = outputs.logits
+        
+        response_logits = logits[0, len(prompt_tokens)-1:len(prompt_tokens)+len(response_tokens)-1, :]
+        response_token_ids = torch.tensor(response_tokens, dtype=torch.long, device=device)
+        
+        log_probs_dist = F.log_softmax(response_logits, dim=-1)
+        token_log_probs = log_probs_dist.gather(1, response_token_ids.unsqueeze(1)).squeeze(1)
+        sequence_log_prob = token_log_probs.sum()
+        log_probs.append(sequence_log_prob)
+    
+    return torch.stack(log_probs)
 
-def cleanup_cuda_memory(aggressive=False):
-    """轻量清理：释放未引用缓存，避免碎片；不打印日志。"""
+def compute_log_probs_with_grad(model, tokenizer, prompts, responses, device=None):
+    """计算序列对数概率（保留梯度）"""
+    if device is None:
+        device = next(model.parameters()).device
+    
+    log_probs = []
+    batch_size = len(prompts)
+    
+    for i in range(batch_size):
+        prompt = prompts[i] if isinstance(prompts, list) else prompts
+        response = responses[i] if isinstance(responses, list) else responses
+        
+        prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
+        response_tokens = tokenizer.encode(response, add_special_tokens=False)
+        full_tokens = prompt_tokens + response_tokens
+        input_ids = torch.tensor([full_tokens], dtype=torch.long, device=device)
+        
+        outputs = model(input_ids=input_ids)
+        logits = outputs.logits
+        
+        response_logits = logits[0, len(prompt_tokens)-1:len(prompt_tokens)+len(response_tokens)-1, :]
+        response_token_ids = torch.tensor(response_tokens, dtype=torch.long, device=device)
+        
+        log_probs_dist = F.log_softmax(response_logits, dim=-1)
+        token_log_probs = log_probs_dist.gather(1, response_token_ids.unsqueeze(1)).squeeze(1)
+        sequence_log_prob = token_log_probs.sum()
+        log_probs.append(sequence_log_prob)
+    
+    return torch.stack(log_probs)
+
+def cleanup_cuda_memory():
+    """清理CUDA内存"""
     torch.cuda.empty_cache()
-    torch.cuda.synchronize()
     gc.collect()
-    if aggressive:
-        # 激进清理：重置CUDA上下文（慎用）
-        try:
-            torch.cuda.ipc_collect()
-        except:
-            pass
 
-def sequence_logprob_with_grad(model, input_ids: torch.Tensor, cand_len: int, max_retries=2) -> Tuple[torch.Tensor, torch.Tensor]:
-    """可以计算梯度的版本，带重试机制和强制同步"""
-    
-    for attempt in range(max_retries + 1):
-        try:
-            # 强制同步，确保CUDA状态干净
-            torch.cuda.synchronize()
-            
-            # 确保输入在正确设备上
-            if not input_ids.is_cuda:
-                input_ids = input_ids.cuda()
-            
-            # 强制同步输入传输
-            torch.cuda.synchronize()
-            
-            # 完全禁用autocast，使用float32计算
-            with torch.cuda.amp.autocast(enabled=False):
-                # 确保模型在eval模式下进行推理部分
-                model.eval()
-                outputs = model(input_ids=input_ids)
-                model.train()  # 恢复训练模式
-                
-            logits = outputs.logits  # [B, T, V]
-            
-            # 强制同步前向传播
-            torch.cuda.synchronize()
-            
-            # 取 candidate 段对应的 logits 与 labels
-            B, T, V = logits.size()
-            
-            # 防止索引越界：确保切片索引不为负
-            start_idx = max(0, T - cand_len - 1)
-            end_idx = max(1, T - 1)
-            
-            cand_logits = logits[:, start_idx:end_idx, :]  # 对齐下一 token 预测
-            cand_labels = input_ids[:, T - cand_len:T]
-            
-            # 如果切片长度不匹配，调整cand_labels
-            if cand_logits.size(1) != cand_labels.size(1):
-                actual_len = cand_logits.size(1)
-                cand_labels = cand_labels[:, -actual_len:]
-            
-            logp = F.log_softmax(cand_logits, dim=-1)
-            token_logp = logp.gather(-1, cand_labels.unsqueeze(-1)).squeeze(-1)  # [B, actual_len]
-            logprob_sum = token_logp.sum(dim=1)  # [B]
-            logprob_mean = token_logp.mean(dim=1)
-            
-            # 强制同步所有计算
-            torch.cuda.synchronize()
-            
-            # 成功计算，立即清理中间变量
-            del outputs, logits, cand_logits, cand_labels, logp, token_logp
-            
-            return logprob_sum, logprob_mean
-            
-        except Exception as e:
-            error_msg = str(e)
-            if "CUDA" in error_msg and attempt < max_retries:
-                print(f"[CUDA] Logprob computation failed (attempt {attempt+1}/{max_retries+1}): {error_msg}")
-                print(f"[CUDA] Performing aggressive cleanup and retry...")
-                
-                # 激进清理
-                cleanup_cuda_memory(aggressive=True)
-                time.sleep(3.0)  # 给GPU更多恢复时间
-                continue
-            else:
-                # 最后一次尝试失败或非CUDA错误
-                print(f"[CUDA] All retries failed. Final error: {error_msg}")
-                raise e
-    
-    # 不应该到达这里
-    raise RuntimeError("All retry attempts failed")
 
 # =========================
 # 奖励函数（基于文本质量评估）
@@ -563,7 +601,6 @@ class TrainArgs:
     
     # 生成和优化固定配置
     max_new_tokens: int = 1024
-    kl_coef: float = 0.05
     grad_clip: float = 1.0
     seed: int = 42
     
@@ -601,6 +638,12 @@ class SFT_GRPO_Trainer:
         # 获取模型的prompt格式
         self.BOF, self.EOF = get_prompt_format(args.model_name)
         print(f"🎯 Using prompt format for {args.model_name}: '{self.BOF}' ... '{self.EOF}'")
+        
+        # 初始化多元化prompt调度器
+        self.prompt_scheduler = PromptScheduler(args.model_name)
+        print(f"🎲 Initialized diverse prompt scheduler:")
+        print(f"   - Early stage (0-60%): {len(self.prompt_scheduler.innovative_prompts)} innovative repair strategies")
+        print(f"   - Late stage (60-100%): {len(self.prompt_scheduler.conservative_prompts)} conservative repair strategies")
         
         self.tokenizer = AutoTokenizer.from_pretrained(args.base_model)
         if self.tokenizer.pad_token is None:
@@ -886,7 +929,6 @@ class SFT_GRPO_Trainer:
                         
                         global_step += 1
                         
-                        # 定期内存清理
                         if global_step % 50 == 0:
                             cleanup_cuda_memory()
                         
@@ -901,22 +943,8 @@ class SFT_GRPO_Trainer:
                                   f"lr={current_lr:.2e} grad_norm={grad_norm:.3f}")
                 
                 except Exception as e:
-                    error_msg = str(e)
-                    print(f"[SFT] Error at step {step}: {error_msg}")
-                    
-                    # CUDA错误的特殊处理
-                    if "CUDA" in error_msg:
-                        print(f"[SFT] CUDA error detected, performing cleanup...")
-                        cleanup_cuda_memory(aggressive=True)
-                        
-                        # 等待GPU恢复
-                        time.sleep(2.0)
-                        
-                        # 尝试重新同步
-                        torch.cuda.synchronize()
-                        
-                        print(f"[SFT] Attempting to continue after CUDA cleanup...")
-                    
+                    print(f"[SFT] Error at step {step}: {e}")
+                    cleanup_cuda_memory()
                     continue
             
             # Epoch 统计
@@ -1033,9 +1061,9 @@ class SFT_GRPO_Trainer:
             else:
                 full_response = chosen.strip()
             
-            # 添加角色和任务指导，使用聊天模板格式化
+            # 添加角色和任务指导，使用模型特定的prompt格式
             enhanced_prompt = f"{prompt}\n\nYou are a software engineer. Can you repair the incorrect code?"
-            formatted_text = f"<s>[INST] {enhanced_prompt} [/INST] {full_response}</s>"
+            formatted_text = f"{self.BOF} {enhanced_prompt} {self.EOF} {full_response}"
             
             # Tokenize完整文本
             tokenized = self.tokenizer(
@@ -1049,7 +1077,7 @@ class SFT_GRPO_Trainer:
             attention_mask = tokenized['attention_mask'].squeeze(0)
             
             # 计算prompt部分的长度（需要排除）
-            prompt_text = f"<s>[INST] {enhanced_prompt} [/INST] "
+            prompt_text = f"{self.BOF} {enhanced_prompt} {self.EOF} "
             prompt_tokens = self.tokenizer.encode(prompt_text, add_special_tokens=False)
             prompt_len = len(prompt_tokens)
             
@@ -1164,8 +1192,8 @@ class SFT_GRPO_Trainer:
                     epoch_ratio = (ep + step / max(1, len(loader))) / max(1, self.args.grpo_epochs)
                     temp, top_p, K = curriculum.interp(epoch_ratio)
                     
-                    # 生成候选组
-                    candidates_data = self._generate_candidate_group(sample, temp, top_p, K)
+                    # 生成多元化候选组
+                    candidates_data = self._generate_candidate_group(sample, temp, top_p, K, epoch_ratio)
                     
                     if not candidates_data or len(candidates_data['texts']) < 2:
                         print(f"[GRPO] Warning: Insufficient valid candidates at step {step} (got {len(candidates_data.get('texts', []))} candidates), skipping")
@@ -1202,9 +1230,8 @@ class SFT_GRPO_Trainer:
                     scheduler.step()
                     global_step += 1
                     
-                    # 定期激进清理防止累积错误
-                    if global_step % 5 == 0:
-                        cleanup_cuda_memory(aggressive=True)
+                    if global_step % 10 == 0:
+                        cleanup_cuda_memory()
                     
                     # 统计信息
                     epoch_policy_loss += loss_info['policy_loss'].item()
@@ -1252,66 +1279,59 @@ class SFT_GRPO_Trainer:
         
         print("[GRPO] GRPO phase completed successfully!")
 
-    def _generate_d4j_style(self, prompt: str, max_new_tokens: int = 1024, temperature: float = 1.0) -> str:
-        """使用d4j.py的风格生成单个候选，确保稳定性"""
+    def _generate_d4j_style(self, prompt: str, max_new_tokens: int = 1024, 
+                           temperature: float = 1.0, top_p: float = 0.9) -> str:
+        """生成单个候选，使用温度和top_p控制多样性"""
         try:
-            # 完全模仿d4j.py的调用方式
             output = self.inference_pipe(
                 prompt, 
                 max_new_tokens=max_new_tokens, 
-                temperature=temperature, 
+                temperature=temperature,
+                top_p=top_p,
                 do_sample=True
             )
             full_text = output[0]['generated_text']
             return full_text
         except Exception as e:
-            print(f"[GRPO] Error in d4j-style generation: {e}")
+            print(f"[GRPO] Error in generation: {e}")
             return ""
 
-    def _generate_candidate_group(self, sample: Dict, temp: float, top_p: float, K: int) -> Dict:
-        """生成候选组"""
-        prompt = sample['prompt']
+    def _generate_candidate_group(self, sample: Dict, temp: float, top_p: float, K: int, epoch_ratio: float = 0.0) -> Dict:
+        """生成多元化候选组"""
+        base_prompt = sample['prompt']
+        base_prompt = str(base_prompt) if base_prompt is not None else ''
         
-        # 确保prompt是字符串
-        prompt = str(prompt) if prompt is not None else ''
-        
-        # GRPO阶段增强的prompt设计，使用模型特定的前缀后缀
-        # 参考d4j.py的做法，添加BOF和EOF
-        prompt = (
-    self.BOF 
-    + "\n" + prompt.strip()
-    + "\nYou are an expert software engineer. Please carefully analyze the incorrect code and provide a correct, clean implementation. "
-    + "Generate ONLY the corrected C++ code inside a code block, without any explanation or comments outside the code.\n"
-    + self.EOF + "\n```cpp\n"
-)
-
-        
-        # 打印完整的 prompt
-        print(f"[GRPO] Input prompt:")
-        print(f"--- Prompt ---")
-        print(prompt)
-        print(f"--- End Prompt ---")
-        
-        # 样本开始前轻量清理
         cleanup_cuda_memory()
         
-        # 使用d4j风格的pipeline生成，不需要手动tokenize
         texts = []
-        
-        # 增加重试机制，确保生成足够的候选
-        max_attempts = K + 2  # 允许额外的重试
+        max_attempts = K + 2
         attempt = 0
         
         while len(texts) < max(2, K) and attempt < max_attempts:
             try:
-                # 每个候选前轻量清理
                 cleanup_cuda_memory()
                 
-                # 使用d4j风格生成
+                # 获取当前候选的索引，用于prompt多样性
+                candidate_idx = len(texts)
+                
+                # 使用多元化prompt调度器生成不同的prompt
+                diverse_prompt, strategy_type = self.prompt_scheduler.get_diverse_prompt(
+                    base_prompt, epoch_ratio, candidate_idx
+                )
+                
+                # 获取探索增强系数
+                exploration_boost = self.prompt_scheduler.get_exploration_boost(epoch_ratio)
+                
+                # 应用温度扰动和探索增强
+                temp_noise = temp + random.uniform(-0.1, 0.1) + exploration_boost
+                temp_noise = max(0.1, min(2.0, temp_noise))
+                
+                # 生成候选
                 full_text = self._generate_d4j_style(
-                    prompt, 
+                    diverse_prompt, 
                     max_new_tokens=self.args.max_new_tokens, 
-                    temperature=temp
+                    temperature=temp_noise,
+                    top_p=top_p
                 )
                 
                 if not full_text:
@@ -1330,38 +1350,22 @@ class SFT_GRPO_Trainer:
                     else:
                         text = full_text.strip()
                 
-                # 确保从源头就是字符串
                 text = str(text).strip()
                 
-                # 打印模型生成的输出
-                print(f"[GRPO] Generated candidate {len(texts)+1}:")
-                print(f"--- Generated Text ---")
-                print(text)
-                print(f"--- End Generated Text ---")
-                
-                # 使用新的C++代码抓取逻辑（已内置质量检查）
+                # 检查是否包含有效的C++代码
                 extracted_code = extract_first_cpp_code(text)
                 if not extracted_code:
-                    print(f"[GRPO] Candidate rejected: no valid C++ code block found")
                     continue
                 
-                print(f"[GRPO] Candidate accepted: extracted {len(extracted_code)} chars of C++ code")
-                texts.append(text)  # 保存原始生成文本，不只是代码部分
+                texts.append(text)
                 
                 # 每生成一个候选后轻量清理  
                 cleanup_cuda_memory()
                 
             except Exception as e:
-                error_msg = str(e)
-                print(f"[GRPO] Error generating candidate attempt {attempt}: {error_msg}")
-                
-                # CUDA错误时的特殊处理
-                if "CUDA" in error_msg:
-                    print(f"[GRPO] CUDA error detected, aggressive cleanup...")
-                    cleanup_cuda_memory(aggressive=True)
-                    
-                    # 等待GPU恢复
-                    time.sleep(2.0)
+                print(f"[GRPO] Error generating candidate: {e}")
+                cleanup_cuda_memory()
+                time.sleep(1.0)
             
             attempt += 1
         
@@ -1371,137 +1375,74 @@ class SFT_GRPO_Trainer:
         
         return {
             'texts': texts,
-            'prompt': prompt
+            'base_prompt': base_prompt,
+            'epoch_ratio': epoch_ratio
         }
 
     def _compute_rewards_and_probs(self, sample: Dict, candidates_data: Dict, 
                                   rewarder: RewardComputer, epoch_ratio: float) -> Dict:
         """计算奖励和概率"""
-        try:
-            rewards = []
-            logps = []
-            ref_logps = []
-            extras = []
-            valid_indices = []
-            
-            for i, text in enumerate(candidates_data['texts']):
-                try:
-                    # 确保text是字符串
-                    text = str(text)
-                    
-                    # 计算奖励
-                    reward_info = rewarder(sample, text, epoch_ratio)
-                    
-                    # 计算概率
-                    prompt = candidates_data['prompt']
-                    prompt = str(prompt) if prompt is not None else ''
-                    
-                    full_text = prompt + text
-                    input_ids, cand_len = concat_and_prepare(
-                        self.tokenizer, prompt, text, self.args.device
-                    )
-                    
-                    # 当前模型概率
-                    lp_sum, _ = sequence_logprob_with_grad(self.model, input_ids, cand_len)
-                    
-                    # 检查logprob计算结果
-                    if torch.isnan(lp_sum) or torch.isinf(lp_sum):
-                        continue
-                    
-                    # 不使用参考模型，设置为0
-                    rlp_sum = torch.tensor(0.0, device=input_ids.device)
-                    
-                    rewards.append(reward_info['reward'])
-                    logps.append(lp_sum)
-                    ref_logps.append(rlp_sum)
-                    extras.append(reward_info)
-                    valid_indices.append(i)
-                    
-                    # 细粒度内存释放（轻量）
-                    del input_ids
-                    cleanup_cuda_memory()
-                    
-                except Exception as e:
-                    error_msg = str(e)
-                    print(f"[GRPO] Error computing reward for candidate {i}: {error_msg}")
-                    
-                    # CUDA错误时激进清理
-                    if "CUDA" in error_msg:
-                        print(f"[GRPO] CUDA error in reward computation, aggressive cleanup...")
-                        cleanup_cuda_memory(aggressive=True)
-                        time.sleep(1.0)
-                    
-                    continue
-            
-            if len(rewards) < 2:
-                print(f"[GRPO] Insufficient valid rewards: got {len(rewards)} rewards, need at least 2")
-                return {}
-            
-            # 转换为tensor
-            rewards_t = torch.tensor(rewards, dtype=torch.float32, device=self.args.device)
-            logps_t = torch.stack(logps)
-            ref_logps_t = torch.stack(ref_logps)
-            
-            # 组相对优势计算
-            baseline = rewards_t.mean()
-            advantages = rewards_t - baseline
-            std = advantages.std(unbiased=False).clamp_min(1e-8)
-            advantages = (advantages / std).clamp_(-10.0, 10.0)  # 更宽的裁剪范围
-            
-            # 检查advantages是否全为0（这会导致梯度为0）
-            if torch.all(torch.abs(advantages) < 1e-6):
-                # 给予轻微的随机扰动以避免梯度为0
-                advantages = torch.randn_like(advantages) * 0.01
-            
-            return {
-                'rewards': rewards_t,
-                'logps': logps_t,
-                'ref_logps': ref_logps_t,
-                'advantages': advantages,
-                'extras': extras,
-                'baseline': baseline
-            }
-            
-        except Exception as e:
-            print(f"[GRPO] Error in reward computation: {str(e)}")
-            return {}
-
-    def _compute_grpo_loss(self, rewards_info: Dict) -> Dict:
-        """计算简化的GRPO损失（无KL散度）"""
-        logps_t = rewards_info['logps']
-        advantages = rewards_info['advantages']
+        texts = candidates_data['texts']
+        base_prompt = candidates_data['base_prompt']
         
-        # 检查梯度状态和数值正常性
-        if not logps_t.requires_grad:
+        if len(texts) < 2:
             return {}
         
-        if torch.isnan(logps_t).any() or torch.isinf(logps_t).any():
+        # 计算奖励
+        rewards = []
+        extras = []
+        for text in texts:
+            reward_info = rewarder(sample, str(text), epoch_ratio)
+            rewards.append(reward_info['reward'])
+            extras.append(reward_info)
+        
+        # 为每个候选重新生成对应的多元化prompt（用于概率计算）
+        diverse_prompts = []
+        strategy_types = []
+        for i in range(len(texts)):
+            diverse_prompt, strategy_type = self.prompt_scheduler.get_diverse_prompt(
+                base_prompt, epoch_ratio, i
+            )
+            diverse_prompts.append(diverse_prompt)
+            strategy_types.append(strategy_type)
+        
+        # 计算对数概率
+        policy_log_probs = compute_log_probs_with_grad(self.model, self.tokenizer, diverse_prompts, texts)
+        
+        if torch.isnan(policy_log_probs).any() or torch.isinf(policy_log_probs).any():
             return {}
         
-        if torch.isnan(advantages).any() or torch.isinf(advantages).any():
-            return {}
+        # 计算优势
+        rewards_t = torch.tensor(rewards, dtype=torch.float32, device=policy_log_probs.device)
+        baseline = rewards_t.mean()
+        advantages = rewards_t - baseline
         
-        # 简化版本：直接使用策略梯度，无需参考模型
-        # 使用REINFORCE-style损失
-        policy_loss = -(logps_t * advantages.detach()).mean()
-        
-        # 总损失就是策略损失
-        total_loss = policy_loss
-        
-        # 统计信息
-        with torch.no_grad():
-            # 由于没有参考模型，这些统计设为0
-            clip_fraction = 0.0
-            approx_kl = 0.0
-            ratio_mean = 1.0  # 没有比率，设为1
+        if advantages.std() > 1e-8:
+            advantages = advantages / (advantages.std() + 1e-8)
+        advantages = torch.clamp(advantages, -10.0, 10.0)
         
         return {
-            'total_loss': total_loss,
-            'policy_loss': policy_loss,
-            'kl_divergence': torch.tensor(0.0),  # 设为0
-            'clip_fraction': clip_fraction,
-            'approx_kl': approx_kl,
-            'ratio_mean': ratio_mean
+            'rewards': rewards_t,
+            'logps': policy_log_probs,
+            'advantages': advantages,
+            'extras': extras,
+            'baseline': baseline,
+            'strategy_types': strategy_types
+        }
+
+    def _compute_grpo_loss(self, rewards_info: Dict) -> Dict:
+        """计算GRPO损失"""
+        policy_log_probs = rewards_info['logps']
+        advantages = rewards_info['advantages']
+        
+        if not policy_log_probs.requires_grad:
+            return {}
+        
+        policy_loss = -(policy_log_probs * advantages.detach()).mean()
+        
+        return {
+            'total_loss': policy_loss,
+            'policy_loss': policy_loss
         }
 
     def _log_grpo_step(self, epoch: int, step: int, total_steps: int, 
@@ -1512,13 +1453,17 @@ class SFT_GRPO_Trainer:
         reward_std = rewards_info['rewards'].std().item()
         advantage_std = rewards_info['advantages'].std().item()
         
+        # 确定当前策略阶段
+        epoch_ratio = epoch / max(1, self.args.grpo_epochs)
+        current_strategy = "innovative" if epoch_ratio < 0.6 else "conservative"
+        
         print(f"[GRPO] ep{epoch} step{step}/{total_steps} "
               f"loss={loss_info['total_loss'].item():.4f} "
-              f"policy_loss={loss_info['policy_loss'].item():.4f} "
               f"R_mean={reward_mean:.3f}±{reward_std:.3f} "
               f"adv_std={advantage_std:.3f} "
               f"lr={lr:.2e} grad_norm={grad_norm:.3f} "
-              f"temp={temp:.2f} top_p={top_p:.2f} K={K}")
+              f"temp={temp:.2f} top_p={top_p:.2f} K={K} "
+              f"strategy={current_strategy}")
         
         # 打印第一个候选的详细信息
         if rewards_info['extras']:
@@ -1692,7 +1637,7 @@ def main():
         print("-" * 60)
         trainer.run_sft(dataset)
 
-    print('\n🎯 [Stage 2] GRPO Training (group-relative + KL + curriculum)')
+    print('\n🎯 [Stage 2] GRPO Training (group-relative + curriculum)')
     print("-" * 60)
     # 使用固定的课程学习和奖励配置
     curriculum_cfg = CurriculumCfg(
