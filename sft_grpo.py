@@ -144,137 +144,77 @@ def extract_code(text: str) -> str:
     return '\n'.join(line for line in text.splitlines() if line.strip())
 
 def run_code_with_testcases(code: str, testcases: List[Dict], timeout: float = 5.0) -> float:
-    """
-    执行C++代码并运行测试用例，返回通过率
-    testcases格式: [{"input": "...", "output": "...", "testcase_id": ..., ...}, ...]
-    支持包含testcase_id, complexity, features等额外字段
-    """
+    """执行C++代码并运行测试用例，返回通过率"""
     if not testcases:
         return 0.0
     
     try:
-        # 创建临时C++文件
         with tempfile.NamedTemporaryFile(mode='w', suffix='.cpp', delete=False) as f:
             f.write(code)
             cpp_file = f.name
         
-        # 编译C++代码
         import platform
-        if platform.system() == 'Windows':
-            exe_file = cpp_file.replace('.cpp', '.exe')
-        else:
-            exe_file = cpp_file.replace('.cpp', '')
+        exe_file = cpp_file.replace('.cpp', '.exe' if platform.system() == 'Windows' else '')
         
-        # 使用g++编译器
-        try:
-            compile_result = subprocess.run(
-                ['g++', '-o', exe_file, cpp_file, '-std=c++17'],
-                capture_output=True,
-                text=True,
-                timeout=timeout
-            )
-            compile_success = compile_result.returncode == 0
-        except FileNotFoundError:
-            # g++编译器不存在
-            compile_success = False
+        compile_result = subprocess.run(
+            ['g++', '-o', exe_file, cpp_file, '-std=c++17'],
+            capture_output=True, timeout=timeout
+        )
         
-        if not compile_success:
-            # 编译失败，清理文件并返回
-            try:
-                os.unlink(cpp_file)
-            except:
-                pass
+        if compile_result.returncode != 0:
+            os.unlink(cpp_file)
             return 0.0
         
         passed = 0
-        total = len(testcases)
-        
-        for i, test in enumerate(testcases):
+        for test in testcases:
             try:
-                # 提取输入输出（兼容各种格式）
                 input_data = str(test.get('input', ''))
                 expected_output = str(test.get('output', '')).strip()
-                testcase_id = test.get('testcase_id', i)
                 
-                # 确保输入数据格式正确
-                if input_data and not input_data.endswith('\n'):
-                    input_data += '\n'
-                
-                # 执行编译后的程序
                 result = subprocess.run(
-                    [exe_file],
-                    input=input_data,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout
+                    [exe_file], input=input_data, capture_output=True, 
+                    text=True, timeout=timeout
                 )
                 
-                if result.returncode == 0:
-                    actual_output = result.stdout.strip()
-                    if actual_output == expected_output:
-                        passed += 1
-                        
-            except subprocess.TimeoutExpired:
-                # 测试用例超时
-                continue
-            except Exception as e:
-                # 其他执行错误
+                if result.returncode == 0 and result.stdout.strip() == expected_output:
+                    passed += 1
+            except:
                 continue
         
-        # 清理临时文件
         try:
             os.unlink(cpp_file)
             os.unlink(exe_file)
         except:
             pass
             
-        return passed / total if total > 0 else 0.0
+        return passed / len(testcases)
         
-    except Exception:
+    except:
         return 0.0
 
 def compute_text_quality(ref_text: str, cand_text: str) -> Tuple[float, float, float]:
-    """
-    计算生成文本与参考文本的质量评估
-    返回 (retention, diff_ratio, score)，其中：
-    - retention = l/k，l为候选代码中与参考代码匹配的行数，k为候选代码总行数（越高越好）
-    - diff_ratio = 1 - similarity，整体差异程度（越小越好，表示改动越少）
-    - score = retention - diff_ratio，综合质量评分
-    """
-    # 确保输入是字符串
+    """计算文本质量：retention, diff_ratio, score"""
     ref_text = str(ref_text) if ref_text is not None else ''
     cand_text = str(cand_text) if cand_text is not None else ''
     
-    # 特殊情况处理
     if not cand_text.strip():
         return 0.0, 1.0, -1.0
     if not ref_text.strip():
         return 0.0, 0.0, 0.0
     
-    # 按行分割进行比较
     ref_lines = ref_text.splitlines()
     cand_lines = cand_text.splitlines()
-    
-    k = len(cand_lines)  # 候选代码总行数
+    k = len(cand_lines)
     if k == 0:
         return 0.0, 1.0, -1.0
     
-    # 使用difflib计算匹配
     matcher = difflib.SequenceMatcher(None, ref_lines, cand_lines)
-    
-    # l = 匹配的行数（匹配块的大小之和）
     matching_blocks = matcher.get_matching_blocks()
     l = sum(block.size for block in matching_blocks if block.size > 0)
-    
-    # retention = l/k：候选代码中与参考代码匹配的行数比例
     retention = l / k
     
-    # diff_ratio = 1 - similarity：整体差异程度，越小表示改动越少
     similarity = matcher.ratio()
     diff_ratio = 1.0 - similarity
-    
-    # score = retention - diff_ratio：综合评分
-    # 高保留率好，低差异度好
     score = retention - diff_ratio
     
     return retention, diff_ratio, score
@@ -308,19 +248,11 @@ class PromptScheduler:
         # 创新型修复：鼓励大胆改动和多种方案
         self.innovative_prompts = [
             "Please try to propose multiple different repair methods, which can have major changes, but ensure that the code can be compiled and run:",
-            "Explore completely different approaches to fix this code. Consider major refactoring or alternative algorithms:",
-            "Think creatively and propose a significantly different solution. Major code restructuring is acceptable:",
-            "Generate an innovative fix using a different programming paradigm or data structure:",
-            "Approach this problem from a completely new angle. Feel free to make substantial changes:",
         ]
         
         # 保守型修复：最小化改动，保持原有结构  
         self.conservative_prompts = [
             "Please generate a minimal repair patch that preserves the original code structure and only modifies the necessary parts to fix the error:",
-            "Provide the smallest possible fix that maintains the existing code structure:",
-            "Generate a minimal patch - change only what's absolutely necessary to fix the bug:",
-            "Create a conservative fix that preserves the original design and makes minimal changes:",
-            "Deliver a targeted fix that keeps the original code structure intact:",
         ]
         
         # 通用的任务描述
@@ -330,23 +262,19 @@ class PromptScheduler:
         )
     
     def get_diverse_prompt(self, base_prompt: str, epoch_ratio: float, candidate_idx: int = 0) -> str:
-        """根据训练进度生成创新型或保守型修复prompt"""
-        # 获取模型特定的前缀后缀
+        """根据训练进度生成prompt"""
         BOF, EOF = get_prompt_format(self.model_key)
         
-        # 早期使用创新型，晚期使用保守型
-        if epoch_ratio < 0.6:  # 早期：创新型修复
+        if epoch_ratio < 0.6:
             strategy_prompts = self.innovative_prompts
             strategy_type = "innovative"
-        else:  # 晚期：保守型修复
+        else:
             strategy_prompts = self.conservative_prompts
             strategy_type = "conservative"
         
-        # 从对应策略中选择prompt变体
         prompt_idx = candidate_idx % len(strategy_prompts)
         diversity_instruction = strategy_prompts[prompt_idx]
         
-        # 构建完整prompt
         full_prompt = (
             BOF + "\n" + 
             base_prompt.strip() + "\n\n" +
@@ -358,19 +286,19 @@ class PromptScheduler:
         return full_prompt, strategy_type
     
     def get_exploration_boost(self, epoch_ratio: float) -> float:
-        """获取探索增强系数（用于调整温度）"""
+        """获取探索增强系数"""
         if epoch_ratio < 0.3:
-            return 0.2  # 早期大幅增强探索
+            return 0.2
         elif epoch_ratio < 0.6:
-            return 0.1  # 中期适度增强
+            return 0.1
         else:
-            return 0.0  # 晚期不增强
+            return 0.0
 
 # =========================
 # 概率/损失相关：logprob、KL、优势
 # =========================
 def compute_log_probs(model, tokenizer, prompts, responses, device=None):
-    """计算序列对数概率（无梯度）"""
+    """计算序列对数概率"""
     if device is None:
         device = next(model.parameters()).device
     
@@ -401,7 +329,7 @@ def compute_log_probs(model, tokenizer, prompts, responses, device=None):
     return torch.stack(log_probs)
 
 def compute_log_probs_with_grad(model, tokenizer, prompts, responses, device=None):
-    """计算序列对数概率（保留梯度）"""
+    """计算序列对数概率(保留梯度)"""
     if device is None:
         device = next(model.parameters()).device
     
@@ -431,7 +359,7 @@ def compute_log_probs_with_grad(model, tokenizer, prompts, responses, device=Non
     return torch.stack(log_probs)
 
 def cleanup_cuda_memory():
-    """清理CUDA内存"""
+    """清理内存"""
     torch.cuda.empty_cache()
     gc.collect()
 
@@ -441,23 +369,21 @@ def cleanup_cuda_memory():
 # =========================
 @dataclass
 class RewardCfg:
-    diff_clip_low: float = -1.0  # 文本质量分数的下界
-    diff_clip_high: float = 1.0  # 文本质量分数的上界
-    # 测试用例权重配置
-    use_test_cases: bool = True           # 是否使用测试用例
-    test_weight: float = 0.6              # 测试用例权重 (60%)
-    text_weight: float = 0.4              # 文本质量权重 (40%)
-    test_timeout: float = 5.0             # 测试超时时间(秒)
-    # 外部测试用例配置
-    external_testcase_file: str = ""      # 外部测试用例文件路径
-    problem_id_field: str = "problem_id"  # problem_id字段名
+    diff_clip_low: float = -1.0
+    diff_clip_high: float = 1.0
+    use_test_cases: bool = True
+    test_weight: float = 0.6
+    text_weight: float = 0.4
+    test_timeout: float = 5.0
+    external_testcase_file: str = ""
+    problem_id_field: str = "problem_id"
 
 class RewardComputer:
     def __init__(self, cfg: RewardCfg):
         self.cfg = cfg
-        self.external_testcases = {}  # 缓存外部测试用例
+        self.external_testcases = {}
         
-        # 加载外部测试用例文件
+        # 加载外部测试用例
         if cfg.external_testcase_file and os.path.exists(cfg.external_testcase_file):
             try:
                 with open(cfg.external_testcase_file, 'r', encoding='utf-8') as f:
@@ -477,15 +403,11 @@ class RewardComputer:
                                     problem_id = item[cfg.problem_id_field]
                                     self.external_testcases[problem_id] = item['testcases']
                         elif isinstance(data, dict):
-                            # 格式: {problem_id: {"testcases": [...]}}
                             for problem_id, content in data.items():
                                 if isinstance(content, dict) and 'testcases' in content:
                                     self.external_testcases[problem_id] = content['testcases']
                                 elif isinstance(content, list):
-                                    # 直接是testcase列表
                                     self.external_testcases[problem_id] = content
-                                    
-                # 统计信息
                 total_problems = len(self.external_testcases)
                 total_testcases = sum(len(testcases) for testcases in self.external_testcases.values())
                 print(f"[Reward] Loaded external test cases:")
@@ -499,46 +421,36 @@ class RewardComputer:
                 self.external_testcases = {}
 
     def __call__(self, sample: Dict, generated_text: str, epoch_ratio: float) -> Dict:
-        # 确保输入是字符串
         generated_text = str(generated_text) if generated_text is not None else ''
         chosen_text = str(sample.get('chosen', '')) if sample.get('chosen') is not None else ''
         
-        # 清理chosen_text：移除列表格式的字符串表示
         if chosen_text.startswith("['") and chosen_text.endswith("']"):
-            # 移除列表的字符串表示形式
-            chosen_text = chosen_text[2:-2]  # 移除 ['...']
-            chosen_text = chosen_text.replace("\\n", "\n")  # 恢复换行符
-            chosen_text = chosen_text.replace("\\'", "'")   # 恢复单引号
-            chosen_text = chosen_text.replace('\\"', '"')   # 恢复双引号
+            chosen_text = chosen_text[2:-2]
+            chosen_text = chosen_text.replace("\\n", "\n")
+            chosen_text = chosen_text.replace("\\'", "'")
+            chosen_text = chosen_text.replace('\\"', '"')
         
-        # 从代码块中提取纯代码
         generated_code = extract_code(generated_text)
         chosen_code = extract_code(chosen_text)
         
-        # 使用提取的代码进行质量比较，如果提取失败则使用原文本
         compare_generated = generated_code if generated_code.strip() else generated_text
         compare_chosen = chosen_code if chosen_code.strip() else chosen_text
         
         retention, diff_ratio, text_score = compute_text_quality(compare_chosen, compare_generated)
         
-        # 获取测试用例（优先级：样本内 > 外部文件 > 无）
         testcases = None
         testcase_source = "none"
         
         if self.cfg.use_test_cases:
-            # 1. 优先使用样本内的测试用例
             if 'testcases' in sample and sample['testcases']:
                 testcases = sample['testcases']
                 testcase_source = "inline"
-            
-            # 2. 尝试从外部文件通过problem_id获取
             elif (self.cfg.problem_id_field in sample and 
                   sample[self.cfg.problem_id_field] in self.external_testcases):
                 problem_id = sample[self.cfg.problem_id_field]
                 testcases = self.external_testcases[problem_id]
                 testcase_source = "external"
         
-        # 计算测试通过率
         test_pass_rate = 0.0
         if testcases:
             try:
@@ -548,18 +460,14 @@ class RewardComputer:
                 print(f"[Reward] Test execution failed: {e}")
                 test_pass_rate = 0.0
         
-        # 综合奖励计算
         if testcases:
-            # 有测试用例：测试用例 + 文本质量的加权组合
             final_score = (self.cfg.test_weight * test_pass_rate + 
                           self.cfg.text_weight * text_score)
             used_tests = True
         else:
-            # 无测试用例：仅使用文本质量
             final_score = text_score
             used_tests = False
         
-        # 应用裁剪
         clipped_score = max(self.cfg.diff_clip_low, min(self.cfg.diff_clip_high, final_score))
         
         return {
