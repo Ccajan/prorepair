@@ -1,0 +1,854 @@
+import os
+import json
+import random
+import time
+import warnings
+
+os.environ.pop('PYTORCH_CUDA_ALLOC_CONF', None)   # 取消你之前设置的 allocator 调整
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"           # 精确定位发生错误的 kernel（会慢）
+
+# 过滤梯度检查点警告
+warnings.filterwarnings("ignore", message="None of the inputs have requires_grad=True")
+
+from datetime import datetime
+from typing import List, Dict
+from dataclasses import dataclass
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+from transformers import (
+    AutoTokenizer, 
+    AutoModelForCausalLM,
+    get_linear_schedule_with_warmup
+)
+from peft import LoraConfig, get_peft_model, TaskType
+
+# ==========================================
+# 配置类
+# ==========================================
+
+@dataclass
+class Config:
+    """训练配置 - 支持课程学习"""
+    # 动态参数 - 模型名称用于拼接路径
+    model_name_only: str = "Llama-3-8B-Instruct"
+    
+    # 固定路径配置
+    model_base_path: str = "/data1/czj/model"
+    train_file: str = "/data1/czj/prorepair/data/trainset/sft_dataset.json"
+    output_base_path: str = "/data1/czj/model"  # 输出基础路径
+    
+    # 固定训练参数
+    max_length: int = 2048
+    batch_size: int = 2
+    gradient_accumulation_steps: int = 4
+    num_epochs: int = 3
+    learning_rate: float = 1.5e-5
+    weight_decay: float = 0.01
+    warmup_ratio: float = 0.03
+    seed: int = 42
+    
+    # 🎓 课程学习参数
+    curriculum_stages: int = 3           # 课程阶段数
+    
+    # LoRA配置 - 使用标准LoRA避免复杂性
+    use_chain_lora: bool = False    # 使用标准LoRA而非Chain LoRA
+    chain_depth: int = 3            # Chain LoRA参数（保留但不使用）
+    lora_rank: int = 8              # rank=8标准配置
+    lora_alpha: float = 16.0        # 2倍rank的缩放因子
+    lora_dropout: float = 0.1       # 防过拟合的dropout
+    target_modules: List[str] = None
+    
+    # 固定损失参数
+    preference_beta: float = 0.5    # pairwise loss温度
+    dft_weight: float = 0.3         # DFT loss权重
+    use_dft: bool = True
+    num_negatives: int = 2          # 每个chosen使用的rejected数量
+    
+    # 固定训练优化 - 使用fp16避免bf16兼容性问题
+    fp16: bool = True               # 改用fp16，更好的driver兼容性
+    bf16: bool = False              # 禁用bf16避免优化器状态tensor问题
+    gradient_checkpointing: bool = True   # 如果内存不够可以启用，忽略警告
+    gradient_clipping: float = 1.0
+    
+    # 固定日志设置
+    logging_steps: int = 10
+    save_steps: int = 500
+    
+    # 固定聊天模板
+    chat_template: str = "llama"
+    
+    def __post_init__(self):
+        # 拼接完整的模型路径
+        self.model_name = os.path.join(self.model_base_path, self.model_name_only)
+        
+        # 动态生成输出路径
+        model_short_name = self.model_name_only.lower().replace("-", "_")
+        self.output_dir = os.path.join(self.output_base_path, f"trained_model_{model_short_name}_curriculum")
+        
+        if self.target_modules is None:
+            # 自动设置target_modules
+            if "llama" in self.model_name_only.lower():
+                self.target_modules = ["q_proj", "v_proj"]
+            elif "qwen" in self.model_name_only.lower():
+                self.target_modules = ["q_proj", "v_proj"]
+            else:
+                self.target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"]
+
+# ==========================================
+# 数据处理
+# ==========================================
+
+class ChatTemplate:
+    """聊天模板"""
+    def __init__(self, template_type: str = "llama"):
+        self.template_type = template_type.lower()
+    
+    def format_conversation(self, prompt: str, response: str, explanation: str = "") -> str:
+        full_response = response.strip()
+        if explanation and explanation.strip():
+            full_response = f"{full_response}\n\nExplanation: {explanation.strip()}"
+        
+        if self.template_type == "qwen":
+            return f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n{full_response}<|im_end|>"
+        else:  # llama
+            return f"<s>[INST] {prompt} [/INST] {full_response}</s>"
+
+class CurriculumScheduler:
+    """🎓 课程学习调度器"""
+    def __init__(self, config: Config, total_samples: int):
+        self.config = config
+        self.total_samples = total_samples
+        self.current_stage = 0
+        self.max_stages = config.curriculum_stages
+        
+    def get_difficulty_score(self, sample):
+        """计算样本难度分数 - 基于bug_hunks_count"""
+        return sample.get('bug_hunks_count', 0)
+    
+    def sort_by_difficulty(self, data):
+        """按难度排序数据 - 从简单到困难"""
+        # 计算每个样本的难度分数
+        scored_data = [(sample, self.get_difficulty_score(sample)) for sample in data]
+        
+        # 按难度排序（简单到困难）
+        scored_data.sort(key=lambda x: x[1])
+        
+        return [sample for sample, _ in scored_data]
+    
+    def get_stage_data(self, sorted_data, stage: int):
+        """获取当前阶段的数据"""
+        # 计算当前阶段应该包含的数据比例
+        stage_ratio = (stage + 1) / self.max_stages
+        stage_size = int(len(sorted_data) * stage_ratio)
+        
+        # 返回从简单到当前难度的所有数据
+        return sorted_data[:stage_size]
+    
+    def update_stage(self, current_step: int, total_steps: int):
+        """更新课程学习阶段"""
+        # 计算当前应该处于哪个阶段
+        progress = current_step / total_steps
+        new_stage = min(int(progress * self.max_stages), self.max_stages - 1)
+        
+        if new_stage != self.current_stage:
+            self.current_stage = new_stage
+            return True  # 阶段发生变化
+        return False
+    
+    def get_difficulty_distribution(self, data):
+        """获取数据难度分布统计"""
+        difficulty_scores = [self.get_difficulty_score(sample) for sample in data]
+        
+        if not difficulty_scores:
+            return {}
+        
+        return {
+            'min_difficulty': min(difficulty_scores),
+            'max_difficulty': max(difficulty_scores),
+            'avg_difficulty': sum(difficulty_scores) / len(difficulty_scores),
+            'total_samples': len(difficulty_scores)
+        }
+
+class PreferenceDataset(Dataset):
+    """偏好学习数据集 - 支持课程学习"""
+    def __init__(self, data_path: str, tokenizer, chat_template: ChatTemplate,
+                 max_length: int = 2048, num_negatives: int = 3, 
+                 curriculum_scheduler: CurriculumScheduler = None):
+        self.tokenizer = tokenizer
+        self.chat_template = chat_template
+        self.max_length = max_length
+        self.num_negatives = num_negatives
+        self.curriculum_scheduler = curriculum_scheduler
+        
+        # 加载数据
+        with open(data_path, 'r', encoding='utf-8') as f:
+            if data_path.endswith('.jsonl'):
+                self.raw_data = [json.loads(line) for line in f if line.strip()]
+            else:
+                self.raw_data = json.load(f)
+        
+        print(f"✅ Loaded {len(self.raw_data)} preference samples")
+        
+        # 🎓 课程学习：按难度排序
+        self.sorted_data = curriculum_scheduler.sort_by_difficulty(self.raw_data)
+        self.current_stage_data = curriculum_scheduler.get_stage_data(self.sorted_data, 0)
+        
+        # 打印难度分布统计
+        full_stats = curriculum_scheduler.get_difficulty_distribution(self.sorted_data)
+        stage_stats = curriculum_scheduler.get_difficulty_distribution(self.current_stage_data)
+        
+        print(f"🎓 Curriculum Learning Enabled:")
+        print(f"   📊 Full Dataset: {full_stats['total_samples']} samples, "
+              f"Difficulty: {full_stats['min_difficulty']:.1f} - {full_stats['max_difficulty']:.1f} "
+              f"(avg: {full_stats['avg_difficulty']:.1f})")
+        print(f"   🎯 Stage 0: {stage_stats['total_samples']} samples, "
+              f"Difficulty: {stage_stats['min_difficulty']:.1f} - {stage_stats['max_difficulty']:.1f} "
+              f"(avg: {stage_stats['avg_difficulty']:.1f})")
+        
+        self.data = self.current_stage_data
+    
+    def update_curriculum_stage(self, stage: int):
+        """更新课程学习阶段"""
+        self.current_stage_data = self.curriculum_scheduler.get_stage_data(self.sorted_data, stage)
+        self.data = self.current_stage_data
+        
+        # 打印新阶段的统计信息
+        stage_stats = self.curriculum_scheduler.get_difficulty_distribution(self.current_stage_data)
+        print(f"🎓 Curriculum Stage {stage}: {stage_stats['total_samples']} samples, "
+              f"Difficulty: {stage_stats['min_difficulty']:.1f} - {stage_stats['max_difficulty']:.1f} "
+              f"(avg: {stage_stats['avg_difficulty']:.1f})")
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+def collate_fn(batch, tokenizer, chat_template, max_length, num_negatives):
+    """批处理函数"""
+    chosen_batch = []
+    rejected_batch = []
+    
+    for sample in batch:
+        prompt = sample['prompt']
+        chosen = sample['chosen']
+        rejected_list = sample['rejected']
+        explanation = sample.get('explanation', '')
+        
+        # 处理rejected列表
+        if isinstance(rejected_list, str):
+            rejected_list = [rejected_list]
+        
+        # 采样negatives
+        if len(rejected_list) > num_negatives:
+            rejected_list = random.sample(rejected_list, num_negatives)
+        
+        # Tokenize chosen
+        chosen_text = chat_template.format_conversation(prompt, chosen, explanation)
+        chosen_tokens = tokenizer(
+            chosen_text,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt"
+        )
+        chosen_batch.append(chosen_tokens)
+        
+        # Tokenize rejected  
+        for rejected in rejected_list:
+            rejected_text = chat_template.format_conversation(prompt, rejected)
+            rejected_tokens = tokenizer(
+                rejected_text,
+                truncation=True,
+                max_length=max_length,
+                return_tensors="pt"
+            )
+            rejected_batch.append(rejected_tokens)
+    
+    # Padding function with separate handling for chosen and rejected
+    def pad_batch(batch_list, is_chosen=True):
+        if not batch_list:
+            return None
+            
+        max_len = max(item['input_ids'].size(1) for item in batch_list)
+        batch_size = len(batch_list)
+        
+        input_ids = torch.full((batch_size, max_len), tokenizer.pad_token_id, dtype=torch.long)
+        attention_mask = torch.zeros(batch_size, max_len, dtype=torch.long)
+        labels = torch.full((batch_size, max_len), -100, dtype=torch.long)
+        
+        for i, item in enumerate(batch_list):
+            seq_len = item['input_ids'].size(1)
+            input_ids[i, :seq_len] = item['input_ids'].squeeze(0)
+            attention_mask[i, :seq_len] = item['attention_mask'].squeeze(0)
+            
+            # 关键修改：只有chosen样本设置labels用于学习
+            if is_chosen:
+                labels[i, :seq_len] = item['input_ids'].squeeze(0)
+            # rejected样本的labels保持-100，不参与学习
+        
+        return {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'labels': labels
+        }
+    
+    return {
+        'chosen': pad_batch(chosen_batch, is_chosen=True),
+        'rejected': pad_batch(rejected_batch, is_chosen=False)
+    }
+
+# ==========================================
+# 损失函数
+# ==========================================
+
+class PreferenceLoss(nn.Module):
+    """偏好损失"""
+    def __init__(self, beta: float = 0.5):
+        super().__init__()
+        self.beta = beta
+    
+    def get_log_probs(self, model, batch):
+        """计算log概率"""
+        outputs = model(
+            input_ids=batch['input_ids'],
+            attention_mask=batch['attention_mask']
+        )
+        
+        logits = outputs.logits[:, :-1, :]
+        labels = batch['labels'][:, 1:].contiguous()
+        
+        log_probs = F.log_softmax(logits, dim=-1)
+        
+        mask = (labels != -100).float()
+        labels_safe = labels.clone()
+        labels_safe[labels == -100] = 0
+        
+        token_log_probs = log_probs.gather(-1, labels_safe.unsqueeze(-1)).squeeze(-1)
+        token_log_probs = token_log_probs * mask
+        
+        seq_log_probs = token_log_probs.sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+        return seq_log_probs
+    
+    def forward(self, model, chosen_batch, rejected_batch):
+        """计算偏好损失"""
+        chosen_log_probs = self.get_log_probs(model, chosen_batch)
+        rejected_log_probs = self.get_log_probs(model, rejected_batch)
+        
+        # 处理维度不匹配
+        if len(rejected_log_probs) != len(chosen_log_probs):
+            num_chosen = len(chosen_log_probs)
+            rejected_log_probs = rejected_log_probs.view(num_chosen, -1).mean(dim=1)
+        
+        # Pairwise logistic loss
+        diff = self.beta * (chosen_log_probs - rejected_log_probs)
+        loss = -F.logsigmoid(diff).mean()
+        return loss
+
+class DFTLoss(nn.Module):
+    """DFT损失"""
+    def __init__(self, weight: float = 0.3):
+        super().__init__()
+        self.weight = weight
+    
+    def forward(self, model, batch):
+        """计算DFT损失"""
+        outputs = model(
+            input_ids=batch['input_ids'],
+            attention_mask=batch['attention_mask']
+        )
+        
+        logits = outputs.logits[:, :-1, :]
+        labels = batch['labels'][:, 1:].contiguous()
+        
+        probs = F.softmax(logits, dim=-1)
+        log_probs = F.log_softmax(logits, dim=-1)
+        
+        mask = (labels != -100).float()
+        labels_safe = labels.clone()
+        labels_safe[labels == -100] = 0
+        
+        target_probs = probs.gather(-1, labels_safe.unsqueeze(-1)).squeeze(-1)
+        target_log_probs = log_probs.gather(-1, labels_safe.unsqueeze(-1)).squeeze(-1)
+        
+        dft_loss = -(target_probs.detach() * target_log_probs) * mask
+        
+        return (dft_loss.sum() / mask.sum().clamp(min=1.0)) * self.weight
+
+class HybridLoss(nn.Module):
+    """混合损失：CrossEntropyLoss + PreferenceLoss
+    
+    让chosen样本作用两次：
+    1. 通过CrossEntropyLoss直接学习token
+    2. 通过PreferenceLoss与rejected进行对比
+    """
+    def __init__(self, lm_weight: float = 1.0, preference_weight: float = 0.5, preference_beta: float = 0.5):
+        super().__init__()
+        self.lm_weight = lm_weight
+        self.preference_weight = preference_weight
+        self.preference_beta = preference_beta
+        self.cross_entropy = nn.CrossEntropyLoss(ignore_index=-100)
+        
+    def forward(self, model, chosen_batch, rejected_batch):
+        """计算混合损失"""
+        total_loss = 0.0
+        individual_losses = {}
+        
+        # 1. CrossEntropyLoss: chosen样本的语言建模损失
+        if chosen_batch is not None:
+            chosen_outputs = model(
+                input_ids=chosen_batch['input_ids'],
+                attention_mask=chosen_batch['attention_mask'],
+                labels=chosen_batch['labels']
+            )
+            lm_loss = chosen_outputs.loss  # 这是标准的CrossEntropyLoss
+            total_loss += self.lm_weight * lm_loss
+            individual_losses['lm_loss'] = lm_loss
+        else:
+            individual_losses['lm_loss'] = torch.tensor(0.0)
+        
+        # 2. PreferenceLoss: chosen vs rejected 对比损失
+        if chosen_batch is not None and rejected_batch is not None:
+            # 计算chosen的log概率
+            chosen_log_prob = self._get_sequence_log_prob(model, chosen_batch)
+            
+            # 计算rejected的log概率（不产生梯度）
+            with torch.no_grad():
+                rejected_log_prob = self._get_sequence_log_prob(model, rejected_batch)
+            
+            # 处理维度不匹配
+            if len(rejected_log_prob) != len(chosen_log_prob):
+                num_chosen = len(chosen_log_prob)
+                rejected_log_prob = rejected_log_prob.view(num_chosen, -1).mean(dim=1)
+            
+            # 偏好损失：希望chosen的概率大于rejected
+            diff = self.preference_beta * (chosen_log_prob - rejected_log_prob)
+            preference_loss = -F.logsigmoid(diff).mean()
+            
+            total_loss += self.preference_weight * preference_loss
+            individual_losses['preference_loss'] = preference_loss
+        else:
+            individual_losses['preference_loss'] = torch.tensor(0.0)
+        
+        individual_losses['total_loss'] = total_loss
+        return total_loss, individual_losses
+    
+    def _get_sequence_log_prob(self, model, batch):
+        """计算序列的log概率"""
+        outputs = model(
+            input_ids=batch['input_ids'],
+            attention_mask=batch['attention_mask']
+        )
+        
+        logits = outputs.logits[:, :-1, :]  # 去掉最后一个位置
+        labels = batch['input_ids'][:, 1:].contiguous()  # 去掉第一个位置
+        
+        log_probs = F.log_softmax(logits, dim=-1)
+        
+        # 创建mask，排除padding token
+        mask = (labels != -100).float()
+        if mask.sum() == 0:  # 如果所有token都被忽略，使用attention_mask
+            mask = batch['attention_mask'][:, 1:].float()
+        
+        # 收集目标token的log概率
+        labels_safe = labels.clone()
+        labels_safe[labels == -100] = 0  # 防止index out of range
+        
+        token_log_probs = log_probs.gather(-1, labels_safe.unsqueeze(-1)).squeeze(-1)
+        token_log_probs = token_log_probs * mask
+        
+        # 计算序列级别的平均log概率
+        seq_log_probs = token_log_probs.sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+        return seq_log_probs
+
+# ==========================================
+# 训练器
+# ==========================================
+
+class CurriculumPreferenceTrainer:
+    """🎓 课程学习偏好训练器"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # 设置随机种子
+        random.seed(config.seed)
+        torch.manual_seed(config.seed)
+        torch.cuda.manual_seed_all(config.seed)
+        
+        # 创建输出目录
+        os.makedirs(config.output_dir, exist_ok=True)
+        
+        # 初始化组件
+        self.tokenizer = None
+        self.model = None
+        self.train_loader = None
+        self.optimizer = None
+        self.scheduler = None
+        
+        # 🎓 课程学习组件
+        self.curriculum_scheduler = None
+        self.dataset = None
+        
+        # 损失函数
+        self.preference_loss = PreferenceLoss(config.preference_beta)
+        self.dft_loss = DFTLoss(config.dft_weight)
+        # 新增：混合损失函数（CrossEntropyLoss + PreferenceLoss）
+        self.hybrid_loss = HybridLoss(
+            lm_weight=1.0,  # CrossEntropy权重
+            preference_weight=config.preference_beta,  # 偏好损失权重
+            preference_beta=config.preference_beta
+        )
+        
+        # 训练状态
+        self.global_step = 0
+        self.loss_history = []
+    
+    def setup_model(self):
+        """设置模型"""
+        print(f"🔧 Loading model: {self.config.model_name}")
+        
+        # Tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.config.model_name, 
+            use_fast=True, 
+            trust_remote_code=True
+        )
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        
+        # Model - 直接GPU加载
+        print("🔧 Loading model directly to GPU...")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.config.model_name,
+            torch_dtype=torch.float16,
+            device_map="auto",  
+            trust_remote_code=True,
+            use_cache=False
+        )
+        
+        # 应用LoRA (在梯度检查点之前)
+        print(f"🔧 Applying LoRA: rank={self.config.lora_rank}")
+        lora_config = LoraConfig(
+            r=self.config.lora_rank,
+            lora_alpha=self.config.lora_alpha,
+            lora_dropout=self.config.lora_dropout,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+            target_modules=self.config.target_modules
+        )
+        self.model = get_peft_model(self.model, lora_config)
+        
+        # 确保LoRA参数需要梯度
+        for name, param in self.model.named_parameters():
+            if 'lora' in name.lower():
+                param.requires_grad = True
+        
+        # 启用梯度检查点 (在LoRA之后)
+        if self.config.gradient_checkpointing:
+            print("🔧 Enabling gradient checkpointing...")
+            self.model.gradient_checkpointing_enable()
+            # 确保基础模型参数不需要梯度 (只有LoRA需要)
+            for name, param in self.model.named_parameters():
+                if 'lora' not in name.lower():
+                    param.requires_grad = False
+        
+        # 打印参数统计
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        print(f"📊 Total params: {total_params:,}")
+        print(f"📊 Trainable params: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
+        
+        # 验证梯度设置
+        lora_params = sum(p.numel() for name, p in self.model.named_parameters() if 'lora' in name.lower() and p.requires_grad)
+        print(f"🔧 LoRA trainable params: {lora_params:,}")
+        if lora_params == 0:
+            print("⚠️ Warning: No LoRA parameters found with requires_grad=True")
+    
+    def setup_data(self):
+        """设置数据 - 课程学习"""
+        chat_template = ChatTemplate(self.config.chat_template)
+        
+        # 🎓 初始化课程学习调度器
+        # 先加载数据来计算总样本数
+        with open(self.config.train_file, 'r', encoding='utf-8') as f:
+            if self.config.train_file.endswith('.jsonl'):
+                temp_data = [json.loads(line) for line in f if line.strip()]
+            else:
+                temp_data = json.load(f)
+        
+        self.curriculum_scheduler = CurriculumScheduler(self.config, len(temp_data))
+        print(f"🎓 Curriculum Learning: {self.config.curriculum_stages} stages based on bug_hunks_count")
+        
+        # 创建数据集（支持课程学习）
+        self.dataset = PreferenceDataset(
+            self.config.train_file,
+            self.tokenizer,
+            chat_template,
+            self.config.max_length,
+            self.config.num_negatives,
+            self.curriculum_scheduler
+        )
+        
+        # 创建数据加载器
+        self.train_loader = DataLoader(
+            self.dataset,
+            batch_size=self.config.batch_size,
+            shuffle=True,  # 在每个阶段内仍然随机打乱
+            collate_fn=lambda batch: collate_fn(
+                batch, self.tokenizer, chat_template,
+                self.config.max_length, self.config.num_negatives
+            ),
+            num_workers=0
+        )
+    
+    def setup_optimizer(self):
+        """设置优化器"""
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=self.config.learning_rate,
+            weight_decay=self.config.weight_decay
+        )
+        
+        total_steps = len(self.train_loader) * self.config.num_epochs // self.config.gradient_accumulation_steps
+        warmup_steps = int(total_steps * self.config.warmup_ratio)
+        
+        self.scheduler = get_linear_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps
+        )
+        
+        print(f"📈 Total training steps: {total_steps}")
+        print(f"🔥 Warmup steps: {warmup_steps}")
+    
+    def train_step(self, batch):
+        """训练步骤 - 使用混合损失（CrossEntropyLoss + PreferenceLoss）"""
+        # 移动数据到设备并确保需要梯度
+        for key in ['chosen', 'rejected']:
+            if key in batch and batch[key] is not None:
+                for tensor_key in batch[key]:
+                    if isinstance(batch[key][tensor_key], torch.Tensor):
+                        batch[key][tensor_key] = batch[key][tensor_key].to(self.device)
+                        # 对于input_ids，确保需要梯度以支持梯度检查点
+                        if tensor_key == 'input_ids':
+                            batch[key][tensor_key] = batch[key][tensor_key].requires_grad_(False)  # input_ids不需要梯度
+        
+        # 确保模型在训练模式
+        self.model.train()
+        
+        # 使用混合损失函数
+        if batch['chosen'] is not None:
+            total_loss, loss_dict = self.hybrid_loss(self.model, batch['chosen'], batch['rejected'])
+            
+            # 提取各个损失组件
+            lm_loss = loss_dict['lm_loss']
+            preference_loss = loss_dict['preference_loss']
+            
+            # 应用梯度累积
+            total_loss = total_loss / self.config.gradient_accumulation_steps
+            
+            return total_loss, lm_loss, preference_loss
+        else:
+            # 如果没有chosen数据，返回零损失
+            zero_loss = torch.tensor(0.0, device=self.device)
+            return zero_loss, zero_loss, zero_loss
+    
+    def train(self):
+        """🎓 课程学习训练主循环"""
+        print("🚀 Starting Curriculum Preference Training...")
+        
+        # 设置模型、数据、优化器
+        self.setup_model()
+        self.setup_data()
+        self.setup_optimizer()
+        
+        self.model.train()
+        
+        # 训练时间记录
+        start_time = time.time()
+        start_datetime = datetime.now()
+        
+        total_steps = len(self.train_loader) * self.config.num_epochs // self.config.gradient_accumulation_steps
+        
+        print(f"📊 Training Info:")
+        print(f"   Start time: {start_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"   Total steps: {total_steps}")
+        if self.config.use_curriculum:
+            print(f"   🎓 Curriculum: {self.config.curriculum_stages} stages, {self.config.curriculum_strategy} strategy")
+        print("=" * 60)
+        
+        for epoch in range(self.config.num_epochs):
+            epoch_loss = 0.0
+            
+            for batch_idx, batch in enumerate(self.train_loader):
+                # 训练步骤 - 现在返回lm_loss和preference_loss
+                total_loss, lm_loss, preference_loss = self.train_step(batch)
+                
+                # 反向传播
+                total_loss.backward()
+                
+                # 优化器步骤
+                if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
+                    if self.config.gradient_clipping > 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clipping)
+                    
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    self.scheduler.step()
+                    self.global_step += 1
+                    
+                    # 🎓 课程学习：检查是否需要更新阶段
+                    stage_changed = self.curriculum_scheduler.update_stage(self.global_step, total_steps)
+                    if stage_changed:
+                        new_stage = self.curriculum_scheduler.current_stage
+                        print(f"\n🎓 Curriculum Stage Update: Moving to Stage {new_stage}")
+                        
+                        # 更新数据集
+                        self.dataset.update_curriculum_stage(new_stage)
+                        
+                        # 重新创建数据加载器以使用新的数据集
+                        chat_template = ChatTemplate(self.config.chat_template)
+                        self.train_loader = DataLoader(
+                            self.dataset,
+                            batch_size=self.config.batch_size,
+                            shuffle=True,
+                            collate_fn=lambda batch: collate_fn(
+                                batch, self.tokenizer, chat_template,
+                                self.config.max_length, self.config.num_negatives
+                            ),
+                            num_workers=0
+                        )
+                        print(f"🎓 DataLoader updated with {len(self.dataset)} samples\n")
+                    
+                    # 日志记录
+                    if self.global_step % self.config.logging_steps == 0:
+                        lr = self.scheduler.get_last_lr()[0]
+                        elapsed_time = time.time() - start_time
+                        progress = (self.global_step / total_steps) * 100
+                        
+                        # 添加课程学习信息到日志
+                        stage = self.curriculum_scheduler.current_stage
+                        samples_count = len(self.dataset)
+                        total_samples = len(self.dataset.raw_data)
+                        curriculum_info = f" | 🎓 Stage: {stage} ({samples_count}/{total_samples})"
+                        
+                        self.loss_history.append({
+                            'step': self.global_step,
+                            'epoch': epoch + 1,
+                            'total_loss': total_loss.item(),
+                            'lm_loss': lm_loss.item(),
+                            'preference_loss': preference_loss.item(),
+                            'lr': lr,
+                            'curriculum_stage': self.curriculum_scheduler.current_stage,
+                            'curriculum_samples': len(self.dataset)
+                        })
+                        
+                        print(f"[Epoch {epoch+1}/{self.config.num_epochs}] "
+                              f"Step {self.global_step}/{total_steps} ({progress:.1f}%) | "
+                              f"LM: {lm_loss.item():.4f} | Pref: {preference_loss.item():.4f} | "
+                              f"Total: {total_loss.item():.4f} | LR: {lr:.2e}{curriculum_info}")
+                
+                epoch_loss += total_loss.item()
+            
+            print(f"✅ Epoch {epoch+1} completed | Avg Loss: {epoch_loss/len(self.train_loader):.4f}")
+        
+        # 保存模型
+        self.save_model()
+        
+        # 计算总训练时间
+        total_time = time.time() - start_time
+        end_datetime = datetime.now()
+        
+        print("🎉 Curriculum Preference Training completed!")
+        print(f"📊 Training Summary:")
+        print(f"   • Start time: {start_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"   • End time: {end_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"   • Total time: {total_time/60:.1f} minutes")
+        print(f"   • Total steps: {self.global_step}")
+        print(f"   • Final curriculum stage: {self.curriculum_scheduler.current_stage}")
+        print("=" * 60)
+    
+    def save_model(self):
+        """保存模型"""
+        self.model.save_pretrained(self.config.output_dir)
+        self.tokenizer.save_pretrained(self.config.output_dir)
+        print(f"💾 Model saved to {self.config.output_dir}")
+        
+        # 保存训练统计
+        if self.loss_history:
+            stats_file = os.path.join(self.config.output_dir, "training_stats.json")
+            with open(stats_file, 'w') as f:
+                json.dump(self.loss_history, f, indent=2)
+            print(f"📊 Training stats saved to {stats_file}")
+        
+        # 保存课程学习配置
+        curriculum_config = {
+            'curriculum_stages': self.config.curriculum_stages,
+            'final_stage': self.curriculum_scheduler.current_stage,
+            'strategy': 'bug_count'
+        }
+        curriculum_file = os.path.join(self.config.output_dir, "curriculum_config.json")
+        with open(curriculum_file, 'w') as f:
+            json.dump(curriculum_config, f, indent=2)
+        print(f"🎓 Curriculum config saved to {curriculum_file}")
+
+# ==========================================
+# 主程序
+# ==========================================
+
+def main():
+    """主函数"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='🎓 Curriculum Preference Training')
+    parser.add_argument('--model_name', type=str, required=True, 
+                       help='Model name (e.g., "Llama-3-8B-Instruct")')
+    parser.add_argument('--curriculum_stages', type=int, default=3,
+                       help='Number of curriculum stages')
+    args = parser.parse_args()
+    
+    # 创建配置
+    config = Config(model_name_only=args.model_name)
+    config.curriculum_stages = args.curriculum_stages
+    
+    print("🚀 Curriculum Preference Training Pipeline")
+    print("=" * 60)
+    print(f"🏷️ Model Name: {config.model_name_only}")
+    print(f"📁 Model Path: {config.model_name}")
+    print(f"📂 Data File: {config.train_file}")
+    print(f"💾 Output Dir: {config.output_dir}")
+    print(f"🔗 LoRA: Rank={config.lora_rank}, Alpha={config.lora_alpha}, Dropout={config.lora_dropout}")
+    print(f"🎯 Training: {config.num_epochs} epochs, Batch={config.batch_size}, LR={config.learning_rate}")
+    print(f"📊 Loss: Beta={config.preference_beta}, DFT Weight={config.dft_weight}")
+    print(f"🎓 Curriculum: {config.curriculum_stages} stages based on bug_hunks_count")
+    print(f"💬 Template: {config.chat_template}")
+    print("=" * 60)
+    
+    try:
+        # 开始训练
+        import torch
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        trainer = CurriculumPreferenceTrainer(config)
+        trainer.train()
+        
+        print("\n🎉 Curriculum Preference Training Completed!")
+        print("=" * 60)
+        print(f"📁 Final model saved: {config.output_dir}")
+        print("🎓 Curriculum learning enhanced training finished!")
+        print("🔬 Ready for evaluation and paper experiments!")
+        print("=" * 60)
+        
+    except Exception as e:
+        print(f"\n❌ Training failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
