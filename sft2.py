@@ -16,6 +16,8 @@ from dataclasses import dataclass
 
 os.environ.pop('PYTORCH_CUDA_ALLOC_CONF', None)
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
+
 warnings.filterwarnings("ignore", message="None of the inputs have requires_grad=True")
 
 # ==========================================
@@ -24,7 +26,7 @@ warnings.filterwarnings("ignore", message="None of the inputs have requires_grad
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 
 # ==========================================
 # 预训练模型与微调框架
@@ -149,6 +151,29 @@ class ChatTemplate:
         else:  # llama格式
             return f"<s>[INST] {prompt} [/INST] {full_response}</s>"
 
+class CurriculumSampler(Sampler):
+    """🎓 课程学习采样器 - 动态调整采样范围"""
+    def __init__(self, dataset, curriculum_scheduler):
+        self.dataset = dataset
+        self.curriculum_scheduler = curriculum_scheduler
+        self.current_stage = 0
+        
+    def update_stage(self, stage: int):
+        """更新当前阶段"""
+        self.current_stage = stage
+        
+    def __iter__(self):
+        # 根据当前阶段获取可用的数据索引
+        stage_data = self.curriculum_scheduler.get_stage_data(self.dataset.sorted_data, self.current_stage)
+        indices = list(range(len(stage_data)))
+        # 随机打乱
+        random.shuffle(indices)
+        return iter(indices)
+    
+    def __len__(self):
+        stage_data = self.curriculum_scheduler.get_stage_data(self.dataset.sorted_data, self.current_stage)
+        return len(stage_data)
+
 class CurriculumScheduler:
     """🎓 课程学习调度器"""
     def __init__(self, config: TrainingConfig, total_samples: int):
@@ -227,15 +252,16 @@ class PreferenceDataset(Dataset):
         
         # 🎓 课程学习：按难度排序
         self.sorted_data = curriculum_scheduler.sort_by_difficulty(self.raw_data)
-        self.current_stage_data = curriculum_scheduler.get_stage_data(self.sorted_data, 0)
         
         # 打印难度分布统计
         full_stats = curriculum_scheduler.get_difficulty_distribution(self.sorted_data)
-        stage_stats = curriculum_scheduler.get_difficulty_distribution(self.current_stage_data)
+        stage_0_data = curriculum_scheduler.get_stage_data(self.sorted_data, 0)
+        stage_stats = curriculum_scheduler.get_difficulty_distribution(stage_0_data)
         
         print(f"Curriculum Learning: {stage_stats['total_samples']}/{full_stats['total_samples']} samples in stage 0")
         
-        self.data = self.current_stage_data
+        # 使用完整的排序数据，由sampler控制实际使用的数据
+        self.data = self.sorted_data
     
     def update_curriculum_stage(self, stage: int):
         """更新课程学习阶段"""
@@ -269,13 +295,30 @@ def _process_sample_with_prompt_masking(tokenizer, chat_template, prompt, respon
     input_ids = tokenized['input_ids'].squeeze(0)
     attention_mask = tokenized['attention_mask'].squeeze(0)
     
-    # 计算prompt长度并掩码
-    prompt_only_text = chat_template.format_conversation(prompt, "")
-    prompt_tokens = tokenizer.encode(prompt_only_text, add_special_tokens=False)
-    prompt_len = len(prompt_tokens)
+    # 修复：更准确地计算prompt长度
+    # 方法1：使用完整的prompt模板来计算长度
+    if chat_template.template_type == "qwen":
+        prompt_template = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+    else:  # llama格式
+        prompt_template = f"<s>[INST] {prompt} [/INST] "
+    
+    # 使用相同的tokenizer设置来计算prompt长度
+    prompt_tokenized = tokenizer(
+        prompt_template,
+        add_special_tokens=False,  # 因为模板中已经包含了特殊token
+        return_tensors="pt"
+    )
+    prompt_len = prompt_tokenized['input_ids'].size(1)
     
     labels = input_ids.clone()
+    # 确保不会超出序列长度
+    prompt_len = min(prompt_len, len(labels))
     labels[:prompt_len] = -100  # 只对response部分计算损失
+    
+    # 调试信息：检查有多少个token用于损失计算
+    valid_tokens = (labels != -100).sum().item()
+    total_tokens = len(labels)
+    # print(f"Debug: prompt_len={prompt_len}, valid_tokens={valid_tokens}, total_tokens={total_tokens}")
     
     return {
         'input_ids': input_ids,
@@ -335,6 +378,7 @@ def collate_fn(batch, tokenizer, chat_template, max_length, num_negatives):
             # chosen使用预处理的labels，rejected全部为-100
             if is_chosen:
                 labels[i, :seq_len] = item['labels']
+            # 修复：padding部分的labels保持为-100（已经在初始化时设置）
         
         return {
             'input_ids': input_ids,
@@ -398,9 +442,16 @@ class DFTLoss(nn.Module):
         labels = batch['labels']
         log_probs = F.log_softmax(logits, dim=-1)
         probs = F.softmax(logits, dim=-1)
+        
+        # 修复：只使用非-100的位置作为mask，不要fallback到attention_mask
         mask = (labels != -100).float()
+        
+        # 如果mask全为0，说明数据处理有问题，返回一个小的非零损失而不是0
         if mask.sum() == 0:
-            mask = batch['attention_mask'].float()
+            print("Warning: No valid tokens for DFT loss calculation, returning small loss")
+            device = next(model.parameters()).device
+            return torch.tensor(1e-6, device=device, requires_grad=True)
+        
         labels_safe = labels.clone()
         labels_safe[labels == -100] = 0
         target_log_probs = log_probs.gather(-1, labels_safe.unsqueeze(-1)).squeeze(-1)
@@ -468,15 +519,27 @@ class HybridLoss(nn.Module):
             attention_mask=batch['attention_mask']
         )
         
-        logits = outputs.logits[:, :-1, :]  # 去掉最后一个位置
-        labels = batch['input_ids'][:, 1:].contiguous()  # 去掉第一个位置
+        # 修复：使用batch['labels']而不是重新计算shift
+        # 这样可以保持与mask处理的一致性
+        logits = outputs.logits
+        labels = batch['labels']
+        
+        # 确保logits和labels的维度匹配
+        if logits.size(1) != labels.size(1):
+            min_len = min(logits.size(1), labels.size(1))
+            logits = logits[:, :min_len, :]
+            labels = labels[:, :min_len]
         
         log_probs = F.log_softmax(logits, dim=-1)
         
-        # 创建mask，排除padding token
+        # 修复：只使用非-100的位置作为mask，与DFT loss保持一致
         mask = (labels != -100).float()
-        if mask.sum() == 0:  # 如果所有token都被忽略，使用attention_mask
-            mask = batch['attention_mask'][:, 1:].float()
+        
+        # 如果mask全为0，返回一个小的log概率
+        if mask.sum() == 0:
+            device = next(model.parameters()).device
+            batch_size = labels.size(0)
+            return torch.full((batch_size,), -10.0, device=device)
         
         # 收集目标token的log概率
         labels_safe = labels.clone()
@@ -501,10 +564,16 @@ class HybridLoss(nn.Module):
         labels = batch['labels']
         log_probs = F.log_softmax(logits, dim=-1)
         probs = F.softmax(logits, dim=-1)
+        
+        # 修复：只使用非-100的位置作为mask，不要fallback到attention_mask
         mask = (labels != -100).float()
+        
+        # 如果mask全为0，说明数据处理有问题，返回一个小的非零损失而不是0
         if mask.sum() == 0:
-            # 保持与未shift的一致性，使用完整的 attention_mask
-            mask = batch['attention_mask'].float()
+            print("Warning: No valid tokens for LM loss calculation, returning small loss")
+            device = next(model.parameters()).device
+            return torch.tensor(1e-6, device=device, requires_grad=True)
+        
         labels_safe = labels.clone()
         labels_safe[labels == -100] = 0
         target_log_probs = log_probs.gather(-1, labels_safe.unsqueeze(-1)).squeeze(-1)
@@ -522,7 +591,7 @@ class CurriculumPreferenceTrainer:
     
     def __init__(self, config: TrainingConfig):
         self.config = config
-        self.device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         
         # 创建输出目录
@@ -587,7 +656,7 @@ class CurriculumPreferenceTrainer:
         self.model = AutoModelForCausalLM.from_pretrained(
             self.config.model_name,
             quantization_config=bnb_config,
-            device_map={"": 1},  
+            device_map="auto",  
             trust_remote_code=True,
             use_cache=False
         )
@@ -672,11 +741,14 @@ class CurriculumPreferenceTrainer:
             self.curriculum_scheduler
         )
         
-        # 创建数据加载器
+        # 🎓 创建课程学习采样器
+        self.curriculum_sampler = CurriculumSampler(self.dataset, self.curriculum_scheduler)
+        
+        # 创建数据加载器 - 使用自定义采样器
         self.train_loader = DataLoader(
             self.dataset,
             batch_size=self.config.batch_size,
-            shuffle=True,  # 在每个阶段内仍然随机打乱
+            sampler=self.curriculum_sampler,  # 使用自定义采样器替代shuffle
             collate_fn=lambda batch: collate_fn(
                 batch, self.tokenizer, chat_template,
                 self.config.max_length, self.config.num_negatives
@@ -686,8 +758,9 @@ class CurriculumPreferenceTrainer:
     
     def setup_optimizer(self):
         """设置优化器"""
+        # 修复：只优化需要梯度的参数（LoRA参数）
         self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
+            filter(lambda p: p.requires_grad, self.model.parameters()),
             lr=self.config.learning_rate,
             weight_decay=self.config.weight_decay
         )
@@ -782,15 +855,9 @@ class CurriculumPreferenceTrainer:
                     # 🎓 课程学习：检查是否需要更新阶段
                     if self.curriculum_scheduler.update_stage(self.global_step, total_steps):
                         stage = self.curriculum_scheduler.current_stage
-                        self.dataset.update_curriculum_stage(stage)
-                        # 重建数据加载器
-                        chat_template = ChatTemplate(self.config.chat_template)
-                        self.train_loader = DataLoader(
-                            self.dataset, batch_size=self.config.batch_size, shuffle=True,
-                            collate_fn=lambda batch: collate_fn(
-                                batch, self.tokenizer, chat_template,
-                                self.config.max_length, self.config.num_negatives),
-                            num_workers=0)
+                        # 修复：只更新采样器，不重建DataLoader
+                        self.curriculum_sampler.update_stage(stage)
+                        print(f"🎓 Updated curriculum to stage {stage}")
                     
                     # 日志记录
                     if self.global_step % self.config.logging_steps == 0:
@@ -800,7 +867,8 @@ class CurriculumPreferenceTrainer:
                         
                         # 添加课程学习信息到日志
                         stage = self.curriculum_scheduler.current_stage
-                        samples_count = len(self.dataset)
+                        stage_data = self.curriculum_scheduler.get_stage_data(self.dataset.sorted_data, stage)
+                        samples_count = len(stage_data)
                         total_samples = len(self.dataset.raw_data)
                         curriculum_info = f" | 🎓 Stage: {stage} ({samples_count}/{total_samples})"
                         
@@ -812,7 +880,7 @@ class CurriculumPreferenceTrainer:
                             'preference_loss': preference_loss.item(),
                             'lr': lr,
                             'curriculum_stage': self.curriculum_scheduler.current_stage,
-                            'curriculum_samples': len(self.dataset)
+                            'curriculum_samples': samples_count
                         })
                         
                         print(f"[Epoch {epoch+1}/{self.config.num_epochs}] "
