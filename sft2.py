@@ -32,9 +32,10 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import (
     AutoTokenizer, 
     AutoModelForCausalLM,
-    get_linear_schedule_with_warmup
+    get_linear_schedule_with_warmup,
+    BitsAndBytesConfig
 )
-from peft import LoraConfig, get_peft_model, TaskType
+from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
 
 # ==========================================
 # 配置类
@@ -45,12 +46,11 @@ class TrainingConfig:
     """训练配置类"""
     
     # 模型配置
-    model_name_only: str = "Llama-3-8B-Instruct"
     model_base_path: str = "/data1/czj/model"
-    output_base_path: str = "/data1/czj/model"
+    output_base_path: str = "/data1/czj/train_model"
     
     # 数据配置
-    train_file: str = "/data1/czj/prorepair/data/trainset/sft_dataset.json"
+    train_file: str = "/data1/czj/prorepair/data/trainset/sft_dataset1.json"
     max_length: int = 2048
     num_negatives: int = 2
     chat_template: str = "llama"
@@ -61,27 +61,33 @@ class TrainingConfig:
     # 训练参数
     num_epochs: int = 3
     batch_size: int = 1
-    gradient_accumulation_steps: int = 4
-    learning_rate: float = 1.5e-5
+    gradient_accumulation_steps: int = 1
+    learning_rate: float = 2e-4
     weight_decay: float = 0.01
-    warmup_ratio: float = 0.03
-    gradient_clipping: float = 1.0
+    warmup_ratio: float = 0.05
+    gradient_clipping: float = 0.3
     
     # 课程学习
     curriculum_stages: int = 3
     
-    # LoRA配置
-    lora_rank: int = 8
+    # QLoRA配置
+    lora_rank: int = 32
     lora_alpha: float = 16.0
-    lora_dropout: float = 0.1
+    lora_dropout: float = 0.05
     target_modules: Optional[List[str]] = None
+    
+    # 量化配置
+    use_4bit: bool = True
+    bnb_4bit_compute_dtype: str = "bfloat16"
+    bnb_4bit_quant_type: str = "nf4"
+    use_nested_quant: bool = True
     
     # 损失函数
     preference_beta: float = 0.5
     
     # 优化配置
-    fp16: bool = True
-    bf16: bool = False
+    fp16: bool = False
+    bf16: bool = True
     gradient_checkpointing: bool = True
     
     # NEFTune噪声
@@ -92,11 +98,11 @@ class TrainingConfig:
     logging_steps: int = 100
     save_steps: int = 500
     
-    # 遗留配置（兼容性）
-    use_chain_lora: bool = False
-    chain_depth: int = 3
-    dft_weight: float = 0.3
-    use_dft: bool = True
+    
+    # 其他必需属性
+    model_name_only: str = ""  # 由命令行参数指定
+    use_curriculum: bool = True
+    curriculum_strategy: str = "bug_count"
     
     def __post_init__(self) -> None:
         """初始化后处理"""
@@ -110,7 +116,7 @@ class TrainingConfig:
             self.target_modules = self._get_default_target_modules()
     
     def _get_default_target_modules(self) -> List[str]:
-        """自动选择LoRA目标模块"""
+        """自动选择QLoRA目标模块"""
         model_name_lower = self.model_name_only.lower()
         if "llama" in model_name_lower or "qwen" in model_name_lower:
             return ["q_proj", "v_proj"]
@@ -217,7 +223,7 @@ class PreferenceDataset(Dataset):
             else:
                 self.raw_data = json.load(f)
         
-        print(f"✅ Loaded {len(self.raw_data)} preference samples")
+        print(f"Loaded {len(self.raw_data)} samples")
         
         # 🎓 课程学习：按难度排序
         self.sorted_data = curriculum_scheduler.sort_by_difficulty(self.raw_data)
@@ -227,13 +233,7 @@ class PreferenceDataset(Dataset):
         full_stats = curriculum_scheduler.get_difficulty_distribution(self.sorted_data)
         stage_stats = curriculum_scheduler.get_difficulty_distribution(self.current_stage_data)
         
-        print(f"🎓 Curriculum Learning Enabled:")
-        print(f"   📊 Full Dataset: {full_stats['total_samples']} samples, "
-              f"Difficulty: {full_stats['min_difficulty']:.1f} - {full_stats['max_difficulty']:.1f} "
-              f"(avg: {full_stats['avg_difficulty']:.1f})")
-        print(f"   🎯 Stage 0: {stage_stats['total_samples']} samples, "
-              f"Difficulty: {stage_stats['min_difficulty']:.1f} - {stage_stats['max_difficulty']:.1f} "
-              f"(avg: {stage_stats['avg_difficulty']:.1f})")
+        print(f"Curriculum Learning: {stage_stats['total_samples']}/{full_stats['total_samples']} samples in stage 0")
         
         self.data = self.current_stage_data
     
@@ -242,11 +242,8 @@ class PreferenceDataset(Dataset):
         self.current_stage_data = self.curriculum_scheduler.get_stage_data(self.sorted_data, stage)
         self.data = self.current_stage_data
         
-        # 打印新阶段的统计信息
         stage_stats = self.curriculum_scheduler.get_difficulty_distribution(self.current_stage_data)
-        print(f"🎓 Curriculum Stage {stage}: {stage_stats['total_samples']} samples, "
-              f"Difficulty: {stage_stats['min_difficulty']:.1f} - {stage_stats['max_difficulty']:.1f} "
-              f"(avg: {stage_stats['avg_difficulty']:.1f})")
+        print(f"Curriculum Stage {stage}: {stage_stats['total_samples']} samples")
     
     def __len__(self):
         return len(self.data)
@@ -363,7 +360,9 @@ class SFTLoss(nn.Module):
     def forward(self, model, chosen_batch, rejected_batch=None):
         """计算标准SFT损失"""
         if chosen_batch is None:
-            return torch.tensor(0.0), {'lm_loss': torch.tensor(0.0), 'total_loss': torch.tensor(0.0)}
+            device = next(model.parameters()).device
+            zero_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            return zero_loss, {'lm_loss': zero_loss, 'total_loss': zero_loss}
         
         outputs = model(
             input_ids=chosen_batch['input_ids'],
@@ -381,7 +380,9 @@ class DFTLoss(nn.Module):
     def forward(self, model, chosen_batch, rejected_batch=None):
         """计算DFT损失"""
         if chosen_batch is None:
-            return torch.tensor(0.0), {'lm_loss': torch.tensor(0.0), 'total_loss': torch.tensor(0.0)}
+            device = next(model.parameters()).device
+            zero_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            return zero_loss, {'lm_loss': zero_loss, 'total_loss': zero_loss}
         
         lm_loss = self._compute_dft_loss(model, chosen_batch)
         return lm_loss, {'lm_loss': lm_loss, 'total_loss': lm_loss}
@@ -422,16 +423,17 @@ class HybridLoss(nn.Module):
         
     def forward(self, model, chosen_batch, rejected_batch):
         """计算混合损失"""
-        total_loss = 0.0
+        device = next(model.parameters()).device
         individual_losses = {}
         
         # 1) DFT风格的LM损失（仅对chosen）
         if chosen_batch is not None:
             lm_loss = self._compute_lm_loss(model, chosen_batch)
-            total_loss += self.lm_weight * lm_loss
             individual_losses['lm_loss'] = lm_loss
+            total_loss = self.lm_weight * lm_loss
         else:
-            individual_losses['lm_loss'] = torch.tensor(0.0)
+            individual_losses['lm_loss'] = torch.tensor(0.0, device=device)
+            total_loss = torch.tensor(0.0, device=device, requires_grad=True)
         
         # 2) 偏好对比损失（pairwise logistic）
         if chosen_batch is not None and rejected_batch is not None:
@@ -451,10 +453,10 @@ class HybridLoss(nn.Module):
             diff = self.preference_beta * (chosen_log_prob - rejected_log_prob)
             preference_loss = -F.logsigmoid(diff).mean()
             
-            total_loss += self.preference_weight * preference_loss
+            total_loss = total_loss + self.preference_weight * preference_loss
             individual_losses['preference_loss'] = preference_loss
         else:
-            individual_losses['preference_loss'] = torch.tensor(0.0)
+            individual_losses['preference_loss'] = torch.tensor(0.0, device=device)
         
         individual_losses['total_loss'] = total_loss
         return total_loss, individual_losses
@@ -518,14 +520,10 @@ class HybridLoss(nn.Module):
 class CurriculumPreferenceTrainer:
     """🎓 课程学习偏好训练器"""
     
-    def __init__(self, config: Config):
+    def __init__(self, config: TrainingConfig):
         self.config = config
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
         
-        # 设置随机种子
-        random.seed(config.seed)
-        torch.manual_seed(config.seed)
-        torch.cuda.manual_seed_all(config.seed)
         
         # 创建输出目录
         os.makedirs(config.output_dir, exist_ok=True)
@@ -568,8 +566,6 @@ class CurriculumPreferenceTrainer:
     
     def setup_model(self):
         """设置模型"""
-        print(f"🔧 Loading model: {self.config.model_name}")
-        
         # Tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.config.model_name, 
@@ -579,18 +575,29 @@ class CurriculumPreferenceTrainer:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         
-        # Model - 直接GPU加载
-        print("🔧 Loading model directly to GPU...")
+        # QLoRA 量化配置
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=self.config.use_4bit,
+            bnb_4bit_compute_dtype=getattr(torch, self.config.bnb_4bit_compute_dtype),
+            bnb_4bit_quant_type=self.config.bnb_4bit_quant_type,
+            bnb_4bit_use_double_quant=self.config.use_nested_quant,
+        )
+        
+        # Model
         self.model = AutoModelForCausalLM.from_pretrained(
             self.config.model_name,
-            torch_dtype=torch.float16,
-            device_map="auto",  
+            quantization_config=bnb_config,
+            device_map={"": 1},  
             trust_remote_code=True,
             use_cache=False
         )
+        if hasattr(self.model, "config"):
+            self.model.config.use_cache = False
         
-        # 应用LoRA (在梯度检查点之前)
-        print(f"🔧 Applying LoRA: rank={self.config.lora_rank}")
+        # 准备k-bit训练
+        self.model = prepare_model_for_kbit_training(self.model)
+        
+        # QLoRA配置
         lora_config = LoraConfig(
             r=self.config.lora_rank,
             lora_alpha=self.config.lora_alpha,
@@ -601,33 +608,30 @@ class CurriculumPreferenceTrainer:
         )
         self.model = get_peft_model(self.model, lora_config)
         
-        # 确保LoRA参数需要梯度
+        # 梯度检查点
+        if self.config.gradient_checkpointing:
+            self.model.gradient_checkpointing_enable()
+            # 需要为输入启用梯度以兼容检查点
+            if hasattr(self.model, "enable_input_require_grads"):
+                self.model.enable_input_require_grads()
+        
+        # 确保只有LoRA参数需要梯度
         for name, param in self.model.named_parameters():
             if 'lora' in name.lower():
                 param.requires_grad = True
+            else:
+                param.requires_grad = False
         
-        # 启用梯度检查点 (在LoRA之后)
-        if self.config.gradient_checkpointing:
-            print("🔧 Enabling gradient checkpointing...")
-            self.model.gradient_checkpointing_enable()
-            # 确保基础模型参数不需要梯度 (只有LoRA需要)
-            for name, param in self.model.named_parameters():
-                if 'lora' not in name.lower():
-                    param.requires_grad = False
-        
-        # 打印参数统计
-        total_params = sum(p.numel() for p in self.model.parameters())
+        # 参数统计
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        print(f"📊 Total params: {total_params:,}")
-        print(f"📊 Trainable params: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
+        print(f"Trainable params: {trainable_params:,}")
         
-        # 验证梯度设置
+        # 验证LoRA参数
         lora_params = sum(p.numel() for name, p in self.model.named_parameters() if 'lora' in name.lower() and p.requires_grad)
-        print(f"🔧 LoRA trainable params: {lora_params:,}")
         if lora_params == 0:
-            print("⚠️ Warning: No LoRA parameters found with requires_grad=True")
+            raise RuntimeError("No LoRA parameters found with requires_grad=True")
         
-        # 注册 NEFTune 噪声（模仿 MOTrain.py: neftune_noise_alpha=5）
+        # NEFTune噪声
         if getattr(self.config, 'use_neftune', True) and self.config.neftune_alpha > 0:
             alpha = float(self.config.neftune_alpha)
             def neftune_forward_hook(module, input, output):
@@ -640,10 +644,8 @@ class CurriculumPreferenceTrainer:
                 if isinstance(module, nn.Embedding):
                     module.register_forward_hook(neftune_forward_hook)
                     neftune_modules.append(name)
-            if neftune_modules:
-                print(f"🔊 NEFTune enabled on {len(neftune_modules)} embedding modules, alpha={alpha}")
-            else:
-                print("⚠️ NEFTune not applied (no embedding modules found)")
+            if not neftune_modules:
+                print("⚠️ NEFTune: no embedding modules found")
     
     def setup_data(self):
         """设置数据 - 课程学习"""
@@ -658,7 +660,7 @@ class CurriculumPreferenceTrainer:
                 temp_data = json.load(f)
         
         self.curriculum_scheduler = CurriculumScheduler(self.config, len(temp_data))
-        print(f"🎓 Curriculum Learning: {self.config.curriculum_stages} stages based on bug_hunks_count")
+        print(f"Curriculum stages: {self.config.curriculum_stages}")
         
         # 创建数据集（支持课程学习）
         self.dataset = PreferenceDataset(
@@ -699,8 +701,7 @@ class CurriculumPreferenceTrainer:
             num_training_steps=total_steps
         )
         
-        print(f"📈 Total training steps: {total_steps}")
-        print(f"🔥 Warmup steps: {warmup_steps}")
+        print(f"Training steps: {total_steps}, warmup: {warmup_steps}")
     
     def train_step(self, batch):
         """训练步骤 - 使用混合损失（CrossEntropyLoss + PreferenceLoss）"""
@@ -731,7 +732,7 @@ class CurriculumPreferenceTrainer:
             return total_loss, lm_loss, preference_loss
         else:
             # 如果没有chosen数据，返回零损失
-            zero_loss = torch.tensor(0.0, device=self.device)
+            zero_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
             return zero_loss, zero_loss, zero_loss
     
     def train(self):
@@ -779,27 +780,17 @@ class CurriculumPreferenceTrainer:
                     self.global_step += 1
                     
                     # 🎓 课程学习：检查是否需要更新阶段
-                    stage_changed = self.curriculum_scheduler.update_stage(self.global_step, total_steps)
-                    if stage_changed:
-                        new_stage = self.curriculum_scheduler.current_stage
-                        print(f"\n🎓 Curriculum Stage Update: Moving to Stage {new_stage}")
-                        
-                        # 更新数据集
-                        self.dataset.update_curriculum_stage(new_stage)
-                        
-                        # 重新创建数据加载器以使用新的数据集
+                    if self.curriculum_scheduler.update_stage(self.global_step, total_steps):
+                        stage = self.curriculum_scheduler.current_stage
+                        self.dataset.update_curriculum_stage(stage)
+                        # 重建数据加载器
                         chat_template = ChatTemplate(self.config.chat_template)
                         self.train_loader = DataLoader(
-                            self.dataset,
-                            batch_size=self.config.batch_size,
-                            shuffle=True,
+                            self.dataset, batch_size=self.config.batch_size, shuffle=True,
                             collate_fn=lambda batch: collate_fn(
                                 batch, self.tokenizer, chat_template,
-                                self.config.max_length, self.config.num_negatives
-                            ),
-                            num_workers=0
-                        )
-                        print(f"🎓 DataLoader updated with {len(self.dataset)} samples\n")
+                                self.config.max_length, self.config.num_negatives),
+                            num_workers=0)
                     
                     # 日志记录
                     if self.global_step % self.config.logging_steps == 0:
@@ -896,19 +887,12 @@ def main():
     config.curriculum_stages = args.curriculum_stages
     config.training_mode = args.training_mode
     
-    print("🚀 Curriculum Preference Training Pipeline")
-    print("=" * 60)
-    print(f"🏷️ Model Name: {config.model_name_only}")
-    print(f"📁 Model Path: {config.model_name}")
-    print(f"📂 Data File: {config.train_file}")
-    print(f"💾 Output Dir: {config.output_dir}")
-    print(f"🔗 LoRA: Rank={config.lora_rank}, Alpha={config.lora_alpha}, Dropout={config.lora_dropout}")
-    print(f"🎯 Training: {config.num_epochs} epochs, Batch={config.batch_size}, LR={config.learning_rate}")
-    print(f"📊 Loss: Beta={config.preference_beta}, DFT Weight={config.dft_weight}")
-    print(f"🎓 Curriculum: {config.curriculum_stages} stages based on bug_hunks_count")
-    print(f"🎯 Training Mode: {config.training_mode}")
-    print(f"💬 Template: {config.chat_template}")
-    print("=" * 60)
+    print("Curriculum Preference Training")
+    print(f"Model: {config.model_name_only}")
+    print(f"Mode: {config.training_mode}")
+    print(f"LoRA: r={config.lora_rank}, alpha={config.lora_alpha}")
+    print(f"Epochs: {config.num_epochs}, LR: {config.learning_rate}")
+    print(f"Output: {config.output_dir}")
     
     try:
         # 开始训练
@@ -919,12 +903,7 @@ def main():
         trainer = CurriculumPreferenceTrainer(config)
         trainer.train()
         
-        print("\n🎉 Curriculum Preference Training Completed!")
-        print("=" * 60)
-        print(f"📁 Final model saved: {config.output_dir}")
-        print("🎓 Curriculum learning enhanced training finished!")
-        print("🔬 Ready for evaluation and paper experiments!")
-        print("=" * 60)
+        print(f"\nTraining completed! Model saved to: {config.output_dir}")
         
     except Exception as e:
         print(f"\n❌ Training failed: {e}")
