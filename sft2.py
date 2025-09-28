@@ -1,24 +1,34 @@
+"""
+多模式偏好训练框架 - 支持SFT/DFT/DFT+偏好三种训练模式
+"""
+
+# ==========================================
+# 系统导入与环境设置
+# ==========================================
 import os
 import json
 import random
 import time
 import warnings
-
-os.environ.pop('PYTORCH_CUDA_ALLOC_CONF', None)   # 取消你之前设置的 allocator 调整
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"           # 精确定位发生错误的 kernel（会慢）
-
-# 过滤梯度检查点警告
-warnings.filterwarnings("ignore", message="None of the inputs have requires_grad=True")
-
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Optional, Tuple, Any, Union
 from dataclasses import dataclass
 
+os.environ.pop('PYTORCH_CUDA_ALLOC_CONF', None)
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+warnings.filterwarnings("ignore", message="None of the inputs have requires_grad=True")
+
+# ==========================================
+# 深度学习框架导入
+# ==========================================
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
+# ==========================================
+# 预训练模型与微调框架
+# ==========================================
 from transformers import (
     AutoTokenizer, 
     AutoModelForCausalLM,
@@ -31,95 +41,111 @@ from peft import LoraConfig, get_peft_model, TaskType
 # ==========================================
 
 @dataclass
-class Config:
-    """训练配置 - 支持课程学习"""
-    # 动态参数 - 模型名称用于拼接路径
+class TrainingConfig:
+    """训练配置类"""
+    
+    # 模型配置
     model_name_only: str = "Llama-3-8B-Instruct"
-    
-    # 固定路径配置
     model_base_path: str = "/data1/czj/model"
-    train_file: str = "/data1/czj/prorepair/data/trainset/sft_dataset.json"
-    output_base_path: str = "/data1/czj/model"  # 输出基础路径
+    output_base_path: str = "/data1/czj/model"
     
-    # 固定训练参数
+    # 数据配置
+    train_file: str = "/data1/czj/prorepair/data/trainset/sft_dataset.json"
     max_length: int = 2048
-    batch_size: int = 2
-    gradient_accumulation_steps: int = 4
+    num_negatives: int = 2
+    chat_template: str = "llama"
+    
+    # 训练模式: "sft", "dft", "dft_preference"
+    training_mode: str = "dft_preference"
+    
+    # 训练参数
     num_epochs: int = 3
+    batch_size: int = 1
+    gradient_accumulation_steps: int = 4
     learning_rate: float = 1.5e-5
     weight_decay: float = 0.01
     warmup_ratio: float = 0.03
-    seed: int = 42
-    
-    # 🎓 课程学习参数
-    curriculum_stages: int = 3           # 课程阶段数
-    
-    # LoRA配置 - 使用标准LoRA避免复杂性
-    use_chain_lora: bool = False    # 使用标准LoRA而非Chain LoRA
-    chain_depth: int = 3            # Chain LoRA参数（保留但不使用）
-    lora_rank: int = 8              # rank=8标准配置
-    lora_alpha: float = 16.0        # 2倍rank的缩放因子
-    lora_dropout: float = 0.1       # 防过拟合的dropout
-    target_modules: List[str] = None
-    
-    # 固定损失参数
-    preference_beta: float = 0.5    # pairwise loss温度
-    dft_weight: float = 0.3         # DFT loss权重
-    use_dft: bool = True
-    num_negatives: int = 2          # 每个chosen使用的rejected数量
-    
-    # 固定训练优化 - 使用fp16避免bf16兼容性问题
-    fp16: bool = True               # 改用fp16，更好的driver兼容性
-    bf16: bool = False              # 禁用bf16避免优化器状态tensor问题
-    gradient_checkpointing: bool = True   # 如果内存不够可以启用，忽略警告
     gradient_clipping: float = 1.0
     
-    # 固定日志设置
-    logging_steps: int = 10
+    # 课程学习
+    curriculum_stages: int = 3
+    
+    # LoRA配置
+    lora_rank: int = 8
+    lora_alpha: float = 16.0
+    lora_dropout: float = 0.1
+    target_modules: Optional[List[str]] = None
+    
+    # 损失函数
+    preference_beta: float = 0.5
+    
+    # 优化配置
+    fp16: bool = True
+    bf16: bool = False
+    gradient_checkpointing: bool = True
+    
+    # NEFTune噪声
+    use_neftune: bool = True
+    neftune_alpha: float = 5.0
+    
+    # 日志配置
+    logging_steps: int = 100
     save_steps: int = 500
     
-    # 固定聊天模板
-    chat_template: str = "llama"
+    # 遗留配置（兼容性）
+    use_chain_lora: bool = False
+    chain_depth: int = 3
+    dft_weight: float = 0.3
+    use_dft: bool = True
     
-    def __post_init__(self):
-        # 拼接完整的模型路径
+    def __post_init__(self) -> None:
+        """初始化后处理"""
         self.model_name = os.path.join(self.model_base_path, self.model_name_only)
-        
-        # 动态生成输出路径
         model_short_name = self.model_name_only.lower().replace("-", "_")
-        self.output_dir = os.path.join(self.output_base_path, f"trained_model_{model_short_name}_curriculum")
-        
+        self.output_dir = os.path.join(
+            self.output_base_path, 
+            f"trained_model_{model_short_name}_curriculum"
+        )
         if self.target_modules is None:
-            # 自动设置target_modules
-            if "llama" in self.model_name_only.lower():
-                self.target_modules = ["q_proj", "v_proj"]
-            elif "qwen" in self.model_name_only.lower():
-                self.target_modules = ["q_proj", "v_proj"]
-            else:
-                self.target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"]
+            self.target_modules = self._get_default_target_modules()
+    
+    def _get_default_target_modules(self) -> List[str]:
+        """自动选择LoRA目标模块"""
+        model_name_lower = self.model_name_only.lower()
+        if "llama" in model_name_lower or "qwen" in model_name_lower:
+            return ["q_proj", "v_proj"]
+        else:
+            return ["q_proj", "v_proj", "k_proj", "o_proj"]
 
 # ==========================================
 # 数据处理
 # ==========================================
 
 class ChatTemplate:
-    """聊天模板"""
-    def __init__(self, template_type: str = "llama"):
+    """聊天模板处理器"""
+    
+    def __init__(self, template_type: str = "llama") -> None:
         self.template_type = template_type.lower()
+        if self.template_type not in ["llama", "qwen"]:
+            raise ValueError(f"不支持的模板类型: {template_type}，支持: llama, qwen")
     
     def format_conversation(self, prompt: str, response: str, explanation: str = "") -> str:
+        """格式化对话为训练文本"""
         full_response = response.strip()
         if explanation and explanation.strip():
             full_response = f"{full_response}\n\nExplanation: {explanation.strip()}"
         
         if self.template_type == "qwen":
-            return f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n{full_response}<|im_end|>"
-        else:  # llama
+            return (
+                f"<|im_start|>user\n{prompt}<|im_end|>\n"
+                f"<|im_start|>assistant\n{full_response}<|im_end|>"
+            )
+        else:  # llama格式
             return f"<s>[INST] {prompt} [/INST] {full_response}</s>"
 
 class CurriculumScheduler:
     """🎓 课程学习调度器"""
-    def __init__(self, config: Config, total_samples: int):
+    def __init__(self, config: TrainingConfig, total_samples: int):
         self.config = config
         self.total_samples = total_samples
         self.current_stage = 0
@@ -228,6 +254,38 @@ class PreferenceDataset(Dataset):
     def __getitem__(self, idx):
         return self.data[idx]
 
+def _process_sample_with_prompt_masking(tokenizer, chat_template, prompt, response, explanation, max_length):
+    """处理样本并正确掩码prompt部分"""
+    if explanation and explanation.strip():
+        full_response = f"{explanation.strip()}\n\n{response.strip()}"
+    else:
+        full_response = response.strip()
+    
+    full_text = chat_template.format_conversation(prompt, full_response)
+    tokenized = tokenizer(
+        full_text,
+        truncation=True,
+        max_length=max_length,
+        return_tensors="pt"
+    )
+    
+    input_ids = tokenized['input_ids'].squeeze(0)
+    attention_mask = tokenized['attention_mask'].squeeze(0)
+    
+    # 计算prompt长度并掩码
+    prompt_only_text = chat_template.format_conversation(prompt, "")
+    prompt_tokens = tokenizer.encode(prompt_only_text, add_special_tokens=False)
+    prompt_len = len(prompt_tokens)
+    
+    labels = input_ids.clone()
+    labels[:prompt_len] = -100  # 只对response部分计算损失
+    
+    return {
+        'input_ids': input_ids,
+        'attention_mask': attention_mask,
+        'labels': labels
+    }
+
 def collate_fn(batch, tokenizer, chat_template, max_length, num_negatives):
     """批处理函数"""
     chosen_batch = []
@@ -247,33 +305,25 @@ def collate_fn(batch, tokenizer, chat_template, max_length, num_negatives):
         if len(rejected_list) > num_negatives:
             rejected_list = random.sample(rejected_list, num_negatives)
         
-        # Tokenize chosen
-        chosen_text = chat_template.format_conversation(prompt, chosen, explanation)
-        chosen_tokens = tokenizer(
-            chosen_text,
-            truncation=True,
-            max_length=max_length,
-            return_tensors="pt"
+        # 处理chosen
+        chosen_item = _process_sample_with_prompt_masking(
+            tokenizer, chat_template, prompt, chosen, explanation, max_length
         )
-        chosen_batch.append(chosen_tokens)
+        chosen_batch.append(chosen_item)
         
-        # Tokenize rejected  
+        # 处理rejected
         for rejected in rejected_list:
-            rejected_text = chat_template.format_conversation(prompt, rejected)
-            rejected_tokens = tokenizer(
-                rejected_text,
-                truncation=True,
-                max_length=max_length,
-                return_tensors="pt"
+            rejected_item = _process_sample_with_prompt_masking(
+                tokenizer, chat_template, prompt, rejected, "", max_length
             )
-            rejected_batch.append(rejected_tokens)
+            rejected_batch.append(rejected_item)
     
     # Padding function with separate handling for chosen and rejected
     def pad_batch(batch_list, is_chosen=True):
         if not batch_list:
             return None
             
-        max_len = max(item['input_ids'].size(1) for item in batch_list)
+        max_len = max(item['input_ids'].size(0) for item in batch_list)  # 修复：使用size(0)而不是size(1)
         batch_size = len(batch_list)
         
         input_ids = torch.full((batch_size, max_len), tokenizer.pad_token_id, dtype=torch.long)
@@ -281,14 +331,13 @@ def collate_fn(batch, tokenizer, chat_template, max_length, num_negatives):
         labels = torch.full((batch_size, max_len), -100, dtype=torch.long)
         
         for i, item in enumerate(batch_list):
-            seq_len = item['input_ids'].size(1)
-            input_ids[i, :seq_len] = item['input_ids'].squeeze(0)
-            attention_mask[i, :seq_len] = item['attention_mask'].squeeze(0)
+            seq_len = item['input_ids'].size(0)  # 修复：使用size(0)
+            input_ids[i, :seq_len] = item['input_ids']  # 修复：不需要squeeze
+            attention_mask[i, :seq_len] = item['attention_mask']  # 修复：不需要squeeze
             
-            # 关键修改：只有chosen样本设置labels用于学习
+            # chosen使用预处理的labels，rejected全部为-100
             if is_chosen:
-                labels[i, :seq_len] = item['input_ids'].squeeze(0)
-            # rejected样本的labels保持-100，不参与学习
+                labels[i, :seq_len] = item['labels']
         
         return {
             'input_ids': input_ids,
@@ -305,112 +354,86 @@ def collate_fn(batch, tokenizer, chat_template, max_length, num_negatives):
 # 损失函数
 # ==========================================
 
-class PreferenceLoss(nn.Module):
-    """偏好损失"""
-    def __init__(self, beta: float = 0.5):
+class SFTLoss(nn.Module):
+    """标准SFT损失：交叉熵损失"""
+    def __init__(self):
         super().__init__()
-        self.beta = beta
+        self.cross_entropy = nn.CrossEntropyLoss(ignore_index=-100)
     
-    def get_log_probs(self, model, batch):
-        """计算log概率"""
+    def forward(self, model, chosen_batch, rejected_batch=None):
+        """计算标准SFT损失"""
+        if chosen_batch is None:
+            return torch.tensor(0.0), {'lm_loss': torch.tensor(0.0), 'total_loss': torch.tensor(0.0)}
+        
         outputs = model(
-            input_ids=batch['input_ids'],
-            attention_mask=batch['attention_mask']
+            input_ids=chosen_batch['input_ids'],
+            attention_mask=chosen_batch['attention_mask'],
+            labels=chosen_batch['labels']
         )
-        
-        logits = outputs.logits[:, :-1, :]
-        labels = batch['labels'][:, 1:].contiguous()
-        
-        log_probs = F.log_softmax(logits, dim=-1)
-        
-        mask = (labels != -100).float()
-        labels_safe = labels.clone()
-        labels_safe[labels == -100] = 0
-        
-        token_log_probs = log_probs.gather(-1, labels_safe.unsqueeze(-1)).squeeze(-1)
-        token_log_probs = token_log_probs * mask
-        
-        seq_log_probs = token_log_probs.sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
-        return seq_log_probs
-    
-    def forward(self, model, chosen_batch, rejected_batch):
-        """计算偏好损失"""
-        chosen_log_probs = self.get_log_probs(model, chosen_batch)
-        rejected_log_probs = self.get_log_probs(model, rejected_batch)
-        
-        # 处理维度不匹配
-        if len(rejected_log_probs) != len(chosen_log_probs):
-            num_chosen = len(chosen_log_probs)
-            rejected_log_probs = rejected_log_probs.view(num_chosen, -1).mean(dim=1)
-        
-        # Pairwise logistic loss
-        diff = self.beta * (chosen_log_probs - rejected_log_probs)
-        loss = -F.logsigmoid(diff).mean()
-        return loss
+        lm_loss = outputs.loss
+        return lm_loss, {'lm_loss': lm_loss, 'total_loss': lm_loss}
 
 class DFTLoss(nn.Module):
-    """DFT损失"""
-    def __init__(self, weight: float = 0.3):
+    """纯DFT损失：E[P(token) * (-log P(token))]"""
+    def __init__(self):
         super().__init__()
-        self.weight = weight
     
-    def forward(self, model, batch):
+    def forward(self, model, chosen_batch, rejected_batch=None):
         """计算DFT损失"""
+        if chosen_batch is None:
+            return torch.tensor(0.0), {'lm_loss': torch.tensor(0.0), 'total_loss': torch.tensor(0.0)}
+        
+        lm_loss = self._compute_dft_loss(model, chosen_batch)
+        return lm_loss, {'lm_loss': lm_loss, 'total_loss': lm_loss}
+    
+    def _compute_dft_loss(self, model, batch):
+        """DFT风格LM损失：E[P(token) * (-log P(token))]"""
         outputs = model(
             input_ids=batch['input_ids'],
-            attention_mask=batch['attention_mask']
+            attention_mask=batch['attention_mask'],
+            use_cache=False
         )
-        
-        logits = outputs.logits[:, :-1, :]
-        labels = batch['labels'][:, 1:].contiguous()
-        
-        probs = F.softmax(logits, dim=-1)
+        logits = outputs.logits
+        labels = batch['labels']
         log_probs = F.log_softmax(logits, dim=-1)
-        
+        probs = F.softmax(logits, dim=-1)
         mask = (labels != -100).float()
+        if mask.sum() == 0:
+            mask = batch['attention_mask'].float()
         labels_safe = labels.clone()
         labels_safe[labels == -100] = 0
-        
-        target_probs = probs.gather(-1, labels_safe.unsqueeze(-1)).squeeze(-1)
         target_log_probs = log_probs.gather(-1, labels_safe.unsqueeze(-1)).squeeze(-1)
-        
-        dft_loss = -(target_probs.detach() * target_log_probs) * mask
-        
-        return (dft_loss.sum() / mask.sum().clamp(min=1.0)) * self.weight
+        target_probs = probs.gather(-1, labels_safe.unsqueeze(-1)).squeeze(-1)
+        token_losses = (-target_log_probs) * target_probs
+        token_losses = token_losses * mask
+        return token_losses.sum() / mask.sum().clamp(min=1.0)
 
 class HybridLoss(nn.Module):
-    """混合损失：CrossEntropyLoss + PreferenceLoss
+    """混合损失：DFT风格LM损失 + 偏好对比损失
     
-    让chosen样本作用两次：
-    1. 通过CrossEntropyLoss直接学习token
-    2. 通过PreferenceLoss与rejected进行对比
+    - LM路径固定为DFT样式：loss = E[P(token) * (-log P(token))]
+    - 再加权偏好对比损失（chosen vs rejected）
     """
     def __init__(self, lm_weight: float = 1.0, preference_weight: float = 0.5, preference_beta: float = 0.5):
         super().__init__()
         self.lm_weight = lm_weight
         self.preference_weight = preference_weight
         self.preference_beta = preference_beta
-        self.cross_entropy = nn.CrossEntropyLoss(ignore_index=-100)
         
     def forward(self, model, chosen_batch, rejected_batch):
         """计算混合损失"""
         total_loss = 0.0
         individual_losses = {}
         
-        # 1. CrossEntropyLoss: chosen样本的语言建模损失
+        # 1) DFT风格的LM损失（仅对chosen）
         if chosen_batch is not None:
-            chosen_outputs = model(
-                input_ids=chosen_batch['input_ids'],
-                attention_mask=chosen_batch['attention_mask'],
-                labels=chosen_batch['labels']
-            )
-            lm_loss = chosen_outputs.loss  # 这是标准的CrossEntropyLoss
+            lm_loss = self._compute_lm_loss(model, chosen_batch)
             total_loss += self.lm_weight * lm_loss
             individual_losses['lm_loss'] = lm_loss
         else:
             individual_losses['lm_loss'] = torch.tensor(0.0)
         
-        # 2. PreferenceLoss: chosen vs rejected 对比损失
+        # 2) 偏好对比损失（pairwise logistic）
         if chosen_batch is not None and rejected_batch is not None:
             # 计算chosen的log概率
             chosen_log_prob = self._get_sequence_log_prob(model, chosen_batch)
@@ -464,6 +487,30 @@ class HybridLoss(nn.Module):
         seq_log_probs = token_log_probs.sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
         return seq_log_probs
 
+    def _compute_lm_loss(self, model, batch):
+        """DFT风格LM损失：E[P(token) * (-log P(token))]，与sft_grpo.py对齐。"""
+        outputs = model(
+            input_ids=batch['input_ids'],
+            attention_mask=batch['attention_mask'],
+            use_cache=False
+        )
+        # 与 sft_grpo.py 的 _dft_forward_step 对齐：不进行 token shift
+        logits = outputs.logits
+        labels = batch['labels']
+        log_probs = F.log_softmax(logits, dim=-1)
+        probs = F.softmax(logits, dim=-1)
+        mask = (labels != -100).float()
+        if mask.sum() == 0:
+            # 保持与未shift的一致性，使用完整的 attention_mask
+            mask = batch['attention_mask'].float()
+        labels_safe = labels.clone()
+        labels_safe[labels == -100] = 0
+        target_log_probs = log_probs.gather(-1, labels_safe.unsqueeze(-1)).squeeze(-1)
+        target_probs = probs.gather(-1, labels_safe.unsqueeze(-1)).squeeze(-1)
+        token_losses = (-target_log_probs) * target_probs
+        token_losses = token_losses * mask
+        return token_losses.sum() / mask.sum().clamp(min=1.0)
+
 # ==========================================
 # 训练器
 # ==========================================
@@ -494,19 +541,30 @@ class CurriculumPreferenceTrainer:
         self.curriculum_scheduler = None
         self.dataset = None
         
-        # 损失函数
-        self.preference_loss = PreferenceLoss(config.preference_beta)
-        self.dft_loss = DFTLoss(config.dft_weight)
-        # 新增：混合损失函数（CrossEntropyLoss + PreferenceLoss）
-        self.hybrid_loss = HybridLoss(
-            lm_weight=1.0,  # CrossEntropy权重
-            preference_weight=config.preference_beta,  # 偏好损失权重
-            preference_beta=config.preference_beta
-        )
+        # 根据训练模式选择损失函数
+        self.loss_fn = self._create_loss_function(config)
         
         # 训练状态
         self.global_step = 0
         self.loss_history = []
+    
+    def _create_loss_function(self, config: TrainingConfig) -> nn.Module:
+        """根据训练模式创建损失函数"""
+        if config.training_mode == "sft":
+            print("🎯 训练模式: 标准SFT")
+            return SFTLoss()
+        elif config.training_mode == "dft":
+            print("🎯 训练模式: 纯DFT")
+            return DFTLoss()
+        elif config.training_mode == "dft_preference":
+            print(f"🎯 训练模式: DFT + 偏好损失")
+            return HybridLoss(
+                lm_weight=1.0,
+                preference_weight=config.preference_beta,
+                preference_beta=config.preference_beta
+            )
+        else:
+            raise ValueError(f"不支持的训练模式: {config.training_mode}")
     
     def setup_model(self):
         """设置模型"""
@@ -568,6 +626,24 @@ class CurriculumPreferenceTrainer:
         print(f"🔧 LoRA trainable params: {lora_params:,}")
         if lora_params == 0:
             print("⚠️ Warning: No LoRA parameters found with requires_grad=True")
+        
+        # 注册 NEFTune 噪声（模仿 MOTrain.py: neftune_noise_alpha=5）
+        if getattr(self.config, 'use_neftune', True) and self.config.neftune_alpha > 0:
+            alpha = float(self.config.neftune_alpha)
+            def neftune_forward_hook(module, input, output):
+                if module.training and alpha > 0:
+                    noise = torch.randn_like(output) * (alpha / (output.numel() ** 0.5))
+                    return output + noise
+                return output
+            neftune_modules = []
+            for name, module in self.model.named_modules():
+                if isinstance(module, nn.Embedding):
+                    module.register_forward_hook(neftune_forward_hook)
+                    neftune_modules.append(name)
+            if neftune_modules:
+                print(f"🔊 NEFTune enabled on {len(neftune_modules)} embedding modules, alpha={alpha}")
+            else:
+                print("⚠️ NEFTune not applied (no embedding modules found)")
     
     def setup_data(self):
         """设置数据 - 课程学习"""
@@ -641,13 +717,13 @@ class CurriculumPreferenceTrainer:
         # 确保模型在训练模式
         self.model.train()
         
-        # 使用混合损失函数
+        # 使用选定的损失函数
         if batch['chosen'] is not None:
-            total_loss, loss_dict = self.hybrid_loss(self.model, batch['chosen'], batch['rejected'])
+            total_loss, loss_dict = self.loss_fn(self.model, batch['chosen'], batch.get('rejected'))
             
             # 提取各个损失组件
             lm_loss = loss_dict['lm_loss']
-            preference_loss = loss_dict['preference_loss']
+            preference_loss = loss_dict.get('preference_loss', torch.tensor(0.0))
             
             # 应用梯度累积
             total_loss = total_loss / self.config.gradient_accumulation_steps
@@ -810,11 +886,15 @@ def main():
                        help='Model name (e.g., "Llama-3-8B-Instruct")')
     parser.add_argument('--curriculum_stages', type=int, default=3,
                        help='Number of curriculum stages')
+    parser.add_argument('--training_mode', type=str, default='dft_preference',
+                       choices=['sft', 'dft', 'dft_preference'],
+                       help='Training mode: sft (standard), dft (pure DFT), dft_preference (DFT + preference)')
     args = parser.parse_args()
     
     # 创建配置
-    config = Config(model_name_only=args.model_name)
+    config = TrainingConfig(model_name_only=args.model_name)
     config.curriculum_stages = args.curriculum_stages
+    config.training_mode = args.training_mode
     
     print("🚀 Curriculum Preference Training Pipeline")
     print("=" * 60)
@@ -826,6 +906,7 @@ def main():
     print(f"🎯 Training: {config.num_epochs} epochs, Batch={config.batch_size}, LR={config.learning_rate}")
     print(f"📊 Loss: Beta={config.preference_beta}, DFT Weight={config.dft_weight}")
     print(f"🎓 Curriculum: {config.curriculum_stages} stages based on bug_hunks_count")
+    print(f"🎯 Training Mode: {config.training_mode}")
     print(f"💬 Template: {config.chat_template}")
     print("=" * 60)
     
