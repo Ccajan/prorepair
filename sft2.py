@@ -48,17 +48,19 @@ class TrainingConfig:
     """训练配置类"""
     
     # 模型配置
-    model_base_path: str = "/data1/czj/model"
-    output_base_path: str = "/data1/czj/train_model"
+    output_base_path: str = "trained_models"
     
     # 数据配置
-    train_file: str = "/data1/czj/prorepair/data/trainset/sft_dataset1.json"
+    train_file: str = "sft_dataset1.json"
     max_length: int = 2048
     num_negatives: int = 2
     chat_template: str = "llama"
     
     # 训练模式: "sft", "dft", "dft_preference"
     training_mode: str = "dft_preference"
+    
+    # 注意力实现: "sdpa", "eager"
+    attn_implementation: str = "sdpa"
     
     # 训练参数
     num_epochs: int = 3
@@ -97,9 +99,14 @@ class TrainingConfig:
     neftune_alpha: float = 5.0
     
     # 日志配置
-    logging_steps: int = 100
+    logging_steps: int = 1
     save_steps: int = 500
     
+    # Wandb配置
+    use_wandb: bool = True
+    wandb_project: str = "prorepair-training"
+    wandb_run_name: Optional[str] = None
+    wandb_entity: Optional[str] = None
     
     # 其他必需属性
     model_name_only: str = ""  # 由命令行参数指定
@@ -108,7 +115,7 @@ class TrainingConfig:
     
     def __post_init__(self) -> None:
         """初始化后处理"""
-        self.model_name = os.path.join(self.model_base_path, self.model_name_only)
+        self.model_name = f'codellama/CodeLlama-7b-Instruct-hf'
         model_short_name = self.model_name_only.lower().replace("-", "_")
         self.output_dir = os.path.join(
             self.output_base_path, 
@@ -614,6 +621,50 @@ class CurriculumPreferenceTrainer:
         # 训练状态
         self.global_step = 0
         self.loss_history = []
+        
+        # 📊 Wandb初始化
+        self.use_wandb = config.use_wandb
+        if self.use_wandb:
+            self._init_wandb()
+    
+    def _init_wandb(self):
+        """初始化Wandb"""
+        try:
+            import wandb
+            
+            # 生成运行名称
+            if self.config.wandb_run_name:
+                run_name = self.config.wandb_run_name
+            else:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                run_name = f"{self.config.model_name_only}_{self.config.training_mode}_{timestamp}"
+            
+            # 初始化wandb
+            wandb.init(
+                project=self.config.wandb_project,
+                entity=self.config.wandb_entity,
+                name=run_name,
+                config={
+                    "model_name": self.config.model_name,
+                    "model_name_only": self.config.model_name_only,
+                    "training_mode": self.config.training_mode,
+                    "num_epochs": self.config.num_epochs,
+                    "batch_size": self.config.batch_size,
+                    "learning_rate": self.config.learning_rate,
+                    "lora_rank": self.config.lora_rank,
+                    "lora_alpha": self.config.lora_alpha,
+                    "max_length": self.config.max_length,
+                    "attn_implementation": self.config.attn_implementation,
+                    "curriculum_stages": self.config.curriculum_stages,
+                }
+            )
+            print(f"✅ Wandb initialized: {wandb.run.url}")
+        except ImportError:
+            print("❌ Wandb not installed. Install with: pip install wandb")
+            self.use_wandb = False
+        except Exception as e:
+            print(f"❌ Wandb initialization failed: {e}")
+            self.use_wandb = False
     
     def _create_loss_function(self, config: TrainingConfig) -> nn.Module:
         """根据训练模式创建损失函数"""
@@ -652,13 +703,22 @@ class CurriculumPreferenceTrainer:
             bnb_4bit_use_double_quant=self.config.use_nested_quant,
         )
         
-        # Model
+        # Model - 添加注意力实现配置
+        model_kwargs = {
+            "quantization_config": bnb_config,
+            "device_map": "auto",
+            "trust_remote_code": True,
+            "use_cache": False
+        }
+        
+        # 如果指定了sdpa，添加attn_implementation参数
+        if self.config.attn_implementation == "sdpa":
+            model_kwargs["attn_implementation"] = "sdpa"
+            print(f"🚀 Using SDPA attention for acceleration")
+        
         self.model = AutoModelForCausalLM.from_pretrained(
             self.config.model_name,
-            quantization_config=bnb_config,
-            device_map="auto",  
-            trust_remote_code=True,
-            use_cache=False
+            **model_kwargs
         )
         if hasattr(self.model, "config"):
             self.model.config.use_cache = False
@@ -872,10 +932,13 @@ class CurriculumPreferenceTrainer:
                         total_samples = len(self.dataset.raw_data)
                         curriculum_info = f" | 🎓 Stage: {stage} ({samples_count}/{total_samples})"
                         
+                        # 计算未经梯度累积调整的原始损失值用于记录
+                        total_loss_log = total_loss.item() * self.config.gradient_accumulation_steps
+                        
                         self.loss_history.append({
                             'step': self.global_step,
                             'epoch': epoch + 1,
-                            'total_loss': total_loss.item(),
+                            'total_loss': total_loss_log,
                             'lm_loss': lm_loss.item(),
                             'preference_loss': preference_loss.item(),
                             'lr': lr,
@@ -883,10 +946,28 @@ class CurriculumPreferenceTrainer:
                             'curriculum_samples': samples_count
                         })
                         
+                        # 📊 Wandb日志
+                        if self.use_wandb:
+                            try:
+                                import wandb
+                                wandb.log({
+                                    "train/total_loss": total_loss_log,
+                                    "train/lm_loss": lm_loss.item(),
+                                    "train/preference_loss": preference_loss.item(),
+                                    "train/learning_rate": lr,
+                                    "train/epoch": epoch + 1,
+                                    "train/progress": progress,
+                                    "curriculum/stage": stage,
+                                    "curriculum/samples_count": samples_count,
+                                    "curriculum/samples_ratio": samples_count / total_samples,
+                                }, step=self.global_step)
+                            except Exception as e:
+                                print(f"⚠️ Wandb logging failed: {e}")
+                        
                         print(f"[Epoch {epoch+1}/{self.config.num_epochs}] "
                               f"Step {self.global_step}/{total_steps} ({progress:.1f}%) | "
                               f"LM: {lm_loss.item():.4f} | Pref: {preference_loss.item():.4f} | "
-                              f"Total: {total_loss.item():.4f} | LR: {lr:.2e}{curriculum_info}")
+                              f"Total: {total_loss_log:.4f} | LR: {lr:.2e}{curriculum_info}")
                 
                 epoch_loss += total_loss.item()
             
@@ -907,6 +988,20 @@ class CurriculumPreferenceTrainer:
         print(f"   • Total steps: {self.global_step}")
         print(f"   • Final curriculum stage: {self.curriculum_scheduler.current_stage}")
         print("=" * 60)
+        
+        # 📊 Wandb结束日志
+        if self.use_wandb:
+            try:
+                import wandb
+                wandb.log({
+                    "summary/total_training_time_minutes": total_time / 60,
+                    "summary/total_steps": self.global_step,
+                    "summary/final_curriculum_stage": self.curriculum_scheduler.current_stage,
+                })
+                wandb.finish()
+                print("✅ Wandb run finished successfully")
+            except Exception as e:
+                print(f"⚠️ Wandb finish failed: {e}")
     
     def save_model(self):
         """保存模型"""
@@ -948,12 +1043,28 @@ def main():
     parser.add_argument('--training_mode', type=str, default='dft_preference',
                        choices=['sft', 'dft', 'dft_preference'],
                        help='Training mode: sft (standard), dft (pure DFT), dft_preference (DFT + preference)')
+    parser.add_argument('--attn_implementation', type=str, default='sdpa',
+                       choices=['sdpa', 'eager'],
+                       help='Attention implementation: sdpa (faster), eager (standard)')
+    parser.add_argument('--use_wandb', action='store_true', default=True,
+                       help='Enable Wandb logging (default: True)')
+    parser.add_argument('--wandb_project', type=str, default='prorepair-training',
+                       help='Wandb project name')
+    parser.add_argument('--wandb_entity', type=str, default=None,
+                       help='Wandb entity (username or team name)')
+    parser.add_argument('--wandb_run_name', type=str, default=None,
+                       help='Wandb run name (auto-generated if not specified)')
     args = parser.parse_args()
     
     # 创建配置
     config = TrainingConfig(model_name_only=args.model_name)
     config.curriculum_stages = args.curriculum_stages
     config.training_mode = args.training_mode
+    config.attn_implementation = args.attn_implementation
+    config.use_wandb = args.use_wandb
+    config.wandb_project = args.wandb_project
+    config.wandb_entity = args.wandb_entity
+    config.wandb_run_name = args.wandb_run_name
     
     print("Curriculum Preference Training")
     print(f"Model: {config.model_name_only}")

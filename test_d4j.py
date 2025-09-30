@@ -304,8 +304,11 @@ class ValInfo():
             return
         filename = str(self.curr_bug) + '-validated.jsonl'
         log_file = os.path.join(self.val_result_path, filename)
-        if not os.path.exists(self.val_result_path):
+        # 直接尝试创建目录，避免竞态条件
+        try:
             os.makedirs(self.val_result_path, exist_ok=True)
+        except FileExistsError:
+            pass  # 目录已存在，继续
         try:   
             with open(log_file, "w") as f: 
                 json.dump(self.validated_result, f, indent=2)
@@ -523,9 +526,15 @@ def load_cached_result(log_path, result_path):
 
 def save_validation_result(log_path, result_path, results, log_content):
     """保存验证结果和日志"""
-    # 确保目录存在
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    os.makedirs(os.path.dirname(result_path), exist_ok=True)
+    # 确保目录存在，使用 try-except 避免竞态条件
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    except (FileExistsError, FileNotFoundError):
+        pass
+    try:
+        os.makedirs(os.path.dirname(result_path), exist_ok=True)
+    except (FileExistsError, FileNotFoundError):
+        pass
     
     print(f"[DEBUG] Saving results to:")
     print(f"[DEBUG] - Log: {log_path}")
