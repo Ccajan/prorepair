@@ -1,7 +1,13 @@
+import os, sys
+# 在导入torch前设置GPU，让整个进程只看到指定的GPU
+if len(sys.argv) == 6:
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"] = sys.argv[4]
 import json
-import os
-import sys
 import torch
+import time
+import fcntl
+import psutil
 from pathlib import Path
 from transformers import pipeline
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModelForSeq2SeqLM, BitsAndBytesConfig, AutoTokenizer
@@ -17,13 +23,126 @@ except RuntimeError:
     # 如果已经设置过，忽略错误
     pass
 
+
+def setup_gpu_environment():
+    """设置GPU环境，包括冲突检测和预防"""
+    if len(sys.argv) != 6:
+        print("Usage: python d4j.py <model_key> <num_processes> <process_id> <gpu_id> <num_generations>")
+        print("参数说明:")
+        print("  model_key: 模型名称")
+        print("  num_processes: 总进程数")
+        print("  process_id: 当前进程ID (0开始)")
+        print("  gpu_id: GPU编号 (0开始)")
+        print("  num_generations: 生成次数")
+        sys.exit(1)
+    
+    gpu_id = sys.argv[4]
+    
+    # 验证GPU编号格式
+    try:
+        gpu_num = int(gpu_id)
+        if gpu_num < 0:
+            raise ValueError("GPU编号不能为负数")
+    except ValueError as e:
+        print(f"错误：无效的GPU编号 '{gpu_id}': {e}")
+        sys.exit(1)
+    
+    # 由于CUDA_VISIBLE_DEVICES已设置，PyTorch只能看到一个GPU（编号为0）
+    if torch.cuda.is_available():
+        gpu_count = torch.cuda.device_count()
+        print(f"物理GPU {gpu_id} 已映射为 cuda:0 (PyTorch可见GPU数: {gpu_count})")
+        
+        # 测试GPU是否可用
+        try:
+            test_tensor = torch.tensor([1.0]).cuda(0)
+            print(f"GPU 测试成功: {test_tensor.device}")
+            del test_tensor
+        except Exception as e:
+            print(f"GPU 测试失败: {e}")
+            sys.exit(1)
+    else:
+        print("错误：CUDA不可用")
+        sys.exit(1)
+    
+    # GPU冲突检测和预防
+    lock_file = f"/tmp/gpu_{gpu_id}_lock"
+    try:
+        # 尝试获取GPU锁
+        lock_fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        
+        # 写入进程信息
+        process_info = f"PID:{os.getpid()},TIME:{time.time()},SCRIPT:{sys.argv[0]}\n"
+        os.write(lock_fd, process_info.encode())
+        os.close(lock_fd)
+        
+        print(f"成功获取物理GPU {gpu_id} 的锁")
+        
+        # 注册清理函数
+        import atexit
+        def cleanup_gpu_lock():
+            try:
+                if os.path.exists(lock_file):
+                    os.remove(lock_file)
+                    print(f"已释放GPU {gpu_id} 锁")
+            except:
+                pass
+        atexit.register(cleanup_gpu_lock)
+        
+    except FileExistsError:
+        # GPU已被占用，检查占用进程状态
+        try:
+            with open(lock_file, 'r') as f:
+                lock_info = f.read().strip()
+            
+            # 解析锁信息
+            if lock_info.startswith("PID:"):
+                parts = lock_info.split(',')
+                pid_str = parts[0].split(':')[1]
+                lock_pid = int(pid_str)
+                
+                # 检查进程是否还存在
+                if psutil.pid_exists(lock_pid):
+                    proc = psutil.Process(lock_pid)
+                    if proc.is_running():
+                        print(f"错误：GPU {gpu_id} 已被进程 {lock_pid} 占用")
+                        print(f"占用进程信息: {proc.name()} (状态: {proc.status()})")
+                        print("请等待该进程完成或手动终止该进程")
+                        sys.exit(1)
+                    else:
+                        print(f"检测到僵尸锁文件，进程 {lock_pid} 已不存在，清理锁文件")
+                        os.remove(lock_file)
+                        return setup_gpu_environment()  # 递归重试
+                else:
+                    print(f"检测到过期锁文件，进程 {lock_pid} 已不存在，清理锁文件")
+                    os.remove(lock_file)
+                    return setup_gpu_environment()  # 递归重试
+            else:
+                print(f"检测到格式错误的锁文件，清理并重试")
+                os.remove(lock_file)
+                return setup_gpu_environment()  # 递归重试
+                
+        except Exception as e:
+            print(f"检查GPU锁时出错: {e}")
+            print("建议手动检查并清理 /tmp/gpu_*_lock 文件")
+            sys.exit(1)
+    
+    except Exception as e:
+        print(f"设置GPU锁时出错: {e}")
+        sys.exit(1)
+    
+    print(f"GPU设置完成")
+
+
+# 在导入其他模块前先设置GPU环境
+if __name__ == '__main__':
+    setup_gpu_environment()
+
 # vLLM 环境变量优化 - WSL2兼容性
 os.environ['VLLM_USE_MODELSCOPE'] = '0'  # 使用数字格式
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
 os.environ['VLLM_ALLOW_LONG_MAX_MODEL_LEN'] = '1'  # 使用数字格式
 # WSL2 CUDA 兼容性设置
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'  # 同步CUDA调用以便调试
-os.environ['CUDA_VISIBLE_DEVICES'] = sys.argv[3]  # 明确指定GPU设备
 # os.environ['VLLM_ATTENTION_BACKEND'] = 'FLASHINFER'  # 让 vLLM 自动选择注意力后端
 os.environ['VLLM_USE_V1'] = '0'  # 禁用V1引擎，使用更稳定的V0
 # 离线模式设置 - 避免连接HuggingFace Hub
@@ -31,14 +150,8 @@ os.environ['HF_HUB_OFFLINE'] = '1'  # HuggingFace Hub离线模式
 os.environ['TRANSFORMERS_OFFLINE'] = '1'  # Transformers离线模式
 os.environ['HF_DATASETS_OFFLINE'] = '1'  # Datasets离线模式
 
-# vLLM 推理引擎导入
-try:
-    from vllm import LLM, SamplingParams
-    VLLM_AVAILABLE = True
-    print("vLLM 可用 - 将使用高性能推理引擎")
-except ImportError:
-    VLLM_AVAILABLE = False
-    print("vLLM 不可用 - 使用标准 transformers")
+import importlib
+VLLM_AVAILABLE = importlib.util.find_spec("vllm") is not None
 
 # 性能优化设置
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -84,10 +197,42 @@ def extract_first_java_code(s: str) -> str:
     return matches[0].strip() if matches else ""
 
 
+def monitor_gpu_status():
+    """监控GPU状态，提供详细的GPU使用信息"""
+    if not torch.cuda.is_available():
+        return "CUDA不可用"
+    
+    try:
+        # 获取当前使用的GPU设备
+        current_device = torch.cuda.current_device()
+        
+        # 获取GPU信息
+        gpu_name = torch.cuda.get_device_name(current_device)
+        total_memory = torch.cuda.get_device_properties(current_device).total_memory
+        allocated_memory = torch.cuda.memory_allocated(current_device)
+        cached_memory = torch.cuda.memory_reserved(current_device)
+        
+        # 计算使用率
+        memory_usage = (allocated_memory / total_memory) * 100
+        cache_usage = (cached_memory / total_memory) * 100
+        
+        # 显示GPU状态
+        status = f"当前GPU cuda:{current_device} ({gpu_name}): "
+        status += f"内存使用 {allocated_memory/1024**3:.1f}GB/{total_memory/1024**3:.1f}GB ({memory_usage:.1f}%), "
+        status += f"缓存 {cached_memory/1024**3:.1f}GB ({cache_usage:.1f}%)"
+        
+        return status
+    except Exception as e:
+        return f"GPU状态监控失败: {e}"
+
+
 def cleanup_resources():
     """清理资源，避免文件句柄泄露"""
     global model, tokenizer
     try:
+        print("开始清理资源...")
+        print(f"清理前GPU状态: {monitor_gpu_status()}")
+        
         if USE_VLLM and model is not None:
             # vLLM 模型清理
             if hasattr(model, 'llm_engine') and model.llm_engine is not None:
@@ -116,6 +261,7 @@ def cleanup_resources():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
+            print(f"清理后GPU状态: {monitor_gpu_status()}")
             
     except Exception as e:
         print(f"资源清理时出错: {e}")
@@ -208,48 +354,39 @@ def get_prompt_format(model_key):
     return '[INST]', '[/INST]'
 
 
-def load_vllm_model(model_config, retry_with_lower_memory=True):
-    """使用 vLLM 加载模型以获得最佳性能"""
+def load_vllm_model(model_config):
+    from vllm import LLM
+    """使用 vLLM 加载模型"""
     base_model_path = model_config['base_model']
     adapter_path = model_config.get('adapter_path')
     
-    # 如果有 LoRA 适配器，需要先合并
+    # 如果有 LoRA 适配器，报错退出
     if adapter_path and os.path.exists(adapter_path):
-        print(f"vLLM 模式：检测到 LoRA 适配器: {adapter_path}")
-        print("警告：vLLM 不直接支持 LoRA。降级到标准模式以支持 LoRA。")
-        raise RuntimeError("vLLM 不支持 LoRA 适配器，请使用预合并模型或降级到标准模式")
+        print(f"错误：检测到 LoRA 适配器: {adapter_path}")
+        print("vLLM 不支持 LoRA 适配器，请使用预合并模型")
+        sys.exit(1)
     
-    # vLLM WSL2 兼容配置 - 解决 CUDA 驱动错误和文件句柄问题
+    # vLLM 配置
     vllm_config = {
         "model": base_model_path,
-        "gpu_memory_utilization": 0.8,  # 进一步降低显存利用率以避免CUDA错误
+        "gpu_memory_utilization": 0.9,
         "trust_remote_code": True,
-        "max_model_len": 2048,  # 进一步降低序列长度
-        "enforce_eager": True,  # 禁用 CUDA Graph
-        "disable_custom_all_reduce": True,  # 禁用自定义 all-reduce
-        "disable_log_stats": True,  # 禁用统计日志
-        "download_dir": None,  # 不下载，使用本地缓存
-        "load_format": "auto",  # 自动检测格式
-        # 添加更多稳定性配置
-        "max_num_seqs": 8,  # 降低并发序列数以减少资源使用
-        "block_size": 16,  # 使用较小的块大小
-        "disable_sliding_window": True,  # 禁用滑动窗口
-        # WSL2 特殊配置
-        "enable_chunked_prefill": False,  # 禁用分块预填充
-        "use_v2_block_manager": False,  # 使用旧版块管理器
-        "swap_space": 0,  # 禁用交换空间
-        "cpu_offload_gb": 0,  # 禁用CPU卸载
+        "max_model_len": 4096,
+        "enforce_eager": True,
+        "disable_custom_all_reduce": True,
+        "disable_log_stats": True,
+        "download_dir": None,
+        "tensor_parallel_size": 1,
     }
     
-    print(f"vLLM WSL2兼容配置: 显存利用率80%, 最大序列长度2048, 降低并发数")
-    
+    print(f"加载vLLM模型: {base_model_path}")
     llm = LLM(**vllm_config)
     
-    # 加载对应的 tokenizer - 离线模式
+    # 加载对应的 tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
         base_model_path, 
         trust_remote_code=True,
-        local_files_only=True  # 仅使用本地文件
+        local_files_only=True
     )
     if tokenizer.pad_token is None:
         if tokenizer.eos_token is not None:
@@ -259,57 +396,10 @@ def load_vllm_model(model_config, retry_with_lower_memory=True):
     
     return llm, tokenizer
 
-def load_model_with_adapter(model_config):
-    """加载带LoRA适配器的模型（fallback方案）"""
-    base_model_path = model_config['base_model']
-    adapter_path = model_config.get('adapter_path')
-
-    # 加载tokenizer - 离线模式
-    tokenizer = AutoTokenizer.from_pretrained(
-        base_model_path, 
-        trust_remote_code=True,
-        local_files_only=True  # 仅使用本地文件
-    )
-    if tokenizer.pad_token is None:
-        if tokenizer.eos_token is not None:
-            tokenizer.pad_token = tokenizer.eos_token
-        else:
-            tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-
-    # 加载基础模型，启用 FlashAttention - 离线模式
-    model_kwargs = {
-        "device_map": "auto",
-        "torch_dtype": torch.bfloat16,
-        "trust_remote_code": True,
-        "local_files_only": True  # 仅使用本地文件
-    }
-    
-    # 如果支持 FlashAttention，启用相关设置
-    if FLASH_ATTENTION_AVAILABLE:
-        model_kwargs["attn_implementation"] = "flash_attention_2"
-    
-    model = AutoModelForCausalLM.from_pretrained(
-        base_model_path,
-        **model_kwargs
-    )
-
-    # 如果有适配器路径，加载并合并LoRA适配器
-    if adapter_path and os.path.exists(adapter_path):
-        print(f"Loading LoRA adapter from: {adapter_path}")
-        # 加载LoRA适配器
-        model = PeftModel.from_pretrained(model, adapter_path)
-        print(f"Original model type: {type(model).__name__}")
-
-        # 合并LoRA权重到基础模型中
-        model = model.merge_and_unload()
-        print(f"Merged model type: {type(model).__name__}")
-        print("LoRA weights merged into base model")
-
-    return model, tokenizer
 
 
 def main():
-    """主函数 - 解决多进程问题"""
+    """主函数"""
     # 设置文件句柄限制
     set_file_limits()
     
@@ -318,46 +408,23 @@ def main():
     BOF, EOF = get_prompt_format(sys.argv[1])
 
     try:
-        # 模型加载 - 优先使用 vLLM
+        # 检查vLLM是否可用
+        if not VLLM_AVAILABLE:
+            print("错误：vLLM未安装，请先安装vLLM")
+            sys.exit(1)
+        
+        # 加载模型
         if sys.argv[1] in MODEL_CONFIGS:
             model_config = MODEL_CONFIGS[sys.argv[1]]
-            
-            # 优先尝试使用 vLLM
-            if VLLM_AVAILABLE:
-                try:
-                    model, tokenizer = load_vllm_model(model_config)
-                    USE_VLLM = True
-                    print("成功加载 vLLM 引擎")
-                except RuntimeError as e:
-                    error_str = str(e)
-                    if "multiprocessing" in error_str or "freeze_support" in error_str:
-                        print(f"vLLM 多进程错误，降级到标准模式: {e}")
-                    elif "CUDA" in error_str or "cuda" in error_str or "unknown error" in error_str:
-                        print(f"vLLM CUDA/驱动错误，降级到标准模式: {e}")
-                        print("建议：检查显卡显存是否足够，或尝试降低 gpu_memory_utilization")
-                    else:
-                        print(f"vLLM 运行时错误，降级到标准模式: {e}")
-                    model, tokenizer = load_model_with_adapter(model_config)
-                    USE_VLLM = False
-                except Exception as e:
-                    print(f"vLLM 加载失败，降级到标准模式: {e}")
-                    model, tokenizer = load_model_with_adapter(model_config)
-                    USE_VLLM = False
-            else:
-                model, tokenizer = load_model_with_adapter(model_config)
-                USE_VLLM = False
-                
-                # 尝试编译模型以获得更好的性能（仅在非vLLM模式）
-                try:
-                    if hasattr(torch, 'compile'):
-                        model = torch.compile(model, mode="reduce-overhead")
-                        print("模型已编译优化")
-                except Exception as e:
-                    print(f"模型编译失败，使用原始模型: {e}")
+            model, tokenizer = load_vllm_model(model_config)
+            USE_VLLM = True
         else:
-            raise ValueError(f"Unknown model key: {sys.argv[1]}. Available models: {list(MODEL_CONFIGS.keys())}")
+            print(f"错误：未知的模型 '{sys.argv[1]}'")
+            print(f"可用模型: {list(MODEL_CONFIGS.keys())}")
+            sys.exit(1)
 
-        print('load model success ..', flush=True)
+        print('模型加载成功', flush=True)
+        print(f"GPU状态: {monitor_gpu_status()}")
         
         # 执行主要处理逻辑
         process_files()
@@ -365,7 +432,7 @@ def main():
     except KeyboardInterrupt:
         print("程序被用户中断")
     except Exception as e:
-        print(f"程序执行过程中出现错误: {e}")
+        print(f"程序执行错误: {e}")
         import traceback
         traceback.print_exc()
     finally:
@@ -397,7 +464,7 @@ def process_files():
                 json_data = json.loads(content)
                 result_data = json_data.copy()  # 创建副本避免修改原数据
 
-                for e in range(int(sys.argv[4])):
+                for e in range(int(sys.argv[5])):  # 更新为sys.argv[5]，因为现在num_generations是第5个参数
                     # 创建固定的输出目录
                     fix_dir = f'{base_fix_dir}/fixed{e}'
                     os.makedirs(fix_dir, exist_ok=True)
@@ -446,6 +513,7 @@ def process_files():
 
 def cal_vllm(bug_id, code, title, description, filename):
     """使用 vLLM 进行高性能推理"""
+    from vllm import SamplingParams
     try:
         prompt = BOF + "\n# " + title + '\n' + description + '\n' + "This is an incorrect code (" + filename + "):\n```java\n" + code + "\n```\nYou are a software engineer. Can you repair the incorrect code?\n" + EOF + "\n```java\n"
         print(prompt, flush=True)
@@ -503,6 +571,7 @@ def cal_vllm(bug_id, code, title, description, filename):
 
 def cal_vllm_batch(prompts):
     """vLLM 批处理推理 - 充分利用显存和并发"""
+    from vllm import SamplingParams
     print(f"vLLM 批处理: {len(prompts)} 个样本")
     
     # vLLM 采样参数
@@ -535,67 +604,18 @@ def cal_vllm_batch(prompts):
     return results
 
 def cal(bug_id, code, title, description, filename):
-    """统一推理接口 - 自动选择 vLLM 或标准模式"""
-    if USE_VLLM:
-        return cal_vllm(bug_id, code, title, description, filename)
-    else:
-        try:
-            # 标准 transformers 推理
-            prompt = BOF + "\n# " + title + '\n' + description + '\n' + "This is an incorrect code (" + filename + "):\n```java\n" + code + "\n```\nYou are a software engineer. Can you repair the incorrect code?\n" + EOF + "\n```java\n"
-            print(prompt, flush=True)
-            
-            inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)  # 降低长度
-            inputs = {k: v.to(model.device) for k, v in inputs.items()}
-            
-            generation_config = {
-                "max_new_tokens": 512,  # 降低生成长度
-                "temperature": 1.0,
-                "do_sample": True,
-                "top_p": 0.9,
-                "top_k": 50,
-                "repetition_penalty": 1.1,
-                "pad_token_id": tokenizer.pad_token_id,
-                "eos_token_id": tokenizer.eos_token_id,
-                "use_cache": True,
-                "num_beams": 1,
-                "early_stopping": False,
-            }
-            
-            try:
-                with torch.no_grad():
-                    outputs = model.generate(**inputs, **generation_config)
-                
-                full_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-                print(full_text)
-                
-                try:
-                    ret = extract_first_java_code(full_text.split('[/INST]')[1])
-                except IndexError:
-                    ret = extract_first_java_code(full_text)
-                
-                print('code:', ret, flush=True)
-                return [full_text, ret]
-                
-            except RuntimeError as e:
-                if "CUDA" in str(e) or "out of memory" in str(e):
-                    print(f"CUDA/内存错误，尝试清理缓存: {e}")
-                    # 清理缓存
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    import gc
-                    gc.collect()
-                    return [None, None]
-                else:
-                    print(f"生成错误: {e}")
-                    return [None, None]
-                    
-        except Exception as e:
-            print(f"cal 标准模式执行出错: {e}")
-            return [None, None]
+    """推理接口 - 使用vLLM"""
+    return cal_vllm(bug_id, code, title, description, filename)
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 5:
-        print("Usage: python d4j.py <model_key> <num_processes> <process_id> <num_generations>")
+    if len(sys.argv) != 6:
+        print("Usage: python d4j.py <model_key> <num_processes> <process_id> <gpu_id> <num_generations>")
+        print("参数说明:")
+        print("  model_key: 模型名称")
+        print("  num_processes: 总进程数")
+        print("  process_id: 当前进程ID (0开始)")
+        print("  gpu_id: GPU编号 (0开始)")
+        print("  num_generations: 生成次数")
         sys.exit(1)
     main()
