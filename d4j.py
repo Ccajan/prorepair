@@ -23,7 +23,7 @@ os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
 os.environ['VLLM_ALLOW_LONG_MAX_MODEL_LEN'] = '1'  # 使用数字格式
 # WSL2 CUDA 兼容性设置
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'  # 同步CUDA调用以便调试
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # 明确指定GPU设备
+os.environ['CUDA_VISIBLE_DEVICES'] = sys.argv[3]  # 明确指定GPU设备
 # os.environ['VLLM_ATTENTION_BACKEND'] = 'FLASHINFER'  # 让 vLLM 自动选择注意力后端
 os.environ['VLLM_USE_V1'] = '0'  # 禁用V1引擎，使用更稳定的V0
 # 离线模式设置 - 避免连接HuggingFace Hub
@@ -397,7 +397,7 @@ def process_files():
                 json_data = json.loads(content)
                 result_data = json_data.copy()  # 创建副本避免修改原数据
 
-                for e in range(int(sys.argv[-1])):
+                for e in range(int(sys.argv[4])):
                     # 创建固定的输出目录
                     fix_dir = f'{base_fix_dir}/fixed{e}'
                     os.makedirs(fix_dir, exist_ok=True)
@@ -595,4 +595,7 @@ def cal(bug_id, code, title, description, filename):
 
 
 if __name__ == '__main__':
+    if len(sys.argv) != 5:
+        print("Usage: python d4j.py <model_key> <num_processes> <process_id> <num_generations>")
+        sys.exit(1)
     main()
