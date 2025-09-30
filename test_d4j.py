@@ -16,9 +16,16 @@ import concurrent.futures as cf
 from contextlib import contextmanager, redirect_stdout, redirect_stderr
 import glob
 
-ROOT_PATH = '/data1/tmp/llm4apr_validation/'
-os.environ["JAVA_HOME"] = "/data1/miniconda3/envs/d4j"
-os.environ["PATH"] = os.path.join(os.environ["JAVA_HOME"], "bin") + ":" + os.environ["PATH"]
+ROOT_PATH = '/tmp/playground/'
+DEFECTS4J_PATH = '/home/barty/research/defects4j/framework/bin/defects4j'
+WORKSPACE_ROOT = os.path.abspath(os.path.dirname(__file__))  # 保存工作区根目录的绝对路径
+
+# 设置 Perl 环境变量
+import os as _os
+_perl5lib = f"/home/barty/perl5/lib/perl5{':' + _os.environ['PERL5LIB'] if 'PERL5LIB' in _os.environ else ''}"
+_os.environ['PERL5LIB'] = _perl5lib
+_os.environ['PATH'] = f"{_os.path.dirname(DEFECTS4J_PATH)}:{_os.environ.get('PATH', '')}"
+
 def clean_tmp_folder(tmp_dir):
     if os.path.isdir(tmp_dir) and tmp_dir.startswith(ROOT_PATH):
         shutil.rmtree(tmp_dir)
@@ -68,7 +75,7 @@ def guess_source_dir(project_dir):
     return None
 def checkout_defects4j_project(current_bug, project_dir):
     project, bug_id = current_bug.split('-')
-    command = f"defects4j checkout -p {project} -v {bug_id}b -w {project_dir}"
+    command = f"{DEFECTS4J_PATH} checkout -p {project} -v {bug_id}b -w {project_dir}"
     print('[CHECKOUT]', command)
 
     # 执行 checkout 命令
@@ -134,7 +141,7 @@ def command_with_timeout(cmd, timeout=90):
 
 def defects4j_test_suite(project_dir, timeout=1000):
     os.chdir(project_dir)
-    out, err = command_with_timeout(["defects4j", "test", "-r"], timeout)
+    out, err = command_with_timeout([DEFECTS4J_PATH, "test", "-r"], timeout)
     if "Compilation failed" in str(out):
         print("[FAIL] Compile tests for ", project_dir)
     return out, err
@@ -142,19 +149,19 @@ def defects4j_test_suite(project_dir, timeout=1000):
 
 def defects4j_export_trigger(project_dir, timeout=90):
     os.chdir(project_dir)
-    out, err = command_with_timeout(["defects4j", "export", "-p", "tests.trigger"], timeout)
+    out, err = command_with_timeout([DEFECTS4J_PATH, "export", "-p", "tests.trigger"], timeout)
     return out, err
 
 
 def defects4j_export_relevant(project_dir, timeout=90):
     os.chdir(project_dir)
-    out, err = command_with_timeout(["defects4j", "export", "-p", "tests.relevant"], timeout)
+    out, err = command_with_timeout([DEFECTS4J_PATH, "export", "-p", "tests.relevant"], timeout)
     return out, err
 
 
 def defects4j_test_one(project_dir, test_case, timeout=100):
     os.chdir(project_dir)
-    out, err = command_with_timeout(["defects4j", "test", "-t", test_case], timeout)
+    out, err = command_with_timeout([DEFECTS4J_PATH, "test", "-t", test_case], timeout)
     return out, err
 
 
@@ -229,12 +236,13 @@ class ValTime:
 
 
 class ValInfo():
-    def __init__(self, candidate_patch):
+    def __init__(self, candidate_patch, model_id):
         print(f"[DEBUG] Initializing ValInfo with: {candidate_patch[1].keys()}")
         self.unvrf_patches = candidate_patch
         self.curr_bug = candidate_patch[0]
         patch_info = candidate_patch[1]
         self.patches = patch_info['patches']
+        self.model_id = model_id
         self.patch_info = {
             'loc': patch_info['loc'],
             'start': patch_info['start'],
@@ -256,11 +264,8 @@ class ValInfo():
         self.validation_path = ROOT_PATH
         self.proj_dir = os.path.join(self.validation_path, self.curr_bug)
         clean_tmp_folder(self.proj_dir)
-        config_path = os.path.join(self.validation_path, 'config.json')
-        with open(config_path, 'r') as f:
-            config_info = json.load(f)
 
-        self.val_result_path = os.path.join('/data1/czj/prorepair/defects4j/results/', config_info['model_id'])
+        self.val_result_path = os.path.join('defects4j/results/', self.model_id)
         checkout_defects4j_project(self.curr_bug, self.proj_dir)
 
     def init_extract_project_info(self):
@@ -325,12 +330,17 @@ class ValInfo():
             self.relevant_tests = [line.strip() for line in str(out).split('\n') if line.strip()]
         
         # 运行初始测试套件，确认bug状态
-        init_out, _ = defects4j_test_suite(self.proj_dir)
+        init_out, init_err = defects4j_test_suite(self.proj_dir)
         self.failed_test_cases = []
+        
+        print(f"[DEBUG] Test suite output: {str(init_out)[:200]}")  # 打印前200个字符
+        print(f"[DEBUG] Test suite error: {str(init_err)[:200]}")
+        
         if init_out:
             self.failed_test_cases = [test.strip() for test in str(init_out).split(' - ')[1:]]
         
         print(f"[DEBUG] Found {len(self.trigger_tests)} trigger tests and {len(self.relevant_tests)} relevant tests")
+        print(f"[DEBUG] Found {len(self.failed_test_cases)} failed test cases")
 
 
 
@@ -492,6 +502,9 @@ class PatchValidation():
 
 
 def get_result_paths(fixed_dir, json_file):
+    # 确保使用绝对路径，防止 os.chdir 导致路径错误
+    if not os.path.isabs(fixed_dir):
+        fixed_dir = os.path.join(WORKSPACE_ROOT, fixed_dir)
     base_path = os.path.join(fixed_dir, json_file)
     log_path = f"{base_path}.judgelog"
     result_path = f"{base_path}.result"
@@ -536,7 +549,7 @@ def save_validation_result(log_path, result_path, results, log_content):
         print(f"[ERROR] Failed to save log file: {str(e)}")
         raise
 
-def validate_patches_per_bug(candidate_patch):
+def validate_patches_per_bug(candidate_patch, model_id):
     bug_name, patch_info = candidate_patch
     patches = patch_info['patches']
     total_patches = len(patches)
@@ -566,9 +579,22 @@ def validate_patches_per_bug(candidate_patch):
         return cached_result
     
     val_time = ValTime(time.time())
-    val_info = ValInfo(candidate_patch)
+    val_info = ValInfo(candidate_patch, model_id)
     if not val_info.check_init_success():
-        return
+        print(f"[ERROR] Initialization failed for {bug_name} - failed_test_cases is empty!")
+        print(f"[ERROR] Trigger tests: {len(val_info.trigger_tests)}, Relevant tests: {len(val_info.relevant_tests)}")
+        # 保存错误信息
+        error_result = [{
+            'patch_code': 'N/A',
+            'patch_status': 'INIT_FAILED',
+            'failing_tests': {'TRIGGER': [], 'RELEVANT': [], 'TIMEOUT': []},
+            'val_cnt': 0,
+            'bug_name': bug_name,
+            'diff_stats': None,
+            'error': 'Failed to initialize: no failing test cases detected'
+        }]
+        save_validation_result(log_path, result_path, error_result, f"Initialization failed for {bug_name}\n")
+        return error_result
     val_time.set_init_time(time.time())
     
     patch_results = []
@@ -701,12 +727,12 @@ class ValidationStats:
         return top1_rate, top5_rate, top10_rate  # 确保这行一定会执行
 
 def load_previous_results(model_id):
-    results_dir = f'/data1/czj/prorepair/defects4j/results/{model_id}'
+    results_dir = f'defects4j/results/{model_id}'
     previous_results = {}
     
     bug_dates = {}
     try:
-        with open('/data1/czj/prorepair/defects4j/time.jsonl', 'r') as f:
+        with open('defects4j/time.jsonl', 'r') as f:
             for line in f:
                 data = json.loads(line)
                 bug_id, date = list(data.items())[0]
@@ -799,7 +825,7 @@ def validate_defects4j(model_id, n_generations):
             print(f"- Major change     (<80% preserved):   {dist['low']:3d} patches ({dist['low']/total*100:5.1f}%)")
     
     for i in range(n_generations):
-        fix_dir = os.path.join('/data1/czj/prorepair/defects4j/results', str(model_id), f'fixed{i}')
+        fix_dir = os.path.join('defects4j/results', str(model_id), f'fixed{i}')
         if not os.path.exists(fix_dir):
             print(f"Warning: {fix_dir} does not exist")
             continue
@@ -870,7 +896,7 @@ def validate_defects4j(model_id, n_generations):
     
     with cf.ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_bug = {
-            executor.submit(validate_patches_per_bug, (bug_name, patch_info)): bug_name 
+            executor.submit(validate_patches_per_bug, (bug_name, patch_info), model_id): bug_name 
             for bug_name, patch_info in sorted(filtered_candidates.items())
         }
         

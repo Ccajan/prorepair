@@ -1,8 +1,12 @@
 import os, sys
 # 在导入torch前设置GPU，让整个进程只看到指定的GPU
-if len(sys.argv) == 6:
-    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ["CUDA_VISIBLE_DEVICES"] = sys.argv[4]
+# 但在重新提取模式下跳过GPU设置
+if len(sys.argv) >= 6:
+    # 检查是否为重新提取模式
+    is_reextract = len(sys.argv) == 7 and sys.argv[6] == '--reextract'
+    if not is_reextract:
+        os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        os.environ["CUDA_VISIBLE_DEVICES"] = sys.argv[4]
 import json
 import torch
 import time
@@ -26,14 +30,15 @@ except RuntimeError:
 
 def setup_gpu_environment():
     """设置GPU环境，包括冲突检测和预防"""
-    if len(sys.argv) != 6:
-        print("Usage: python d4j.py <model_key> <num_processes> <process_id> <gpu_id> <num_generations>")
+    if len(sys.argv) < 6 or len(sys.argv) > 7:
+        print("Usage: python d4j.py <model_key> <num_processes> <process_id> <gpu_id> <num_generations> [--reextract]")
         print("参数说明:")
         print("  model_key: 模型名称")
         print("  num_processes: 总进程数")
         print("  process_id: 当前进程ID (0开始)")
         print("  gpu_id: GPU编号 (0开始)")
         print("  num_generations: 生成次数")
+        print("  --reextract: (可选) 从已有的log文件重新提取代码，不重新生成")
         sys.exit(1)
     
     gpu_id = sys.argv[4]
@@ -135,7 +140,12 @@ def setup_gpu_environment():
 
 # 在导入其他模块前先设置GPU环境
 if __name__ == '__main__':
-    setup_gpu_environment()
+    # 如果是重新提取模式，跳过GPU设置
+    reextract_mode = len(sys.argv) == 7 and sys.argv[6] == '--reextract'
+    if not reextract_mode:
+        setup_gpu_environment()
+    else:
+        print("重新提取模式：跳过GPU环境设置")
 
 # vLLM 环境变量优化 - WSL2兼容性
 os.environ['VLLM_USE_MODELSCOPE'] = '0'  # 使用数字格式
@@ -193,8 +203,58 @@ EOF = None
 
 
 def extract_first_java_code(s: str) -> str:
+    # 首先尝试匹配完整的代码块（有闭合标记）
     matches = re.findall(r'```java(.*?)```', s, re.DOTALL)
-    return matches[0].strip() if matches else ""
+    if matches:
+        return matches[0].strip()
+    
+    # 如果没有闭合标记，尝试匹配从 ```java 开始到字符串结尾或到下一个 ``` 的内容
+    match = re.search(r'```java\s*(.*?)(?:```|$)', s, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    
+    return ""
+
+
+def reextract_code_from_log(log_file_path):
+    """从log文件中重新提取Java代码（从模型输出部分）"""
+    try:
+        with open(log_file_path, 'r', encoding='utf-8') as f:
+            log_content = f.read()
+        
+        # 找到模型输出的开始位置（在 [/INST] 或其他 EOF 标记之后）
+        # 尝试多种可能的分隔符
+        output_part = None
+        for separator in ['[/INST]', '<|im_end|>', '<|end|>\n<|assistant|>']:
+            if separator in log_content:
+                parts = log_content.split(separator)
+                if len(parts) > 1:
+                    output_part = parts[-1]  # 取最后一部分作为模型输出
+                    break
+        
+        # 如果没有找到分隔符，尝试查找 "```java" 出现的位置
+        # 假设第二个 ```java 是模型输出的代码
+        if output_part is None:
+            java_blocks = list(re.finditer(r'```java', log_content))
+            if len(java_blocks) >= 2:
+                # 从第二个 ```java 开始提取
+                output_part = log_content[java_blocks[1].start():]
+            else:
+                print(f"警告: 无法在 {log_file_path} 中找到模型输出分隔符")
+                return None
+        
+        # 从输出部分提取代码
+        code = extract_first_java_code(output_part)
+        
+        if code:
+            print(f"成功从 {log_file_path} 提取代码 (长度: {len(code)} 字符)")
+            return code
+        else:
+            print(f"警告: 无法从 {log_file_path} 的输出部分提取代码")
+            return None
+    except Exception as e:
+        print(f"读取log文件 {log_file_path} 时出错: {e}")
+        return None
 
 
 def monitor_gpu_status():
@@ -403,28 +463,36 @@ def main():
     # 设置文件句柄限制
     set_file_limits()
     
+    # 检查是否为重新提取模式
+    reextract_mode = len(sys.argv) == 7 and sys.argv[6] == '--reextract'
+    
     # 设置prompt格式
     global BOF, EOF, model, tokenizer, USE_VLLM
     BOF, EOF = get_prompt_format(sys.argv[1])
 
     try:
-        # 检查vLLM是否可用
-        if not VLLM_AVAILABLE:
-            print("错误：vLLM未安装，请先安装vLLM")
-            sys.exit(1)
-        
-        # 加载模型
-        if sys.argv[1] in MODEL_CONFIGS:
-            model_config = MODEL_CONFIGS[sys.argv[1]]
-            model, tokenizer = load_vllm_model(model_config)
-            USE_VLLM = True
+        # 重新提取模式不需要加载模型
+        if reextract_mode:
+            print("重新提取模式：跳过模型加载")
+            print("将直接从log文件提取代码...")
         else:
-            print(f"错误：未知的模型 '{sys.argv[1]}'")
-            print(f"可用模型: {list(MODEL_CONFIGS.keys())}")
-            sys.exit(1)
+            # 检查vLLM是否可用
+            if not VLLM_AVAILABLE:
+                print("错误：vLLM未安装，请先安装vLLM")
+                sys.exit(1)
+            
+            # 加载模型
+            if sys.argv[1] in MODEL_CONFIGS:
+                model_config = MODEL_CONFIGS[sys.argv[1]]
+                model, tokenizer = load_vllm_model(model_config)
+                USE_VLLM = True
+            else:
+                print(f"错误：未知的模型 '{sys.argv[1]}'")
+                print(f"可用模型: {list(MODEL_CONFIGS.keys())}")
+                sys.exit(1)
 
-        print('模型加载成功', flush=True)
-        print(f"GPU状态: {monitor_gpu_status()}")
+            print('模型加载成功', flush=True)
+            print(f"GPU状态: {monitor_gpu_status()}")
         
         # 执行主要处理逻辑
         process_files()
@@ -443,6 +511,15 @@ def process_files():
     """处理文件的主要逻辑"""
     base_dir = 'defects4j/dataset'
     base_fix_dir = f'defects4j/results/{sys.argv[1]}'
+    
+    # 检查是否为重新提取模式
+    reextract_mode = len(sys.argv) == 7 and sys.argv[6] == '--reextract'
+    
+    if reextract_mode:
+        print("=" * 60)
+        print("运行模式: 重新提取代码模式")
+        print("将从已有的log文件中重新提取Java代码并保存到JSON")
+        print("=" * 60)
 
     cnt = 0
 
@@ -472,9 +549,29 @@ def process_files():
                     # 获取文件名
                     file_name = os.path.basename(full_path)
                     fix_name = os.path.join(fix_dir, file_name)
+                    log_name = fix_name + '.log'
                     print(f"Output path: {fix_name}", flush=True)
                     
-                    if os.path.exists(fix_name) and os.path.exists(fix_name + '.log'):
+                    # 重新提取模式
+                    if reextract_mode:
+                        if os.path.exists(log_name):
+                            print(f"重新提取模式: 处理 {log_name}")
+                            # 从log文件提取代码
+                            extracted_code = reextract_code_from_log(log_name)
+                            if extracted_code:
+                                result_data['fix'] = extracted_code
+                                # 保存JSON文件
+                                with open(fix_name, 'w', encoding='utf-8') as output_file:
+                                    json.dump(result_data, output_file, indent=2, ensure_ascii=False)
+                                print(f"✓ 已更新 {fix_name}")
+                            else:
+                                print(f"✗ 跳过 {file_name} (无法提取代码)")
+                        else:
+                            print(f"跳过 {file_name} (log文件不存在)")
+                        continue
+                    
+                    # 正常生成模式
+                    if os.path.exists(fix_name) and os.path.exists(log_name):
                         print('result exists ...')
                         continue
                     
@@ -491,7 +588,7 @@ def process_files():
                         with open(fix_name, 'w', encoding='utf-8') as output_file:
                             json.dump(result_data, output_file, indent=2, ensure_ascii=False)
                         
-                        with open(fix_name + '.log', 'w', encoding='utf-8') as log_file:
+                        with open(log_name, 'w', encoding='utf-8') as log_file:
                             print(full, file=log_file)
                             
                     except Exception as e:
@@ -609,13 +706,14 @@ def cal(bug_id, code, title, description, filename):
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 6:
-        print("Usage: python d4j.py <model_key> <num_processes> <process_id> <gpu_id> <num_generations>")
+    if len(sys.argv) < 6 or len(sys.argv) > 7:
+        print("Usage: python d4j.py <model_key> <num_processes> <process_id> <gpu_id> <num_generations> [--reextract]")
         print("参数说明:")
         print("  model_key: 模型名称")
         print("  num_processes: 总进程数")
         print("  process_id: 当前进程ID (0开始)")
         print("  gpu_id: GPU编号 (0开始)")
         print("  num_generations: 生成次数")
+        print("  --reextract: (可选) 从已有的log文件重新提取代码，不重新生成")
         sys.exit(1)
     main()
