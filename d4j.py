@@ -1,12 +1,8 @@
 import os, sys
 # 在导入torch前设置GPU，让整个进程只看到指定的GPU
-# 但在重新提取模式下跳过GPU设置
-if len(sys.argv) >= 6:
-    # 检查是否为重新提取模式
-    is_reextract = len(sys.argv) == 7 and sys.argv[6] == '--reextract'
-    if not is_reextract:
-        os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-        os.environ["CUDA_VISIBLE_DEVICES"] = sys.argv[4]
+if len(sys.argv) == 6:
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"] = sys.argv[4]
 import json
 import torch
 import time
@@ -30,15 +26,14 @@ except RuntimeError:
 
 def setup_gpu_environment():
     """设置GPU环境，包括冲突检测和预防"""
-    if len(sys.argv) < 6 or len(sys.argv) > 7:
-        print("Usage: python d4j.py <model_key> <num_processes> <process_id> <gpu_id> <num_generations> [--reextract]")
+    if len(sys.argv) != 6:
+        print("Usage: python d4j.py <model_key> <num_processes> <process_id> <gpu_id> <num_generations>")
         print("参数说明:")
         print("  model_key: 模型名称")
         print("  num_processes: 总进程数")
         print("  process_id: 当前进程ID (0开始)")
         print("  gpu_id: GPU编号 (0开始)")
         print("  num_generations: 生成次数")
-        print("  --reextract: (可选) 从已有的log文件重新提取代码，不重新生成")
         sys.exit(1)
     
     gpu_id = sys.argv[4]
@@ -140,12 +135,7 @@ def setup_gpu_environment():
 
 # 在导入其他模块前先设置GPU环境
 if __name__ == '__main__':
-    # 如果是重新提取模式，跳过GPU设置
-    reextract_mode = len(sys.argv) == 7 and sys.argv[6] == '--reextract'
-    if not reextract_mode:
-        setup_gpu_environment()
-    else:
-        print("重新提取模式：跳过GPU环境设置")
+    setup_gpu_environment()
 
 # vLLM 环境变量优化 - WSL2兼容性
 os.environ['VLLM_USE_MODELSCOPE'] = '0'  # 使用数字格式
@@ -203,58 +193,8 @@ EOF = None
 
 
 def extract_first_java_code(s: str) -> str:
-    # 首先尝试匹配完整的代码块（有闭合标记）
     matches = re.findall(r'```java(.*?)```', s, re.DOTALL)
-    if matches:
-        return matches[0].strip()
-    
-    # 如果没有闭合标记，尝试匹配从 ```java 开始到字符串结尾或到下一个 ``` 的内容
-    match = re.search(r'```java\s*(.*?)(?:```|$)', s, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    
-    return ""
-
-
-def reextract_code_from_log(log_file_path):
-    """从log文件中重新提取Java代码（从模型输出部分）"""
-    try:
-        with open(log_file_path, 'r', encoding='utf-8') as f:
-            log_content = f.read()
-        
-        # 找到模型输出的开始位置（在 [/INST] 或其他 EOF 标记之后）
-        # 尝试多种可能的分隔符
-        output_part = None
-        for separator in ['[/INST]', '<|im_end|>', '<|end|>\n<|assistant|>']:
-            if separator in log_content:
-                parts = log_content.split(separator)
-                if len(parts) > 1:
-                    output_part = parts[-1]  # 取最后一部分作为模型输出
-                    break
-        
-        # 如果没有找到分隔符，尝试查找 "```java" 出现的位置
-        # 假设第二个 ```java 是模型输出的代码
-        if output_part is None:
-            java_blocks = list(re.finditer(r'```java', log_content))
-            if len(java_blocks) >= 2:
-                # 从第二个 ```java 开始提取
-                output_part = log_content[java_blocks[1].start():]
-            else:
-                print(f"警告: 无法在 {log_file_path} 中找到模型输出分隔符")
-                return None
-        
-        # 从输出部分提取代码
-        code = extract_first_java_code(output_part)
-        
-        if code:
-            print(f"成功从 {log_file_path} 提取代码 (长度: {len(code)} 字符)")
-            return code
-        else:
-            print(f"警告: 无法从 {log_file_path} 的输出部分提取代码")
-            return None
-    except Exception as e:
-        print(f"读取log文件 {log_file_path} 时出错: {e}")
-        return None
+    return matches[0].strip() if matches else ""
 
 
 def monitor_gpu_status():
@@ -414,17 +354,130 @@ def get_prompt_format(model_key):
     return '[INST]', '[/INST]'
 
 
+def merge_lora_adapter(base_model_path: str, adapter_path: str, output_path: str):
+    """
+    合并 LoRA 适配器到基础模型
+    
+    Args:
+        base_model_path: 基础模型路径
+        adapter_path: LoRA 适配器路径
+        output_path: 合并后模型的输出路径
+    
+    Returns:
+        str: 合并后的模型路径
+    """
+    print("=" * 60)
+    print("🔄 检测到 LoRA 适配器，开始自动合并...")
+    print("=" * 60)
+    
+    # 检查是否已经合并过
+    if os.path.exists(output_path):
+        config_file = os.path.join(output_path, "config.json")
+        if os.path.exists(config_file):
+            print(f"✅ 发现已合并的模型: {output_path}")
+            print("   跳过合并步骤，直接使用已合并模型")
+            return output_path
+    
+    print(f"📦 基础模型: {base_model_path}")
+    print(f"🔗 LoRA 适配器: {adapter_path}")
+    print(f"💾 输出路径: {output_path}")
+    print()
+    
+    try:
+        from peft import PeftModel
+        
+        print("📦 [1/4] 加载基础模型...")
+        base_model = AutoModelForCausalLM.from_pretrained(
+            base_model_path,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+            low_cpu_mem_usage=True
+        )
+        print("✅ 基础模型加载成功")
+        
+        print("\n🔗 [2/4] 加载 LoRA 适配器...")
+        model = PeftModel.from_pretrained(
+            base_model,
+            adapter_path,
+            torch_dtype=torch.bfloat16
+        )
+        print("✅ LoRA 适配器加载成功")
+        
+        print("\n🔄 [3/4] 合并 LoRA 权重...")
+        model = model.merge_and_unload()
+        print("✅ 合并成功")
+        
+        print(f"\n💾 [4/4] 保存合并后的模型到 {output_path}")
+        os.makedirs(output_path, exist_ok=True)
+        model.save_pretrained(
+            output_path,
+            safe_serialization=True,
+            max_shard_size="5GB"
+        )
+        
+        # 保存 tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(
+            base_model_path,
+            trust_remote_code=True
+        )
+        tokenizer.save_pretrained(output_path)
+        print("✅ 保存成功")
+        
+        # 清理内存
+        del model
+        del base_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        print("\n" + "=" * 60)
+        print("✅ LoRA 合并完成！")
+        print("=" * 60)
+        return output_path
+        
+    except ImportError:
+        print("❌ 错误：未安装 peft 库")
+        print("请运行: pip install peft")
+        sys.exit(1)
+    except Exception as e:
+        print(f"❌ 合并失败: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
 def load_vllm_model(model_config):
     from vllm import LLM
     """使用 vLLM 加载模型"""
     base_model_path = model_config['base_model']
     adapter_path = model_config.get('adapter_path')
     
-    # 如果有 LoRA 适配器，报错退出
+    # 如果有 LoRA 适配器，先合并
     if adapter_path and os.path.exists(adapter_path):
-        print(f"错误：检测到 LoRA 适配器: {adapter_path}")
-        print("vLLM 不支持 LoRA 适配器，请使用预合并模型")
-        sys.exit(1)
+        # 检查是否是 LoRA 适配器（检查 adapter_config.json）
+        adapter_config_file = os.path.join(adapter_path, "adapter_config.json")
+        if os.path.exists(adapter_config_file):
+            print(f"🔍 检测到 LoRA 适配器: {adapter_path}")
+            
+            # 生成合并后模型的路径
+            adapter_name = os.path.basename(adapter_path.rstrip('/'))
+            merged_model_path = os.path.join(
+                os.path.dirname(adapter_path),
+                f"{adapter_name}_merged"
+            )
+            
+            # 合并 LoRA
+            actual_model_path = merge_lora_adapter(
+                base_model_path,
+                adapter_path,
+                merged_model_path
+            )
+            
+            # 使用合并后的模型
+            base_model_path = actual_model_path
+            print(f"\n🚀 使用合并后的模型: {base_model_path}\n")
+        else:
+            print(f"⚠️ 路径存在但不是 LoRA 适配器，尝试直接加载: {adapter_path}")
     
     # vLLM 配置
     vllm_config = {
@@ -463,36 +516,28 @@ def main():
     # 设置文件句柄限制
     set_file_limits()
     
-    # 检查是否为重新提取模式
-    reextract_mode = len(sys.argv) == 7 and sys.argv[6] == '--reextract'
-    
     # 设置prompt格式
     global BOF, EOF, model, tokenizer, USE_VLLM
     BOF, EOF = get_prompt_format(sys.argv[1])
 
     try:
-        # 重新提取模式不需要加载模型
-        if reextract_mode:
-            print("重新提取模式：跳过模型加载")
-            print("将直接从log文件提取代码...")
+        # 检查vLLM是否可用
+        if not VLLM_AVAILABLE:
+            print("错误：vLLM未安装，请先安装vLLM")
+            sys.exit(1)
+        
+        # 加载模型
+        if sys.argv[1] in MODEL_CONFIGS:
+            model_config = MODEL_CONFIGS[sys.argv[1]]
+            model, tokenizer = load_vllm_model(model_config)
+            USE_VLLM = True
         else:
-            # 检查vLLM是否可用
-            if not VLLM_AVAILABLE:
-                print("错误：vLLM未安装，请先安装vLLM")
-                sys.exit(1)
-            
-            # 加载模型
-            if sys.argv[1] in MODEL_CONFIGS:
-                model_config = MODEL_CONFIGS[sys.argv[1]]
-                model, tokenizer = load_vllm_model(model_config)
-                USE_VLLM = True
-            else:
-                print(f"错误：未知的模型 '{sys.argv[1]}'")
-                print(f"可用模型: {list(MODEL_CONFIGS.keys())}")
-                sys.exit(1)
+            print(f"错误：未知的模型 '{sys.argv[1]}'")
+            print(f"可用模型: {list(MODEL_CONFIGS.keys())}")
+            sys.exit(1)
 
-            print('模型加载成功', flush=True)
-            print(f"GPU状态: {monitor_gpu_status()}")
+        print('模型加载成功', flush=True)
+        print(f"GPU状态: {monitor_gpu_status()}")
         
         # 执行主要处理逻辑
         process_files()
@@ -511,15 +556,6 @@ def process_files():
     """处理文件的主要逻辑"""
     base_dir = 'defects4j/dataset'
     base_fix_dir = f'defects4j/results/{sys.argv[1]}'
-    
-    # 检查是否为重新提取模式
-    reextract_mode = len(sys.argv) == 7 and sys.argv[6] == '--reextract'
-    
-    if reextract_mode:
-        print("=" * 60)
-        print("运行模式: 重新提取代码模式")
-        print("将从已有的log文件中重新提取Java代码并保存到JSON")
-        print("=" * 60)
 
     cnt = 0
 
@@ -549,29 +585,9 @@ def process_files():
                     # 获取文件名
                     file_name = os.path.basename(full_path)
                     fix_name = os.path.join(fix_dir, file_name)
-                    log_name = fix_name + '.log'
                     print(f"Output path: {fix_name}", flush=True)
                     
-                    # 重新提取模式
-                    if reextract_mode:
-                        if os.path.exists(log_name):
-                            print(f"重新提取模式: 处理 {log_name}")
-                            # 从log文件提取代码
-                            extracted_code = reextract_code_from_log(log_name)
-                            if extracted_code:
-                                result_data['fix'] = extracted_code
-                                # 保存JSON文件
-                                with open(fix_name, 'w', encoding='utf-8') as output_file:
-                                    json.dump(result_data, output_file, indent=2, ensure_ascii=False)
-                                print(f"✓ 已更新 {fix_name}")
-                            else:
-                                print(f"✗ 跳过 {file_name} (无法提取代码)")
-                        else:
-                            print(f"跳过 {file_name} (log文件不存在)")
-                        continue
-                    
-                    # 正常生成模式
-                    if os.path.exists(fix_name) and os.path.exists(log_name):
+                    if os.path.exists(fix_name) and os.path.exists(fix_name + '.log'):
                         print('result exists ...')
                         continue
                     
@@ -588,7 +604,7 @@ def process_files():
                         with open(fix_name, 'w', encoding='utf-8') as output_file:
                             json.dump(result_data, output_file, indent=2, ensure_ascii=False)
                         
-                        with open(log_name, 'w', encoding='utf-8') as log_file:
+                        with open(fix_name + '.log', 'w', encoding='utf-8') as log_file:
                             print(full, file=log_file)
                             
                     except Exception as e:
@@ -653,10 +669,10 @@ def cal_vllm(bug_id, code, title, description, filename):
         complete_text = prompt + full_text
         print(complete_text)
         
-        # 提取生成的 Java 代码部分
+        # 根据模型格式提取生成的 Java 代码部分
         try:
-            ret = extract_first_java_code(full_text.split('[/INST]')[-1])
-        except IndexError:
+            ret = extract_first_java_code(full_text.split(EOF)[-1])
+        except (IndexError, AttributeError):
             ret = extract_first_java_code(full_text)
         
         print('code:', ret, flush=True)
@@ -706,14 +722,13 @@ def cal(bug_id, code, title, description, filename):
 
 
 if __name__ == '__main__':
-    if len(sys.argv) < 6 or len(sys.argv) > 7:
-        print("Usage: python d4j.py <model_key> <num_processes> <process_id> <gpu_id> <num_generations> [--reextract]")
+    if len(sys.argv) != 6:
+        print("Usage: python d4j.py <model_key> <num_processes> <process_id> <gpu_id> <num_generations>")
         print("参数说明:")
         print("  model_key: 模型名称")
         print("  num_processes: 总进程数")
         print("  process_id: 当前进程ID (0开始)")
         print("  gpu_id: GPU编号 (0开始)")
         print("  num_generations: 生成次数")
-        print("  --reextract: (可选) 从已有的log文件重新提取代码，不重新生成")
         sys.exit(1)
     main()
