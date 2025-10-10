@@ -292,6 +292,7 @@ MODEL_PROMPT_FORMATS = {
     'codellama': ('[INST]', '[/INST]'),
     'llama': ('[INST]', '[/INST]'),
     'mistral': ('[INST]', '[/INST]'),
+    'deepseek': ('You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.\n### Instruction:\n', '\n### Response:\n'),
     'starchat': ('<|system|>\n<|end|>\n<|user|>', '<|end|>\n<|assistant|>'),
 }
 
@@ -313,12 +314,28 @@ MODEL_CONFIGS = {
         'adapter_path': None
     },
     'codellama-7b-trained': {
-        'base_model': '/data1/czj/model/CodeLlama-7b-Instruct',
-        'adapter_path': '/data1/czj/model/trained_model_llama'
+        'base_model': 'merged_models/sft_codellama7b/codellama_merged',
+        'adapter_path': None
     },
 
     'codellama-13b': {
-        'base_model': '/data1/czj/model/codeLlama-13b-instruct',
+        'base_model': 'codellama/CodeLlama-7b-Instruct-hf',
+        'adapter_path': None
+    },
+    'codellama-13b-trained': {
+        'base_model': 'merged_models/sft_codellama13b',
+        'adapter_path': None
+    },
+    'deepseek-6.7b': {
+        'base_model': 'deepseek-ai/deepseek-coder-6.7b-instruct',
+        'adapter_path': None
+    },
+    'deepseek-6.7b-trained': {
+        'base_model': 'merged_models/sft_deepseek7b/codellama_merged',
+        'adapter_path': None
+    },
+    'deepseek-6.7b-trained-noprompt': {
+        'base_model': 'merged_models/sft_deepseek7b_noprompt/codellama_merged',
         'adapter_path': None
     },
     'trained_model_codellama-v1': {
@@ -585,27 +602,42 @@ def process_files():
                     # 获取文件名
                     file_name = os.path.basename(full_path)
                     fix_name = os.path.join(fix_dir, file_name)
+                    log_file_path = fix_name + '.log'
                     print(f"Output path: {fix_name}", flush=True)
                     
-                    if os.path.exists(fix_name) and os.path.exists(fix_name + '.log'):
-                        print('result exists ...')
-                        continue
-                    
                     try:
-                        full, res = cal(file_name.split('.')[0], json_data['buggy'], json_data['issue_title'],
-                                        json_data['issue_description'], json_data['loc'])
-                        if full is None:  # 如果 full 为 None，则说明修复失败，跳过此轮
-                            print(f"修复失败，跳过 {file_name}")
-                            continue
+                        # 检查log文件是否存在
+                        if os.path.exists(log_file_path):
+                            # 如果log文件存在，直接加载并重新提取Java代码
+                            print(f'Log文件存在，重新提取代码: {log_file_path}')
+                            with open(log_file_path, 'r', encoding='utf-8') as log_file:
+                                full = log_file.read()
+                            
+                            # 重新提取Java代码
+                            res = extract_first_java_code(full)
+                            
+                            if not res:  # 如果提取失败
+                                print(f"从log文件提取代码失败，跳过 {file_name}")
+                                continue
+                        else:
+                            # 如果log文件不存在，才调用模型生成
+                            print(f'Log文件不存在，调用模型生成: {log_file_path}')
+                            full, res = cal(file_name.split('.')[0], json_data['buggy'], json_data['issue_title'],
+                                            json_data['issue_description'], json_data['loc'])
+                            if full is None:  # 如果 full 为 None，则说明修复失败，跳过此轮
+                                print(f"修复失败，跳过 {file_name}")
+                                continue
+                            
+                            # 保存log文件
+                            with open(log_file_path, 'w', encoding='utf-8') as log_file:
+                                print(full, file=log_file)
                         
+                        # 无论是从log加载还是新生成，都更新并保存结果到json文件
                         result_data['fix'] = res  # 将修复后的代码存入 JSON 数据
                         
                         # 使用 with 语句确保文件正确关闭
                         with open(fix_name, 'w', encoding='utf-8') as output_file:
                             json.dump(result_data, output_file, indent=2, ensure_ascii=False)
-                        
-                        with open(fix_name + '.log', 'w', encoding='utf-8') as log_file:
-                            print(full, file=log_file)
                             
                     except Exception as e:
                         print(f"处理文件 {file_name} 时出错: {e}")
@@ -628,7 +660,7 @@ def cal_vllm(bug_id, code, title, description, filename):
     """使用 vLLM 进行高性能推理"""
     from vllm import SamplingParams
     try:
-        prompt = BOF + "\n# " + title + '\n' + description + '\n' + "This is an incorrect code (" + filename + "):\n```java\n" + code + "\n```\nYou are a software engineer. Can you repair the incorrect code?\n" + EOF + "\n```java\n"
+        prompt = BOF + "\n# " + title + '\n' + description + '\n' + "This is an incorrect Java code (" + filename + "):\n```java\n" + code + "\n```\nYou are a software engineer. Can you repair the incorrect Java code?\n" + EOF + "\n```java\n"
         print(prompt, flush=True)
         
         # vLLM 采样参数 - 保守配置
@@ -636,46 +668,66 @@ def cal_vllm(bug_id, code, title, description, filename):
             temperature=1.0,
             top_p=0.9,
             top_k=50,
-            max_tokens=512,  # 降低token数量减少显存压力
+            max_tokens=1024,  # 降低token数量减少显存压力
             repetition_penalty=1.1,
             stop=[tokenizer.eos_token] if tokenizer.eos_token else None,
         )
         
-        # vLLM 生成 - 添加错误处理
-        try:
-            outputs = model.generate([prompt], sampling_params)
-            output = outputs[0]
-            full_text = output.outputs[0].text
-        except RuntimeError as e:
-            if "CUDA" in str(e) or "unknown error" in str(e):
-                print(f"vLLM CUDA错误，尝试清理缓存后重试: {e}")
-                # 清理CUDA缓存
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
-                # 重试一次
-                try:
-                    outputs = model.generate([prompt], sampling_params)
-                    output = outputs[0]
-                    full_text = output.outputs[0].text
-                except Exception as e2:
-                    print(f"vLLM重试失败: {e2}")
-                    return [None, None]
+        # 循环生成，直到获取到合法的 Java 代码
+        max_retries = 5  # 最大重试次数
+        retry_count = 0
+        ret = ""
+        complete_text = None
+        
+        while not ret and retry_count < max_retries:
+            retry_count += 1
+            print(f"尝试生成 Java 代码 (第 {retry_count}/{max_retries} 次)...", flush=True)
+            
+            # vLLM 生成 - 添加错误处理
+            try:
+                outputs = model.generate([prompt], sampling_params)
+                output = outputs[0]
+                full_text = output.outputs[0].text
+            except RuntimeError as e:
+                if "CUDA" in str(e) or "unknown error" in str(e):
+                    print(f"vLLM CUDA错误，尝试清理缓存后重试: {e}")
+                    # 清理CUDA缓存
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                    # 重试一次
+                    try:
+                        outputs = model.generate([prompt], sampling_params)
+                        output = outputs[0]
+                        full_text = output.outputs[0].text
+                    except Exception as e2:
+                        print(f"vLLM重试失败: {e2}")
+                        continue  # 继续下一次循环
+                else:
+                    print(f"vLLM生成错误: {e}")
+                    continue  # 继续下一次循环
+            
+            # 完整文本包含prompt
+            complete_text = prompt + full_text
+            print(complete_text)
+            
+            # 根据模型格式提取生成的 Java 代码部分
+            try:
+                ret = extract_first_java_code('```java\n' + full_text.split(EOF)[-1])
+            except (IndexError, AttributeError):
+                ret = extract_first_java_code(full_text)
+            
+            if ret:
+                print(f'✅ 成功提取 Java 代码 (第 {retry_count} 次尝试)', flush=True)
+                print('code:', ret, flush=True)
             else:
-                print(f"vLLM生成错误: {e}")
-                return [None, None]
+                print(f'⚠️ 未能提取 Java 代码，继续重试...', flush=True)
         
-        # 完整文本包含prompt
-        complete_text = prompt + full_text
-        print(complete_text)
+        # 检查是否成功获取代码
+        if not ret:
+            print(f'❌ 经过 {max_retries} 次尝试仍未获取到有效的 Java 代码', flush=True)
+            return [None, None]
         
-        # 根据模型格式提取生成的 Java 代码部分
-        try:
-            ret = extract_first_java_code(full_text.split(EOF)[-1])
-        except (IndexError, AttributeError):
-            ret = extract_first_java_code(full_text)
-        
-        print('code:', ret, flush=True)
         return [complete_text, ret]
         
     except Exception as e:
