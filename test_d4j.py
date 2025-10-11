@@ -16,16 +16,9 @@ import concurrent.futures as cf
 from contextlib import contextmanager, redirect_stdout, redirect_stderr
 import glob
 
-ROOT_PATH = '/tmp/playground/'
-DEFECTS4J_PATH = '/home/barty/research/defects4j/framework/bin/defects4j'
-WORKSPACE_ROOT = os.path.abspath(os.path.dirname(__file__))  # 保存工作区根目录的绝对路径
-
-# 设置 Perl 环境变量
-import os as _os
-_perl5lib = f"/home/barty/perl5/lib/perl5{':' + _os.environ['PERL5LIB'] if 'PERL5LIB' in _os.environ else ''}"
-_os.environ['PERL5LIB'] = _perl5lib
-_os.environ['PATH'] = f"{_os.path.dirname(DEFECTS4J_PATH)}:{_os.environ.get('PATH', '')}"
-
+ROOT_PATH = '/data1/tmp/llm4apr_validation/'
+os.environ["JAVA_HOME"] = "/data1/miniconda3/envs/d4j"
+os.environ["PATH"] = os.path.join(os.environ["JAVA_HOME"], "bin") + ":" + os.environ["PATH"]
 def clean_tmp_folder(tmp_dir):
     if os.path.isdir(tmp_dir) and tmp_dir.startswith(ROOT_PATH):
         shutil.rmtree(tmp_dir)
@@ -75,7 +68,7 @@ def guess_source_dir(project_dir):
     return None
 def checkout_defects4j_project(current_bug, project_dir):
     project, bug_id = current_bug.split('-')
-    command = f"{DEFECTS4J_PATH} checkout -p {project} -v {bug_id}b -w {project_dir}"
+    command = f"defects4j checkout -p {project} -v {bug_id}b -w {project_dir}"
     print('[CHECKOUT]', command)
 
     # 执行 checkout 命令
@@ -141,7 +134,7 @@ def command_with_timeout(cmd, timeout=90):
 
 def defects4j_test_suite(project_dir, timeout=1000):
     os.chdir(project_dir)
-    out, err = command_with_timeout([DEFECTS4J_PATH, "test", "-r"], timeout)
+    out, err = command_with_timeout(["defects4j", "test", "-r"], timeout)
     if "Compilation failed" in str(out):
         print("[FAIL] Compile tests for ", project_dir)
     return out, err
@@ -149,19 +142,19 @@ def defects4j_test_suite(project_dir, timeout=1000):
 
 def defects4j_export_trigger(project_dir, timeout=90):
     os.chdir(project_dir)
-    out, err = command_with_timeout([DEFECTS4J_PATH, "export", "-p", "tests.trigger"], timeout)
+    out, err = command_with_timeout(["defects4j", "export", "-p", "tests.trigger"], timeout)
     return out, err
 
 
 def defects4j_export_relevant(project_dir, timeout=90):
     os.chdir(project_dir)
-    out, err = command_with_timeout([DEFECTS4J_PATH, "export", "-p", "tests.relevant"], timeout)
+    out, err = command_with_timeout(["defects4j", "export", "-p", "tests.relevant"], timeout)
     return out, err
 
 
 def defects4j_test_one(project_dir, test_case, timeout=100):
     os.chdir(project_dir)
-    out, err = command_with_timeout([DEFECTS4J_PATH, "test", "-t", test_case], timeout)
+    out, err = command_with_timeout(["defects4j", "test", "-t", test_case], timeout)
     return out, err
 
 
@@ -236,13 +229,12 @@ class ValTime:
 
 
 class ValInfo():
-    def __init__(self, candidate_patch, model_id):
+    def __init__(self, candidate_patch):
         print(f"[DEBUG] Initializing ValInfo with: {candidate_patch[1].keys()}")
         self.unvrf_patches = candidate_patch
         self.curr_bug = candidate_patch[0]
         patch_info = candidate_patch[1]
         self.patches = patch_info['patches']
-        self.model_id = model_id
         self.patch_info = {
             'loc': patch_info['loc'],
             'start': patch_info['start'],
@@ -264,8 +256,11 @@ class ValInfo():
         self.validation_path = ROOT_PATH
         self.proj_dir = os.path.join(self.validation_path, self.curr_bug)
         clean_tmp_folder(self.proj_dir)
+        config_path = os.path.join(self.validation_path, 'config.json')
+        with open(config_path, 'r') as f:
+            config_info = json.load(f)
 
-        self.val_result_path = os.path.join('defects4j/results/', self.model_id)
+        self.val_result_path = os.path.join('defects4j/results/', config_info['model_id'])
         checkout_defects4j_project(self.curr_bug, self.proj_dir)
 
     def init_extract_project_info(self):
@@ -304,11 +299,8 @@ class ValInfo():
             return
         filename = str(self.curr_bug) + '-validated.jsonl'
         log_file = os.path.join(self.val_result_path, filename)
-        # 直接尝试创建目录，避免竞态条件
-        try:
+        if not os.path.exists(self.val_result_path):
             os.makedirs(self.val_result_path, exist_ok=True)
-        except FileExistsError:
-            pass  # 目录已存在，继续
         try:   
             with open(log_file, "w") as f: 
                 json.dump(self.validated_result, f, indent=2)
@@ -333,17 +325,12 @@ class ValInfo():
             self.relevant_tests = [line.strip() for line in str(out).split('\n') if line.strip()]
         
         # 运行初始测试套件，确认bug状态
-        init_out, init_err = defects4j_test_suite(self.proj_dir)
+        init_out, _ = defects4j_test_suite(self.proj_dir)
         self.failed_test_cases = []
-        
-        print(f"[DEBUG] Test suite output: {str(init_out)[:200]}")  # 打印前200个字符
-        print(f"[DEBUG] Test suite error: {str(init_err)[:200]}")
-        
         if init_out:
             self.failed_test_cases = [test.strip() for test in str(init_out).split(' - ')[1:]]
         
         print(f"[DEBUG] Found {len(self.trigger_tests)} trigger tests and {len(self.relevant_tests)} relevant tests")
-        print(f"[DEBUG] Found {len(self.failed_test_cases)} failed test cases")
 
 
 
@@ -505,9 +492,6 @@ class PatchValidation():
 
 
 def get_result_paths(fixed_dir, json_file):
-    # 确保使用绝对路径，防止 os.chdir 导致路径错误
-    if not os.path.isabs(fixed_dir):
-        fixed_dir = os.path.join(WORKSPACE_ROOT, fixed_dir)
     base_path = os.path.join(fixed_dir, json_file)
     log_path = f"{base_path}.judgelog"
     result_path = f"{base_path}.result"
@@ -526,15 +510,9 @@ def load_cached_result(log_path, result_path):
 
 def save_validation_result(log_path, result_path, results, log_content):
     """保存验证结果和日志"""
-    # 确保目录存在，使用 try-except 避免竞态条件
-    try:
-        os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    except (FileExistsError, FileNotFoundError):
-        pass
-    try:
-        os.makedirs(os.path.dirname(result_path), exist_ok=True)
-    except (FileExistsError, FileNotFoundError):
-        pass
+    # 确保目录存在
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    os.makedirs(os.path.dirname(result_path), exist_ok=True)
     
     print(f"[DEBUG] Saving results to:")
     print(f"[DEBUG] - Log: {log_path}")
@@ -558,7 +536,7 @@ def save_validation_result(log_path, result_path, results, log_content):
         print(f"[ERROR] Failed to save log file: {str(e)}")
         raise
 
-def validate_patches_per_bug(candidate_patch, model_id):
+def validate_patches_per_bug(candidate_patch):
     bug_name, patch_info = candidate_patch
     patches = patch_info['patches']
     total_patches = len(patches)
@@ -588,22 +566,9 @@ def validate_patches_per_bug(candidate_patch, model_id):
         return cached_result
     
     val_time = ValTime(time.time())
-    val_info = ValInfo(candidate_patch, model_id)
+    val_info = ValInfo(candidate_patch)
     if not val_info.check_init_success():
-        print(f"[ERROR] Initialization failed for {bug_name} - failed_test_cases is empty!")
-        print(f"[ERROR] Trigger tests: {len(val_info.trigger_tests)}, Relevant tests: {len(val_info.relevant_tests)}")
-        # 保存错误信息
-        error_result = [{
-            'patch_code': 'N/A',
-            'patch_status': 'INIT_FAILED',
-            'failing_tests': {'TRIGGER': [], 'RELEVANT': [], 'TIMEOUT': []},
-            'val_cnt': 0,
-            'bug_name': bug_name,
-            'diff_stats': None,
-            'error': 'Failed to initialize: no failing test cases detected'
-        }]
-        save_validation_result(log_path, result_path, error_result, f"Initialization failed for {bug_name}\n")
-        return error_result
+        return
     val_time.set_init_time(time.time())
     
     patch_results = []
@@ -632,17 +597,21 @@ def validate_patches_per_bug(candidate_patch, model_id):
                                      val_info.patch_id, val_info.encoding_mode, val_info.proj_dir)
 
         curr_patch_summary = patch_val.summarize_patch_info(val_info.curr_bug)
-        # 只在patch通过测试时计算diff统计
+        # 计算所有补丁的 diff 统计
+        curr_patch_summary['diff_stats'] = calc_diff_stats(
+            val_info.patch_info['buggy'],
+            curr_patch_summary['patch_code']
+        )
+        # 只在 PLAUSIBLE 补丁时打印差异统计
         if curr_patch_summary['patch_status'] == 'PLAUSIBLE':
-            curr_patch_summary['diff_stats'] = calc_diff_stats(
-                val_info.patch_info['buggy'], 
-                curr_patch_summary['patch_code']
-            )
-            print_diff_stats(curr_patch_summary['diff_stats'])  # 打印差异统计
+            print_diff_stats(curr_patch_summary['diff_stats'])
         print(f"[DEBUG] Patch validation result: {curr_patch_summary['patch_status']}")  # 调试信息
         patch_results.append(curr_patch_summary)
         val_info.update_patch_val_result(curr_patch_summary)
         val_info.save_validation_results()
+    
+    # 确保所有结果都被保存到 validated.jsonl
+    val_info.save_validation_results(done=True)
     
     # 保存验证结果和日志
     save_validation_result(log_path, result_path, patch_results, '\n'.join(validation_log))
@@ -653,7 +622,20 @@ class ValidationStats:
     def __init__(self):
         self.total_bugs = 0
         self.bug_results = {}
+        # PLAUSIBLE 补丁的统计
         self.diff_stats = {
+            'total_added': 0,
+            'total_deleted': 0,
+            'total_preserved': 0,
+            'patch_count': 0,
+            'preservation_distribution': {
+                'high': 0,    # >95%
+                'medium': 0,  # 80-95%
+                'low': 0      # <80%
+            }
+        }
+        # 所有补丁的统计
+        self.all_diff_stats = {
             'total_added': 0,
             'total_deleted': 0,
             'total_preserved': 0,
@@ -672,28 +654,38 @@ class ValidationStats:
         if patch_results:
             self.update_diff_stats(patch_results)
 
+    def _update_single_diff_stats(self, stats_dict, diff_stats):
+        """更新单个统计字典
+        
+        Args:
+            stats_dict: 要更新的统计字典
+            diff_stats: 补丁的diff统计信息
+        """
+        stats_dict['total_added'] += diff_stats.get('added_lines', 0)
+        stats_dict['total_deleted'] += diff_stats.get('deleted_lines', 0)
+        stats_dict['total_preserved'] += diff_stats.get('preserved_ratio', 0)
+        stats_dict['patch_count'] += 1
+        
+        ratio = diff_stats.get('preserved_ratio', 0)
+        if ratio > 95:
+            stats_dict['preservation_distribution']['high'] += 1
+        elif ratio > 80:
+            stats_dict['preservation_distribution']['medium'] += 1
+        else:
+            stats_dict['preservation_distribution']['low'] += 1
+    
     def update_diff_stats(self, patch_results):
-        """更新diff统计信息，只统计通过测试的patch（状态为PLAUSIBLE）"""
+        """更新diff统计信息，统计所有补丁和PLAUSIBLE补丁"""
         for patch in patch_results:
+            # 统计所有补丁
+            if 'diff_stats' in patch and patch['diff_stats']:
+                self._update_single_diff_stats(self.all_diff_stats, patch['diff_stats'])
+            
+            # 单独统计 PLAUSIBLE 补丁
             if patch.get('patch_status') == 'PLAUSIBLE':
-                print(f"[DEBUG] Found PLAUSIBLE patch")
-                if 'diff_stats' in patch:
-                    stats = patch['diff_stats']
-                    print(f"[DEBUG] Diff stats found: added={stats.get('added_lines', 0)}, deleted={stats.get('deleted_lines', 0)}, preserved={stats.get('preserved_ratio', 0)}%")
-                    self.diff_stats['total_added'] += stats.get('added_lines', 0)
-                    self.diff_stats['total_deleted'] += stats.get('deleted_lines', 0)
-                    self.diff_stats['total_preserved'] += stats.get('preserved_ratio', 0)
-                    self.diff_stats['patch_count'] += 1
-                else:
-                    print(f"[DEBUG] PLAUSIBLE patch found but no diff_stats available")
-                
-                ratio = stats.get('preserved_ratio', 0)
-                if ratio > 95:
-                    self.diff_stats['preservation_distribution']['high'] += 1
-                elif ratio > 80:
-                    self.diff_stats['preservation_distribution']['medium'] += 1
-                else:
-                    self.diff_stats['preservation_distribution']['low'] += 1
+                if 'diff_stats' in patch and patch['diff_stats']:
+                    self._update_single_diff_stats(self.diff_stats, patch['diff_stats'])
+                    print(f"[DEBUG] PLAUSIBLE patch - preserved={patch['diff_stats'].get('preserved_ratio', 0)}%")
 
     def get_success_rate(self):
         """计算Top-1、Top-5和Top-10的成功率"""
@@ -751,12 +743,28 @@ def load_previous_results(model_id):
     
     status_summary = []
     
-    for json_file in glob.glob(os.path.join(results_dir, '*-validated.jsonl')):
+    # 从 fixed0 目录的 .result 文件加载结果
+    fixed0_dir = os.path.join(results_dir, 'fixed0')
+    
+    if not os.path.exists(fixed0_dir):
+        print(f"[WARNING] fixed0 directory does not exist: {fixed0_dir}")
+        return previous_results
+    
+    result_files = glob.glob(os.path.join(fixed0_dir, '*.json.result'))
+    
+    for result_file in result_files:
         try:
-            bug_id = os.path.basename(json_file).replace('-validated.jsonl', '')
-            with open(json_file, 'r') as f:
+            filename = os.path.basename(result_file)
+            bug_id = filename.replace('.json.result', '')
+            
+            with open(result_file, 'r') as f:
                 results = json.load(f)
-                if results:
+        except Exception as e:
+            print(f"[WARNING] Failed to load previous results from {result_file}: {e}")
+            continue
+        
+        # 处理结果
+        if results:
                     previous_results[bug_id] = results
                     
                     plausible_found = False
@@ -780,8 +788,6 @@ def load_previous_results(model_id):
                             'position': None,
                             'total_patches': len(results)
                         })
-        except Exception as e:
-            print(f"[WARNING] Failed to load previous results from {json_file}: {e}")
     
     print("\n[PREVIOUS VALIDATION SUMMARY]")
     print("=" * 100)
@@ -815,23 +821,9 @@ def validate_defects4j(model_id, n_generations):
     print(f"Top-5:  {top5:.2f}%")
     print(f"Top-10: {top10:.2f}%")
     
-    print(f"\n[DEBUG] Total patch count for diff stats: {stats.diff_stats['patch_count']}")  # 添加调试信息
-    
-    if stats.diff_stats['patch_count'] > 0:
-        patch_count = stats.diff_stats['patch_count']
-        dist = stats.diff_stats['preservation_distribution']
-        
-        print("\n[PATCH MODIFICATION STATISTICS]")
-        print(f"- Average lines added per patch:    {stats.diff_stats['total_added']/patch_count:.1f}")
-        print(f"- Average lines deleted per patch:  {stats.diff_stats['total_deleted']/patch_count:.1f}")
-        print(f"- Average code preserved:           {stats.diff_stats['total_preserved']/patch_count:.1f}%")
-        
-        print("\nDistribution of code preservation ratio:")
-        total = sum(dist.values())
-        if total > 0:
-            print(f"- Minimal change   (>95% preserved):   {dist['high']:3d} patches ({dist['high']/total*100:5.1f}%)")
-            print(f"- Moderate change (80-95% preserved):  {dist['medium']:3d} patches ({dist['medium']/total*100:5.1f}%)")
-            print(f"- Major change     (<80% preserved):   {dist['low']:3d} patches ({dist['low']/total*100:5.1f}%)")
+    # 打印统计信息
+    print_diff_statistics_summary(stats.all_diff_stats, "All Patches")
+    print_diff_statistics_summary(stats.diff_stats, "PLAUSIBLE Patches Only")
     
     for i in range(n_generations):
         fix_dir = os.path.join('defects4j/results', str(model_id), f'fixed{i}')
@@ -905,7 +897,7 @@ def validate_defects4j(model_id, n_generations):
     
     with cf.ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_bug = {
-            executor.submit(validate_patches_per_bug, (bug_name, patch_info), model_id): bug_name 
+            executor.submit(validate_patches_per_bug, (bug_name, patch_info)): bug_name 
             for bug_name, patch_info in sorted(filtered_candidates.items())
         }
         
@@ -934,22 +926,10 @@ def validate_defects4j(model_id, n_generations):
     print(f"Top-10: {top10:.2f}%")
     print("=" * 100)
     
-    # 添加diff统计输出
-    if stats.diff_stats['patch_count'] > 0:
-        patch_count = stats.diff_stats['patch_count']
-        dist = stats.diff_stats['preservation_distribution']
-        
-        print("\n[PATCH MODIFICATION STATISTICS]")
-        print(f"- Average lines added per patch:    {stats.diff_stats['total_added']/patch_count:.1f}")
-        print(f"- Average lines deleted per patch:  {stats.diff_stats['total_deleted']/patch_count:.1f}")
-        print(f"- Average code preserved:           {stats.diff_stats['total_preserved']/patch_count:.1f}%")
-        
-        print("\nDistribution of code preservation ratio:")
-        total = sum(dist.values())
-        if total > 0:
-            print(f"- Minimal change   (>95% preserved):   {dist['high']:3d} patches ({dist['high']/total*100:5.1f}%)")
-            print(f"- Moderate change (80-95% preserved):  {dist['medium']:3d} patches ({dist['medium']/total*100:5.1f}%)")
-            print(f"- Major change     (<80% preserved):   {dist['low']:3d} patches ({dist['low']/total*100:5.1f}%)")
+    # 打印统计信息
+    print_diff_statistics_summary(stats.all_diff_stats, "All Patches")
+    print_diff_statistics_summary(stats.diff_stats, "PLAUSIBLE Patches Only")
+    
     print("=" * 100)
     
     print('[END VALIDATION]')
@@ -974,7 +954,7 @@ def shuffle_validated_patches(candidate_patches):
 def load_and_compare_results(model_id1, model_id2, min_patches=1):
     bug_dates = {}
     try:
-        with open('time.jsonl', 'r') as f:
+        with open('defects4j/time.jsonl', 'r') as f:
             for line in f:
                 data = json.loads(line)
                 bug_id, date = list(data.items())[0]
@@ -991,7 +971,7 @@ def load_and_compare_results(model_id1, model_id2, min_patches=1):
     
     bug_lengths = {}
     for bug_id in filtered_results1.keys() | filtered_results2.keys():
-        json_file = os.path.join('results', model_id1, 'fixed0', f'{bug_id}.json')
+        json_file = os.path.join('defects4j/results', model_id1, 'fixed0', f'{bug_id}.json')
         try:
             with open(json_file, 'r') as f:
                 patch_info = json.load(f)
@@ -1123,10 +1103,13 @@ def calc_diff_stats(buggy, fix):
     added = sum(1 for line in diff if line.startswith('+ '))
     deleted = sum(1 for line in diff if line.startswith('- '))
     
-    # 计算保留比例
+    # 计算保留比例 (Code Consistency Rate) - 排除虚拟的结束块
+    # CCR = r / k, 其中 k 是修复后代码的总行数，r 是保留的代码行数
     matcher = difflib.SequenceMatcher(None, buggy_lines, fix_lines)
-    preserved = sum(block.size for block in matcher.get_matching_blocks())
-    preserved_ratio = preserved / len(buggy_lines) if buggy_lines else 0.0
+    matching_blocks = matcher.get_matching_blocks()
+    # 排除最后一个虚拟块 (len(a), len(b), 0)
+    preserved = sum(block.size for block in matching_blocks[:-1])
+    preserved_ratio = preserved / len(fix_lines) if fix_lines else 0.0
     
     return {
         'added_lines': added,
@@ -1135,50 +1118,105 @@ def calc_diff_stats(buggy, fix):
     }
 
 def print_diff_stats(diff_stats):
-    """打印补丁的差异统计信息"""
+    """打印单个补丁的差异统计信息"""
     print(f"[DIFF STATS]   | Added: {diff_stats['added_lines']}, Deleted: {diff_stats['deleted_lines']}, Preserved: {diff_stats['preserved_ratio']}%")
 
-def recalculate_diff_stats(model_id):
-    """重新计算所有已验证patch的diff统计"""
-    print(f"[INFO] 重新计算 {model_id} 的diff统计")
-    results_dir = os.path.join('defects4j/results', model_id)
+def print_diff_statistics_summary(stats_dict, title):
+    """打印diff统计汇总信息
     
-    for validated_file in glob.glob(os.path.join(results_dir, '*-validated.jsonl')):
-        bug_id = os.path.basename(validated_file).replace('-validated.jsonl', '')
-        print(f"\n[处理] {bug_id}")
+    Args:
+        stats_dict: 包含统计信息的字典
+        title: 统计标题（如 "All Patches" 或 "PLAUSIBLE Patches Only"）
+    """
+    patch_count = stats_dict['patch_count']
+    if patch_count == 0:
+        return
+    
+    dist = stats_dict['preservation_distribution']
+    
+    print(f"\n[PATCH MODIFICATION STATISTICS - {title}]")
+    print(f"- Total patches analyzed:           {patch_count}")
+    print(f"- Average lines added per patch:    {stats_dict['total_added']/patch_count:.1f}")
+    print(f"- Average lines deleted per patch:  {stats_dict['total_deleted']/patch_count:.1f}")
+    print(f"- Average code preserved:           {stats_dict['total_preserved']/patch_count:.1f}%")
+    
+    print("\nDistribution of code preservation ratio:")
+    total = sum(dist.values())
+    if total > 0:
+        print(f"- Minimal change   (>95% preserved):   {dist['high']:3d} patches ({dist['high']/total*100:5.1f}%)")
+        print(f"- Moderate change (80-95% preserved):  {dist['medium']:3d} patches ({dist['medium']/total*100:5.1f}%)")
+        print(f"- Major change     (<80% preserved):   {dist['low']:3d} patches ({dist['low']/total*100:5.1f}%)")
+
+def recalculate_diff_stats(model_id):
+    """重新计算所有已验证patch的diff统计，保存到.result文件"""
+    print(f"[INFO] 重新计算 {model_id} 的统计信息")
+    results_dir = os.path.join('defects4j/results', model_id)
+    fixed0_dir = os.path.join(results_dir, 'fixed0')
+    
+    if not os.path.exists(fixed0_dir):
+        print(f"[ERROR] fixed0目录不存在: {fixed0_dir}")
+        return
+    
+    # 统计信息
+    total_files = 0
+    updated_files = 0
+    skipped_files = 0
+    
+    # 扫描 fixed0 目录下的所有 .result 文件
+    result_files = glob.glob(os.path.join(fixed0_dir, '*.json.result'))
+    
+    for result_file in result_files:
+        total_files += 1
+        # 提取 bug_id (例如: Chart-1.json.result -> Chart-1)
+        filename = os.path.basename(result_file)
+        bug_id = filename.replace('.json.result', '')
         
         try:
             # 读取dataset中的buggy代码
             dataset_file = os.path.join('defects4j/dataset', f'{bug_id}.json')
+            if not os.path.exists(dataset_file):
+                print(f"[警告] Dataset文件不存在: {dataset_file}")
+                skipped_files += 1
+                continue
+            
             with open(dataset_file) as df:
                 dataset_info = json.load(df)
                 buggy_code = dataset_info['buggy']
             
             # 读取验证结果
-            with open(validated_file, 'r') as f:
+            with open(result_file, 'r') as f:
                 results = json.load(f)
             
-            # 重新计算每个PLAUSIBLE patch的diff
-            modified = False
-            for patch in results:
-                if patch['patch_status'] == 'PLAUSIBLE':
-                    patch['diff_stats'] = calc_diff_stats(buggy_code, patch['patch_code'])
-                    print_diff_stats(patch['diff_stats'])
-                    modified = True
+            # 重新计算所有补丁的统计信息
+            plausible_count = 0
+            total_patches = len(results)
             
-            # 如果有修改，保存更新后的结果
-            if modified:
-                with open(validated_file, 'w') as f:
+            for idx, patch in enumerate(results, 1):
+                    # 计算 diff 统计
+                patch['diff_stats'] = calc_diff_stats(buggy_code, patch['patch_code'])
+                
+                if patch['patch_status'] == 'PLAUSIBLE':
+                    plausible_count += 1
+            
+            # 保存更新后的结果
+            with open(result_file, 'w') as f:
                     json.dump(results, f, indent=2)
-                print(f"[已更新] {bug_id}")
-            else:
-                print(f"[跳过] {bug_id} - 没有PLAUSIBLE的patch")
+            
+            status_msg = f"[更新] {bug_id} - {total_patches} 个补丁"
+            if plausible_count > 0:
+                status_msg += f" (其中 {plausible_count} 个PLAUSIBLE)"
+            print(status_msg)
+            updated_files += 1
                 
         except Exception as e:
-            print(f"[错误] 处理 {bug_id} 时出错: {e}")
+            print(f"[错误] 处理 {result_file} 时出错: {e}")
             traceback.print_exc()
+            skipped_files += 1
     
-    print("\n[完成] diff统计重新计算完成")
+    print(f"\n[完成] 统计信息重新计算完成")
+    print(f"- 总文件数: {total_files}")
+    print(f"- 已更新: {updated_files}")
+    print(f"- 已跳过: {skipped_files}")
 
 if __name__ == '__main__':
     start_val_time = time.time()
