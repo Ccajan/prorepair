@@ -1,0 +1,124 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# StringCollectionDeserializer fails with custom collection
+Seeing this with Jackson 2.9.8.
+We have a custom collection implementation, which is wired to use its "immutable" version for deserialization. The rationale is that we don't want accidental modifications to the data structures that come from the wire, so they all are forced to be immutable.
+After upgrade from 2.6.3 to 2.9.8, the deserialization started breaking with the message:
+
+Cannot construct instance of XXX (although at least one Creator exists): no default no-arguments constructor found
+
+This happens ONLY when you deserialize a custom collection of strings as a property of the other object. Deserializing the custom collection of strings directly works fine, and so does the deserialization of custom collection of non-strings. I believe either the StringCollectionDeserializer should not be invoked for custom collections, or perhaps it does not handle the delegation as expected.
+Please see comments for repro and workaround.
+Thanks!
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/deser/std/StringCollectionDeserializer.java):
+```java
+public JsonDeserializer<?> createContextual(DeserializationContext ctxt,
+        BeanProperty property) throws JsonMappingException
+{
+    // May need to resolve types for delegate-based creators:
+    JsonDeserializer<Object> delegate = null;
+    if (_valueInstantiator != null) {
+        // [databind#2324]: check both array-delegating and delegating
+        AnnotatedWithParams delegateCreator = _valueInstantiator.getDelegateCreator();
+        if (delegateCreator != null) {
+            JavaType delegateType = _valueInstantiator.getDelegateType(ctxt.getConfig());
+            delegate = findDeserializer(ctxt, delegateType, property);
+        }
+    }
+    JsonDeserializer<?> valueDeser = _valueDeserializer;
+    final JavaType valueType = _containerType.getContentType();
+    if (valueDeser == null) {
+        // [databind#125]: May have a content converter
+        valueDeser = findConvertingContentDeserializer(ctxt, property, valueDeser);
+        if (valueDeser == null) {
+        // And we may also need to get deserializer for String
+            valueDeser = ctxt.findContextualValueDeserializer(valueType, property);
+        }
+    } else { // if directly assigned, probably not yet contextual, so:
+        valueDeser = ctxt.handleSecondaryContextualization(valueDeser, property, valueType);
+    }
+    // 11-Dec-2015, tatu: Should we pass basic `Collection.class`, or more refined? Mostly
+    //   comes down to "List vs Collection" I suppose... for now, pass Collection
+    Boolean unwrapSingle = findFormatFeature(ctxt, property, Collection.class,
+            JsonFormat.Feature.ACCEPT_SINGLE_VALUE_AS_ARRAY);
+    NullValueProvider nuller = findContentNullProvider(ctxt, property, valueDeser);
+    if (isDefaultDeserializer(valueDeser)) {
+        valueDeser = null;
+    }
+    return withResolved(delegate, valueDeser, nuller, unwrapSingle);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+package com.fasterxml.jackson.databind.deser.std;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
+import org.springframework.stereotype.Component;
+
+@Component("stringCollectionDeserializer")
+public class CustomizedStringCollectionDeserializer extends StdScalarDeserializer<Iterable<String>> {
+    
+    public static List<Class<?>> stringClasses = Arrays.asList(CharSequence.class, String.class);
+
+    @Autowired
+    private StringToArrayConverter converter;
+
+    protected CustomizedStringCollectionDeserializer() {
+        super(Iterable.class);
+    }
+
+    @Override
+    public Iterable<String> deserialize(JsonParser jp, DeserializationContext ctxt) throws IOException, JsonProcessingException {
+        ObjectCodec oc = jp.getCodec();
+        JsonNode node = oc.readTree(jp);
+        
+        ArrayList<String> result = new ArrayList<>();
+        iterateNodes(node, result::add);
+        return result;
+    }
+
+    public void setStringToArrayConverter(StringToArrayConverter converter) {
+        this.converter = converter;
+    }
+
+    public void iterateNodes(JsonNode root, Consumer<String> consumer) throws JsonProcessingException {
+        switch (root.getNodeType()) {
+            case ARRAY:
+                for (int i = 0; i < root.size(); ++i) {
+                    iterateNodes(root.get(i), consumer);
+                }
+                break;
+            case STRING:
+                consumer.accept(root.asText());
+                break;
+            case OBJECT:
+                boolean hasStringProperties = false;
+                Iterator<Map.Entry<String, JsonNode>> fields = root.fields();
+                while (fields.hasNext() && !hasStringProperties) {
+                                    Map.Entry<String, JsonNode> field = fields.next();
+                                if (field.getValue().isTextual()){
+                                     consumer.accept(field.getValue().asText());
+                                     hasStringProperties = true;
+                                 }
+                             }
+                    
+                               if(!hasStringProperties) {
+                                   throw new IllegalArgumentException("Illegal format: Expecting JSON array or properties of simple type (string).");
+                               }
+                
+                   break;
+            default:
+                throw new IllegalArgumentException("Illegal format: Expecting JSON array or object.");
+        }
+    }
+}
+```
+In the above code, we override the standard deserializer in order to solve the issue of being unable to invoke the deserializer because there is no available no-argument constructor. The customized deserializer handles different scenarios including arrays or objects containing multiple elements. Please ensure that the Spring framework annotation `@Component` is included on the customized string collection deserializer class for automatic registration. Also, add a `setter` method for the dependency injection of `StringToArrayConverter`. This would allow you to inject any additional logic that might be necessary to convert your input into the desired output. If your project already uses spring DI, then the `setter` method can be removed.
+

@@ -1,0 +1,142 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# @JacksonXmlRootElement malfunction when using it with multiple XmlMappers and disabling annotations
+Found this in version 2.9.4 running some tests that go back and forth serializing with an XML mapper that uses annotations, and another one that ignores them. May be related to issue #171 and the cache of class annotations.
+When running this code, the second print statement should use the annotation's localName but it instead uses the class name.
+@JacksonXmlRootElement(localName = "myname")
+public class XMLTest {
+
+    public static void main(String[] s) throws Exception {
+
+        final ObjectMapper xmlMapper = new XmlMapper();
+        final ObjectMapper noAnnotationsXmlMapper = xmlMapper.copy()
+                .configure(MapperFeature.USE_ANNOTATIONS, false)
+                .configure(SerializationFeature.FAIL_ON_EMPTY_BEANS, false);
+
+        System.out.println(noAnnotationsXmlMapper.writeValueAsString(new XMLTest()));
+        System.out.println(xmlMapper.writeValueAsString(new XMLTest()));
+
+    }
+
+}
+
+Output:
+<XMLTest/>
+<XMLTest/>
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/dataformat/xml/ser/XmlSerializerProvider.java):
+```java
+protected XmlSerializerProvider(XmlSerializerProvider src) {
+    super(src);
+    // 21-May-2018, tatu: As per [dataformat-xml#282], should NOT really copy
+    //    root name lookup as that may link back to diff version, configuration
+    _rootNameLookup = src._rootNameLookup;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+import com.fasterxml.jackson.databind.*;
+import com.fasterxml.jackson.databind.module.SimpleModule;
+import com.fasterxml.jackson.dataformat.xml.annotation.JacksonXmlRootElement;
+import com.fasterxml.jackson.dataformat.xml.deser.FromXmlParser;
+import com.fasterxml.jackson.dataformat.xml.ser.ToXmlGenerator;
+import com.fasterxml.jackson.core.JsonProcessingException;
+
+import java.util.HashMap;
+import java.util.Map;
+
+public class CustomAnnotationObjectMapper extends ObjectMapper {
+    
+    private Map<Class<?>, String> customLocalNames = new HashMap<>();
+    
+    public <T> void setCustomLocalName(Class<T> clazz, String localName) {
+        customLocalNames.put(clazz, localName);
+    }
+    
+    protected ObjectMapper createInstance() {
+        return new CustomAnnotationObjectMapper();
+    }
+    
+    @Override
+    public ModuleRegistry moduleRegistry() {
+        SimpleModule mod = new SimpleModule("CustomAnnotationModule");
+        mod.setDeserializerModifier(new DeserializerModifier() {
+            @Override
+            public JsonDeserializer<Object> modifyDeserializer(DeserializationConfig config, BasicDeserializerFactory bdf, TypeDeserializer typeDeser) {
+                if (typeDeser instanceof FromXmlParser && ((FromXmlParser) typeDeser).getTypeId().isContainerType()) {
+                    Class<?> raw = typeDeser.getRawType();
+                    if (!customLocalNames.containsKey(raw)) {
+                        for (Class<?> i : raw.getInterfaces()) {
+                            if (customLocalNames.containsKey(i)) {
+                                return new NonEmptyCollectionDeserializer((NonEmptiable) typeDeser, customLocalNames.get(i));
+                            }
+                        }
+                        throw new IllegalArgumentException("No custom local name defined for class: " + raw.getName());
+                    }
+                    
+                    return new NonEmptyCollectionDeserializer((NonEmptiable) typeDeser, customLocalNames.get(raw));
+                }
+                
+                return null;
+            }
+            
+            @SuppressWarnings("unchecked")
+            private static class NonEmptyCollectionDeserializer extends JsonDeserializer<Object> {
+                private final NonEmptiable deserializer;
+                private final String localName;
+                
+                public NonEmptyCollectionDeserializer(NonEmptiable deserializer, String localName) {
+                    this.deserializer = deserializer;
+                    this.localName = localName;
+                }
+                
+                @Override
+                public Object deserialize(JsonParser jp, DeserializationContext ctxt) throws IOException, JsonProcessingException {
+                    List<Object> list = (List<Object>) deserializer.deserialize(jp, ctxt);
+                    if (list == null || list.isEmpty()) {
+                        return null;
+                    }
+                    
+                    return list;
+                }
+                
+                @Override
+                public Object getNullValue(DeserializationContext ctxt) {
+                    return Collections.emptyList();
+                }
+            }
+        });
+        
+        mod.setSerializerModifier(new SerializerModifier() {
+            @Override
+            public JsonSerializer<Object> modifySerializer(SerializationConfig config, BasicSerializerFactory bsf, JsonSerializer<?> ser) {
+                if (ser instanceof ToXmlGenerator) {
+                    Class<?> raw = ser.getClass().getAnnotation(JacksonXmlRootElement.class).value();
+                    if (customLocalNames.containsKey(raw)) {
+                        ((ToXmlGenerator<?>) ser).setRootName(customLocalNames.get(raw), null);
+                        
+                        return ser;
+                    }
+                }
+                
+                return null;
+            }
+        });
+        
+        return super.moduleRegistry().append(mod);
+    }
+}
+```
+
+In your test case, you can now do something like:
+
+```java
+final CustomAnnotationObjectMapper xmlMapper = new CustomAnnotationObjectMapper();
+xmlMapper.setCustomLocalName(XMLTest.class, "myname");
+
+System.out.println(xmlMapper.writeValueAsString(new XMLTest()));
+```
+

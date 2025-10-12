@@ -1,0 +1,141 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# StringCollectionDeserializer fails with custom collection
+Seeing this with Jackson 2.9.8.
+We have a custom collection implementation, which is wired to use its "immutable" version for deserialization. The rationale is that we don't want accidental modifications to the data structures that come from the wire, so they all are forced to be immutable.
+After upgrade from 2.6.3 to 2.9.8, the deserialization started breaking with the message:
+
+Cannot construct instance of XXX (although at least one Creator exists): no default no-arguments constructor found
+
+This happens ONLY when you deserialize a custom collection of strings as a property of the other object. Deserializing the custom collection of strings directly works fine, and so does the deserialization of custom collection of non-strings. I believe either the StringCollectionDeserializer should not be invoked for custom collections, or perhaps it does not handle the delegation as expected.
+Please see comments for repro and workaround.
+Thanks!
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/deser/std/StringCollectionDeserializer.java):
+```java
+public JsonDeserializer<?> createContextual(DeserializationContext ctxt,
+        BeanProperty property) throws JsonMappingException
+{
+    // May need to resolve types for delegate-based creators:
+    JsonDeserializer<Object> delegate = null;
+    if (_valueInstantiator != null) {
+        // [databind#2324]: check both array-delegating and delegating
+        AnnotatedWithParams delegateCreator = _valueInstantiator.getDelegateCreator();
+        if (delegateCreator != null) {
+            JavaType delegateType = _valueInstantiator.getDelegateType(ctxt.getConfig());
+            delegate = findDeserializer(ctxt, delegateType, property);
+        }
+    }
+    JsonDeserializer<?> valueDeser = _valueDeserializer;
+    final JavaType valueType = _containerType.getContentType();
+    if (valueDeser == null) {
+        // [databind#125]: May have a content converter
+        valueDeser = findConvertingContentDeserializer(ctxt, property, valueDeser);
+        if (valueDeser == null) {
+        // And we may also need to get deserializer for String
+            valueDeser = ctxt.findContextualValueDeserializer(valueType, property);
+        }
+    } else { // if directly assigned, probably not yet contextual, so:
+        valueDeser = ctxt.handleSecondaryContextualization(valueDeser, property, valueType);
+    }
+    // 11-Dec-2015, tatu: Should we pass basic `Collection.class`, or more refined? Mostly
+    //   comes down to "List vs Collection" I suppose... for now, pass Collection
+    Boolean unwrapSingle = findFormatFeature(ctxt, property, Collection.class,
+            JsonFormat.Feature.ACCEPT_SINGLE_VALUE_AS_ARRAY);
+    NullValueProvider nuller = findContentNullProvider(ctxt, property, valueDeser);
+    if (isDefaultDeserializer(valueDeser)) {
+        valueDeser = null;
+    }
+    return withResolved(delegate, valueDeser, nuller, unwrapSingle);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+import java.lang.reflect.Method;
+
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.databind.BeanProperty;
+import com.fasterxml.jackson.databind.DeserializationContext;
+import com.fasterxml.jackson.databind.JsonDeserializer;
+import com.fasterxml.jackson.databind.JavaType;
+import com.fasterxml.jackson.databind.annotation.JacksonStdImpl;
+import com.fasterxml.jackson.databind.deser.*;
+
+@SuppressWarnings("serial")
+@JacksonStdImpl
+public class StringCollectionDeserializer extends StdCollectionDeserializer<String>
+{
+
+     private static final Method _addAllToStringBuilder;
+     
+     public StringCollectionDeserializer(JavaType type) {
+         super(type, new StringArrayInstantiator(), new StringArrayListDeserializer(null));
+     }
+
+     @Override
+     protected void addValues(DeserializationContext ctxt, Collection<String> container, JsonParser p) throws IOException
+     {
+         while (p.nextToken() != JsonToken.END_ARRAY) {
+             container.add(ctxt.readValue(p, String.class));
+         }
+     }
+
+     /*
+     * Since 2.9, we can do without adding items via appendTo method.
+     */
+     static {
+         try {
+             _addAllToStringBuilder = Class.forName("org.apache.commons.lang3.builder.ToStringBuilder").getDeclaredMethod("append", Object[].class);
+         } catch (Throwable e) {
+             throw new RuntimeException("Huh?? Missing 'ToStringBuilder' class?" + e.getClass().getName() + ": " + e.getMessage());
+         }
+     }
+
+     /**
+     * This could be in {@link com.fasterxml.jackson.databind.ser.std.StringSerializer}, possibly even.. well, something else than `String` but hey..
+     */
+     public JsonSerializer<?> createContextual(SerializationContext ctxt, BeanProperty property) throws JsonMappingException
+     {
+          /*if (property != null && property.getType().isContainerType()) {
+              return this;
+          }*/
+         return new StringCollectionSerializer((Class<? extends List<String>>)type.getRawClass(), separator, quoteChar);
+     }
+ }
+```
+# StringCollectionDeserializer fails with custom collection
+
+Seeing this with Jackson 2.9.8.
+
+When using the `StringCollectionDeserializer` fails when used with a custom collection. This issue occurs because the method `createContextual(DeserializationContext ctxt, BeanProperty property)` returns the serializer instead of the deserializer for some unknown reason. This results in a breakage since the deserialized object tries to initialize itself through a no-argument constructor and the exception occurs when trying to initialize the `_stringBuffer` field during construction. The work around involves replacing the deserializer created in the `createContextual(DeserializationContext ctxt, BeanProperty property)` method with a serializer manually.
+
+The original code snippet that causes the failure:
+
+```java
+public JsonDeserializer<?> createContextual(DeserializationContext ctxt, BeanProperty property) throws JsonMappingException {
+    JavaType raw = getFirstArgumentType(ctxt._currentIndex, property.getType());
+    if ((raw instanceof SimpleType) && (((SimpleType) raw).getType().isPrimitive())) {
+        raw = ctxt.constructType(_charType);
+    }
+    ...
+}
+```
+
+The fixed code snippet:
+
+```java
+public JsonDeserializer<?> createContextual(DeserializationContext ctxt, BeanProperty property) throws JsonMappingException {
+    JavaType raw = getFirstArgumentType(ctxt._currentIndex, property.getType());
+    if ((raw instanceof SimpleType) && (((SimpleType) raw).getType().isPrimitive())) {
+        raw = ctxt.constructType(_charType);
+    }
+    ...
+    return new StringCollectionSerializer(ctxt, this, raw);
+}
+```
+# StringCollectionSerializer always uses SerializerProvider of the first encountered setter
+
+It seems like when the string collection has multiple properties annotated with `JsonSet

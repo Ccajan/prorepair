@@ -1,0 +1,151 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# DateTimeSerializerBase ignores configured date format when creating contextual
+DateTimeSerializerBase#createContextual creates a new serializer with StdDateFormat.DATE_FORMAT_STR_ISO8601 format instead of re-using the actual format that may have been specified on the configuration. See the following code:
+final String pattern = format.hasPattern()
+                                    ? format.getPattern()
+                                    : StdDateFormat.DATE_FORMAT_STR_ISO8601;
+
+Using the @JsonFormat annotation on a field will therefore reset the format to Jackson's default even if the annotation doesn't specify any custom format.
+DateBasedDeserializer#createContextual behaves differently and tries to re-use the configured format:
+DateFormat df = ctxt.getConfig().getDateFormat();
+// one shortcut: with our custom format, can simplify handling a bit
+if (df.getClass() == StdDateFormat.class) {
+   ...
+   StdDateFormat std = (StdDateFormat) df;
+   std = std.withTimeZone(tz);
+   ...
+} else {
+  // otherwise need to clone, re-set timezone:
+  df = (DateFormat) df.clone();
+  df.setTimeZone(tz);
+}
+
+Shouldn't the serializer follow the same approach ?
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/ser/std/DateTimeSerializerBase.java):
+```java
+    public JsonSerializer<?> createContextual(SerializerProvider serializers,
+            BeanProperty property) throws JsonMappingException
+    {
+        if (property == null) {
+            return this;
+        }
+        JsonFormat.Value format = findFormatOverrides(serializers, property, handledType());
+        if (format == null) {
+            return this;
+        }
+        // Simple case first: serialize as numeric timestamp?
+        JsonFormat.Shape shape = format.getShape();
+        if (shape.isNumeric()) {
+            return withFormat(Boolean.TRUE, null);
+        }
+
+        // 08-Jun-2017, tatu: With [databind#1648], this gets bit tricky..
+        // First: custom pattern will override things
+                if ((shape == JsonFormat.Shape.STRING) || format.hasPattern()
+                                || format.hasLocale() || format.hasTimeZone()) {
+                    TimeZone tz = format.getTimeZone();
+                    final String pattern = format.hasPattern()
+                                    ? format.getPattern()
+                                    : StdDateFormat.DATE_FORMAT_STR_ISO8601;
+            final Locale loc = format.hasLocale()
+                            ? format.getLocale()
+                            : serializers.getLocale();
+                    SimpleDateFormat df = new SimpleDateFormat(pattern, loc);
+                    if (tz == null) {
+                        tz = serializers.getTimeZone();
+                    }
+            df.setTimeZone(tz);
+            return withFormat(Boolean.FALSE, df);
+        }
+
+        // Otherwise, need one of these changes:
+
+
+        // Jackson's own `StdDateFormat` is quite easy to deal with...
+
+        // 08-Jun-2017, tatu: Unfortunately there's no generally usable
+        //    mechanism for changing `DateFormat` instances (or even clone()ing)
+        //    So: require it be `SimpleDateFormat`; can't config other types
+//            serializers.reportBadDefinition(handledType(), String.format(
+            // Ugh. No way to change `Locale`, create copy; must re-crete completely:
+        return this;
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+public class DateTimeSerializerBase extends DateSerializerBase {
+    
+    private static final long serialVersionUID = 1L;
+    
+    protected transient boolean _timestampAsNumber;
+    protected transient DateFormat _dateFormat;
+    protected transient Format _numberFormat;
+    
+    protected DateTimeSerializerBase(DateTimeSerializerBase base, Boolean useTimestamp,
+            DateFormat customFormat, NumberFormat numberFormat) {
+        super(base, useTimestamp);
+        _dateFormat = customFormat;
+        _numberFormat = numberFormat != null ? numberFormat : NumberUtils.FLOAT_FORMAT;
+    }
+
+    @Override
+    public JsonSerializer<?> createContextual(SerializerProvider prov, BeanProperty property) throws JsonMappingException {
+        if (property == null) {
+            return this;
+        }
+        JsonFormat.Value fmt = findFormatOverrides(prov, property, handledType());
+        if (fmt == null) {
+            return this;
+        }
+        JsonFormat.Shape shape = fmt.getShape();
+        if (_timestampAsNumber && ((shape == JsonFormat.Shape.SCALAR && !shape.isAbstract())
+                || shape == JsonFormat.Shape.NUMBER)) {
+            return withFormat(true, null);
+        }
+        
+        if ((shape == JsonFormat.Shape.STRING) || fmt.hasPattern()
+                || fmt.hasLocale() || fmt.hasTimeZone()) {
+            TimeZone tz = fmt.getTimeZone();
+            final String pattern;
+            
+            if (fmt.hasPattern()) {
+                pattern = fmt.getPattern();
+            } else {
+                pattern = StdDateFormat.DATE_FORMAT_STR_ISO8601;
+            }
+
+            final Locale locale;
+            
+            if (fmt.hasLocale()) {
+                locale = fmt.getLocale();
+            } else {
+                locale = prov.getConfig().getDefaultLocale();
+            }
+                        
+            SimpleDateFormat df = new SimpleDateFormat(pattern, locale);
+            
+            if (tz == null) {
+                tz = prov.getConfig().getTimeZone();
+            }
+            df.setTimeZone(tz);
+            return withFormat(false, df);
+        }
+
+        throw new IllegalArgumentException("Unrecognized format configuration");
+    }
+    
+    protected DateTimeSerializerBase withFormat(boolean asTimestamp, DateFormat customFormat) {
+        if (_timestampAsNumber == asTimestamp && _dateFormat == customFormat) {
+            return this;
+        }
+        return new DateTimeSerializerBase(this, asTimestamp, customFormat, _numberFormat);
+    }
+}
+```
+In the corrected code above, we are making sure to correctly set the format in DateTimeSerializerBase's constructor. If no format is provided, we default to StdDateFormat.DATE_FORMAT_STR_ISO8601 which is "yyyy-MM-dd'T'HH:mm:ss.SSSZ" as per your original description. We also consider whether the user has defined a different locale from the default one in the SerializerProvider configuration. If so, it will be used in creation of SimpleDateFormat instance, otherwise, the default locale is used. If a timezone is not provided, it defaults to the timezone obtained from the SerializerProvider's configuration. In all scenarios, we create a new DateTimeSerializerBase object and return it without mutating the existing instance thereby preserving immutability of DateTimeSerializerBase class.
+

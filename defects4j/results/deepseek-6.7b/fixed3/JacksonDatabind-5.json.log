@@ -1,0 +1,176 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# Mixin annotations lost when using a mixin class hierarchy with non-mixin interfaces
+In summary, mixin annotations are lost when Jackson scans a parent mixin class with Json annotations followed by an interface implemented by the parent mixin class that does not have the same Json annotations.
+Jackson version: 2.4.0
+Detail:
+I have the following class structure
+public interface Contact {
+    String getCity();
+}
+
+public class ContactImpl implements Contact {
+    public String getCity() { ... }
+}
+
+public class ContactMixin implements Contact {
+    @JsonProperty
+    public String getCity() { return null; }
+}
+
+public interface Person extends Contact {}
+
+public class PersonImpl extends ContactImpl implements Person {}
+
+public class PersonMixin extends ContactMixin implements Person {}
+and I configure a module as
+// There are other getters/properties in the Impl class that do not need to be serialized and so
+// I am using the Mixin to match the interface and explicitly annotate all the inherited methods
+module.disable(MapperFeature.ALLOW_FINAL_FIELDS_AS_MUTATORS)
+    .disable(MapperFeature.AUTO_DETECT_FIELDS)
+    .disable(MapperFeature.AUTO_DETECT_GETTERS)
+    .disable(MapperFeature.AUTO_DETECT_IS_GETTERS)
+    .disable(MapperFeature.INFER_PROPERTY_MUTATORS);
+module.setMixInAnnotation(Person.class, PersonMixin.class);
+When a PersonImpl instance is serialized, city is not included.
+I debugged the code and this is what happens:
+In AnnotatedClass.resolveMemberMethods() the supertypes of PersonImpl are [Person.class, Contact.class, ContactImpl.class] in that order.
+It starts with Person for which it finds PersonMixin and proceeds to AnnotatedClass._addMethodMixIns(). Here the parents list has [PersonMixin, ContactMixin, Contact]. When it processes ContactMixin it adds getCity() with the JsonProperty annotation. Then it processes Contact, doesn't find getCity() in methods map and so creates a new AnnotatedMethod for getCity() with the one from the interface which has no annotation which replaces the one from ContactMixin
+The workaround for this issue is to explicitly add any parent mixins to the module i.e.
+module.setMixInAnnotation(Contact.class, ContactMixin.class);
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/introspect/AnnotatedClass.java):
+```java
+protected void _addMethodMixIns(Class<?> targetClass, AnnotatedMethodMap methods,
+        Class<?> mixInCls, AnnotatedMethodMap mixIns)
+{
+    List<Class<?>> parents = new ArrayList<Class<?>>();
+    parents.add(mixInCls);
+    ClassUtil.findSuperTypes(mixInCls, targetClass, parents);
+    for (Class<?> mixin : parents) {
+        for (Method m : mixin.getDeclaredMethods()) {
+            if (!_isIncludableMemberMethod(m)) {
+                continue;
+            }
+            AnnotatedMethod am = methods.find(m);
+            /* Do we already have a method to augment (from sub-class
+             * that will mask this mixIn)? If so, add if visible
+             * without masking (no such annotation)
+             */
+            if (am != null) {
+                _addMixUnders(m, am);
+                /* Otherwise will have precedence, but must wait
+                 * until we find the real method (mixIn methods are
+                 * just placeholder, can't be called)
+                 */
+            } else {
+                // Well, or, as per [Issue#515], multi-level merge within mixins...
+                    mixIns.add(_constructMethod(m));
+            }
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+private boolean shouldAddParentMixIn(Class<?> mixInCls, Class<?> superType, Set<Class<?>> seen) {
+    if (_matchInterfaceOrAbstract(superType, mixInCls) ||
+            superType == Object.class) {
+        return false;
+    }
+
+    if (!seen.contains(superType)) {
+        seen.add(superType);
+        if (!superType.equals(mixInCls)) {
+            try {
+                superType.getConstructor((Object[])null); // force load
+            } catch (NoSuchMethodException ex) {
+                LOG.debug("Failed to instantiate $className($signature), ignoring",
+                        superType.getName(),
+                        "ctor problem:" + ex.getMessage());
+            } catch (SecurityException ex) {
+                LOG.warn("Unsafe constructor access denied: $name, ignoring",
+                        superType.getName());
+            }
+            for (Class<?> s : ClassUtil.typeArguments(superType, mixInCls)) {
+                if (shouldAddParentMixIn(mixInCls, s, seen)) {
+                    return true;
+                }
+            }
+            return true;
+        }
+    }
+    return false;
+}
+```
+
+```java
+private static int _calcCombinedMinHashcode(List<Class<?>> cn, int cnt) {
+    final Class<?> lastClass = cn.get(cnt - 1);
+    int hashCode = 1;
+
+    for (int idx = 0; idx < cnt - 1; ++idx) {
+        Class<?> currClass = cn.get(idx);
+        int combined = ObjectIdGenerators.Base.combine(lastClass, currClass);
+        hashCode += ((hashCode << 5) + hashCode) ^ combined;
+    }
+    return hashCode;
+}
+```
+
+```java
+protected boolean _useParentAsDefaultBound(Class<?> cls) {
+    if (!_supportsParentBinding() &&
+         _anyOfSuperClassesHasVirtualProperties(cls)) {
+        return false;
+    }
+
+    /* 97% of times that we don't even use JSON.org inheritance support,
+     *  so might as well optimize out most cases (including some others too)
+     * Note: normally would not apply here either
+     */
+    if (cls.getInterfaces().length == 0) {
+        return false;
+    }
+    /* end */
+
+    List<Class<?>> pats = new ArrayList<>();
+    if (!_collectPatterns(pats, _includeExclude, cls)) {
+        return false;
+    }
+    Collections.sort(pats, sorter);
+
+    int patCount = pats.size();
+    int patMax = patCount - 1;
+    if (patMax < 0) {
+        return false;
+    }
+    int lastPatternIndex = patMax;
+
+    int firstNonMatch = patCount;
+    for (Class<?> superC : cls.getInterfaces()) {
+        MatcherMatcher.Context ctx = new MatcherMatcher.Context(_pathFromRoot, superC, matchers);
+        List<Integer> matchedPatterIndices = new ArrayList<>();
+        for (int pi = 0; pi <= patMax; ++pi) {
+            Class<?> pattern = pats.get(pi);
+            if (MatcherMatcher.matchesForClassNameAndPackage(pattern, ctx)) {
+                matchedPatterIndices.add(pi);
+                firstNonMatch = Math.min(firstNonMatch, pi);
+            }
+        }
+        if (matchedPatterIndices.isEmpty()) {
+            continue;
+        }
+        final int fstMi = matchedPatterIndices.get(0);
+        if (matchedPatterIndices.size() > 1) {
+            Collections.sort(matchedPatterIndices, new Comparator<Integer>(){
+                public int compare(Integer o1, Integer o2) {
+                  return pats.get(o2).getName().compareTo(pats.get(o1).getName());
+                }});
+        }
+        if (fstMi != lastPatternIndex) {
+            int combined = ObjectIdGenerators.Base.combine(cls, pats.get(lastPatternIndex));
+            if (++

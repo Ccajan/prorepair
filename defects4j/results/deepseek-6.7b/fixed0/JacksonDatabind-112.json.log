@@ -1,0 +1,123 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# StringCollectionDeserializer fails with custom collection
+Seeing this with Jackson 2.9.8.
+We have a custom collection implementation, which is wired to use its "immutable" version for deserialization. The rationale is that we don't want accidental modifications to the data structures that come from the wire, so they all are forced to be immutable.
+After upgrade from 2.6.3 to 2.9.8, the deserialization started breaking with the message:
+
+Cannot construct instance of XXX (although at least one Creator exists): no default no-arguments constructor found
+
+This happens ONLY when you deserialize a custom collection of strings as a property of the other object. Deserializing the custom collection of strings directly works fine, and so does the deserialization of custom collection of non-strings. I believe either the StringCollectionDeserializer should not be invoked for custom collections, or perhaps it does not handle the delegation as expected.
+Please see comments for repro and workaround.
+Thanks!
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/deser/std/StringCollectionDeserializer.java):
+```java
+public JsonDeserializer<?> createContextual(DeserializationContext ctxt,
+        BeanProperty property) throws JsonMappingException
+{
+    // May need to resolve types for delegate-based creators:
+    JsonDeserializer<Object> delegate = null;
+    if (_valueInstantiator != null) {
+        // [databind#2324]: check both array-delegating and delegating
+        AnnotatedWithParams delegateCreator = _valueInstantiator.getDelegateCreator();
+        if (delegateCreator != null) {
+            JavaType delegateType = _valueInstantiator.getDelegateType(ctxt.getConfig());
+            delegate = findDeserializer(ctxt, delegateType, property);
+        }
+    }
+    JsonDeserializer<?> valueDeser = _valueDeserializer;
+    final JavaType valueType = _containerType.getContentType();
+    if (valueDeser == null) {
+        // [databind#125]: May have a content converter
+        valueDeser = findConvertingContentDeserializer(ctxt, property, valueDeser);
+        if (valueDeser == null) {
+        // And we may also need to get deserializer for String
+            valueDeser = ctxt.findContextualValueDeserializer(valueType, property);
+        }
+    } else { // if directly assigned, probably not yet contextual, so:
+        valueDeser = ctxt.handleSecondaryContextualization(valueDeser, property, valueType);
+    }
+    // 11-Dec-2015, tatu: Should we pass basic `Collection.class`, or more refined? Mostly
+    //   comes down to "List vs Collection" I suppose... for now, pass Collection
+    Boolean unwrapSingle = findFormatFeature(ctxt, property, Collection.class,
+            JsonFormat.Feature.ACCEPT_SINGLE_VALUE_AS_ARRAY);
+    NullValueProvider nuller = findContentNullProvider(ctxt, property, valueDeser);
+    if (isDefaultDeserializer(valueDeser)) {
+        valueDeser = null;
+    }
+    return withResolved(delegate, valueDeser, nuller, unwrapSingle);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+import com.fasterxml.jackson.core.*;
+import com.fasterxml.jackson.databind.*;
+import java.util.*;
+
+@SuppressWarnings("serial")
+public class ImmutableStringList extends ArrayList<String> implements Serializable {
+    public static final class Serializer extends StdSerializer<ImmutableStringList> {
+        protected Serializer() { super(ImmutableStringList.class); }
+        
+        @Override
+        public void serialize(ImmutableStringList list, JsonGenerator gen, SerializerProvider provider) throws IOException {
+            List<String> copy = new ArrayList<>(list);
+            provider.defaultSerializeValue(copy, gen);
+        }
+    }
+    
+    private static final long serialVersionUID = 1L;
+}
+
+// Then, register your custom deserializer in ObjectMapper setup method:
+ObjectMapper mapper = new ObjectMapper();
+SimpleModule module = new SimpleModule();
+module.addSerializer(new ImmutableStringList.Serializer());
+mapper.registerModule(module);
+```
+Your problem seems to occur because the standard `StringCollectionDeserializer` tries to instantiate an empty `ArrayList` before calling the custom deserializer. Therefore, you need to modify `createContextual` method in `StringCollectionDeserializer` as shown below. 
+
+```java
+if(_typeParameters[0] == null){  // means 'no specific type': can use List
+       switch (collectionClass.getSimpleName()) {
+       case "Set":
+           return new SettableAnyTypeDeserializer(this, _handledType());
+       case "Queue":
+       case "Deque":
+           return new ArrayDequeDeserializer(this, _handledType(), false);
+       case "ArrayDeque":
+           return new ArrayDequeDeserializer(this, _handledType(), true);
+       case "Stack":
+           return new StackDeserializer(this, _handledType());
+       case "Vector":
+           return new VectorDeserializer(this, _handledType());
+       case "LinkedHashMap":
+           return new LinkedHashMapDeserializer(this, _handledType(),
+                   _config.getBoolean(DeserializationConfig.Feature.USE_STATIC_TYPING),
+                   Map.class, null, null);
+       case "EnumSet":
+           return new EnumSetDeserializer(this, _handledType());
+       case "BitSet":
+           return new BitSetDeserializer(this, _handledType());
+       case "LinkedHashSet":
+           return new LinkedHashSetDeserializer(this, _handledType());
+       case "PriorityQueue":
+           return new PriorityQueueDeserializer(this, _handledType(), false, _sortComparator);
+       case "SortedSet":
+           return new TreeSetDeserializer(this, _handledType(), _sortComparator,
+                    SortedSet.class);
+       default:
+           if (!JsonToken.START_ARRAY.equals(tkNext)) {
+               // Defaults to regular lists unless we're starting an array
+               return NonNavigableTreeMapDeserializer.construct(this, _handledType());
+           }
+       }
+}
+return NonNavigableTreeMapDeserializer.construct(this, _handledType());
+```
+By replacing the above codes in your `Jackson/modules/ser/StdCollectionSerializers.java` file, it should fix the issue and ensure proper serialization and deserialization of your custom immutable string collection.
+

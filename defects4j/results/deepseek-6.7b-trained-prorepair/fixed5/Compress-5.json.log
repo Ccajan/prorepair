@@ -1,0 +1,216 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# ZipArchiveInputStream doesn't report the end of a truncated archive
+If a Zip archive is truncated, (e.g. because it is the first volume in a multi-volume archive) the ZipArchiveInputStream.read() method will not detect that fact. All calls to read() will return 0 bytes read. They will not return -1 (end of stream), nor will they throw any exception (which would seem like a good idea to me because the archive is truncated).
+I have tracked this problem to ZipArchiveInputStream.java, line 239. It contains a check
+if (read == 0 && inf.finished()) {
+    return -1;
+}
+For truncated archives the read is always zero but the inf is never finished(). I suggest adding two lines below:
+if (read == 0 && inf.finished()) {
+    return -1;
+} else if (read == 0 && lengthOfLastRead == -1) {
+	throw new IOException("Truncated ZIP file");
+}
+This solves the problem in my tests.
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/zip/ZipArchiveInputStream.java):
+```java
+public int read(byte[] buffer, int start, int length) throws IOException {
+    if (closed) {
+        throw new IOException("The stream is closed");
+    }
+    if (inf.finished() || current == null) {
+        return -1;
+    }
+
+    // avoid int overflow, check null buffer
+    if (start <= buffer.length && length >= 0 && start >= 0
+        && buffer.length - start >= length) {
+        if (current.getMethod() == ZipArchiveOutputStream.STORED) {
+            int csize = (int) current.getSize();
+            if (readBytesOfEntry >= csize) {
+                return -1;
+            }
+            if (offsetInBuffer >= lengthOfLastRead) {
+                offsetInBuffer = 0;
+                if ((lengthOfLastRead = in.read(buf)) == -1) {
+                    return -1;
+                }
+                count(lengthOfLastRead);
+                bytesReadFromStream += lengthOfLastRead;
+            }
+            int toRead = length > lengthOfLastRead
+                ? lengthOfLastRead - offsetInBuffer
+                : length;
+            if ((csize - readBytesOfEntry) < toRead) {
+                toRead = csize - readBytesOfEntry;
+            }
+            System.arraycopy(buf, offsetInBuffer, buffer, start, toRead);
+            offsetInBuffer += toRead;
+            readBytesOfEntry += toRead;
+            crc.update(buffer, start, toRead);
+            return toRead;
+        }
+        if (inf.needsInput()) {
+            fill();
+            if (lengthOfLastRead > 0) {
+                bytesReadFromStream += lengthOfLastRead;
+            }
+        }
+        int read = 0;
+        try {
+            read = inf.inflate(buffer, start, length);
+        } catch (DataFormatException e) {
+            throw new ZipException(e.getMessage());
+        }
+        if (read == 0 && inf.finished()) {
+            return -1;
+        }
+        crc.update(buffer, start, read);
+        return read;
+    }
+    throw new ArrayIndexOutOfBoundsException();
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+import org.apache.commons.compress.archivers.zip.ZipArchiveInputStream;
+import java.io.*;
+
+public class Main {
+	public static void main(String[] args) {
+        File zipFile = new File("/path/to/archive.zip");
+        try (BufferedInputStream bis = new BufferedInputStream(new FileInputStream(zipFile))) {
+            ZipArchiveInputStream zis = new ZipArchiveInputStream(bis);
+            byte[] buffer = new byte[4096];
+            
+            while (!zis.isFinished()) {
+                int len;
+                while ((len = zis.read(buffer)) != -1) {
+                    // Process the data here
+                    System.out.write(buffer, 0, len);
+                }
+                
+                if (zis.canSkipCurrentDirectory()) {
+                    continue;
+                }
+
+                if (!zis.getNextEntry().getName().endsWith(".class")) {
+                    continue;
+                }
+                    
+                long size = zis.getNextEntry().getSize();
+                while (true) {
+                    for (;;) {
+                        int rlen = Math.min((int)(size % Integer.MAX_VALUE), buffer.length);
+                        if (rlen <= 0) break;
+                        len = zis.read(buffer, 0, rlen);
+                        if (len < 0) {
+                            throw new RuntimeException("Unexpected EOF inside JAR entry.");
+                        }
+                        size -= len;
+                        System.out.write(buffer, 0, len);
+                        
+                        if (size == 0) {
+                            break;
+                        }
+                    }
+                }
+            }
+        } catch (IOException ex) {
+            ex.printStackTrace();
+        }
+	}
+}
+```
+
+```java
+package org.apache.commons.compress.archivers.zip;
+
+import java.io.EOFException;
+import java.util.zip.ZipException;
+
+final class Entry implements Directory {
+    final String name;
+    final LocalFileHeader header;
+    
+    public String getName() {
+        return name;
+    }
+
+    public long getSize() throws ZipException {
+        return header.getCompressedSize();
+    }
+
+    private boolean skippableDirectoryEntries;
+    
+    protected Entry(ZipArchiveInputStream in) throws ZipException, EOFException {
+        header = new LocalFileHeader();
+        
+        readHeaders(in);
+    }
+
+    public short getMethod() {
+        return header.getMethod();
+    }
+
+    public long getCrc() {
+        return header.getCrc();
+    }
+
+    protected Entry(ZipArchiveInputStream in, boolean spacing) throws EOFException {
+        header = new CentralDirectoryHeader();
+        
+        readHeaders(in);
+    }
+    
+    private boolean canSkipCurrentDirectoryEntry() {
+        return name != null && (name.equalsIgnoreCase("..") || name.equalsIgnoreCase("."));
+    }
+
+    private boolean isSkippableDirectoryEntry() {
+        if (!canSkipCurrentDirectoryEntry()) {
+            skippableDirectoryEntries = false;
+        }
+        return skippableDirectoryEntries;
+    }
+
+    private void readHeaders(ZipArchiveInputStream in) throws EOFException, ZipException {
+        try {
+            header.read(in);
+        } catch (ZipException e) {
+            throw e;
+        } catch (Throwable th) {
+            throw new EOFException("Premature end of ZIP archive: " + th);
+        }
+        
+        name = header.getFileName();
+        
+        if (header instanceof CentralDirectoryHeader) {
+            skippableDirectoryEntries = isSkippableDirectoryEntry();
+        }
+    }
+}
+```
+
+```java
+package org.apache.commons.compress.archivers.zip;
+
+final class LocalFileHeader extends AbstractZipHeader {
+
+    protected LocalFileHeader() {
+        super(HEADER_SIG, HEADER_MIN_SIZE);
+    }
+
+    @Override
+    protected boolean isZip64Enabled() {
+        return true; // As we cannot change the header signature easily.
+    }
+
+    @Override
+    protected long readZip64EndOfCentralDirectoryRecord(ZipArchiveInputStream in)
+            throws ZipException

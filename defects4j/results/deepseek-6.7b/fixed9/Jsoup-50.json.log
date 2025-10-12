@@ -1,0 +1,153 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# UTF16 streams with BOM are processed as UTF-8
+The handling of the character encoding in org.jsoup.helper.DataUtil.parseByteData(...) is bugged when the input is an UTF16 stream with unicode BOM. This method does a check for presence of a BOM and, if it finds one, incorrectly assumes that this was a UTF-8 BOM. To fix this, the code would have to check the raw BOM bytes as the distinction between the various BOMs is lost after conversion to characters. See also: http://unicode.org/faq/utf_bom.html#bom4
+This is an incorrect Java code (src/main/java/org/jsoup/helper/DataUtil.java):
+```java
+static Document parseByteData(ByteBuffer byteData, String charsetName, String baseUri, Parser parser) {
+    String docData;
+    Document doc = null;
+
+    // look for BOM - overrides any other header or input
+
+    if (charsetName == null) { // determine from meta. safe parse as UTF-8
+        // look for <meta http-equiv="Content-Type" content="text/html;charset=gb2312"> or HTML5 <meta charset="gb2312">
+        docData = Charset.forName(defaultCharset).decode(byteData).toString();
+        doc = parser.parseInput(docData, baseUri);
+        Element meta = doc.select("meta[http-equiv=content-type], meta[charset]").first();
+        if (meta != null) { // if not found, will keep utf-8 as best attempt
+            String foundCharset = null;
+            if (meta.hasAttr("http-equiv")) {
+                foundCharset = getCharsetFromContentType(meta.attr("content"));
+            }
+            if (foundCharset == null && meta.hasAttr("charset")) {
+                try {
+                    if (Charset.isSupported(meta.attr("charset"))) {
+                        foundCharset = meta.attr("charset");
+                    }
+                } catch (IllegalCharsetNameException e) {
+                    foundCharset = null;
+                }
+            }
+
+            if (foundCharset != null && foundCharset.length() != 0 && !foundCharset.equals(defaultCharset)) { // need to re-decode
+                foundCharset = foundCharset.trim().replaceAll("[\"']", "");
+                charsetName = foundCharset;
+                byteData.rewind();
+                docData = Charset.forName(foundCharset).decode(byteData).toString();
+                doc = null;
+            }
+        }
+    } else { // specified by content type header (or by user on file load)
+        Validate.notEmpty(charsetName, "Must set charset arg to character set of file to parse. Set to null to attempt to detect from HTML");
+        docData = Charset.forName(charsetName).decode(byteData).toString();
+    }
+    if (docData.length() > 0 && docData.charAt(0) == UNICODE_BOM) {
+        byteData.rewind();
+        docData = Charset.forName(defaultCharset).decode(byteData).toString();
+        docData = docData.substring(1);
+        charsetName = defaultCharset;
+        doc = null;
+    }
+    if (doc == null) {
+        doc = parser.parseInput(docData, baseUri);
+        doc.outputSettings().charset(charsetName);
+    }
+    return doc;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+import java.nio.ByteBuffer;
+import java.nio.charset.*;
+
+public class DataUtil {
+    private static final char UNICODE_BOM = '\uFEFF';
+    public static Document parseByteData(ByteBuffer byteData, String charsetName, String baseUri, Parser parser) throws UnsupportedEncodingException {
+        String docData;
+        Document doc = null;
+
+        // Look for BOM - overrides any other header or input
+        int b1 = byteData.get(0);
+        int b2 = byteData.get(1);
+        boolean hasUtf16LEBOM = (b1 == 0xFF && b2 == 0xFE);
+        boolean hasUtf16BEBOM = (b1 == 0xFE && b2 == 0xFF);
+
+        if ((charsetName == null || charsetName.isEmpty()) 
+            && (!hasUtf16LEBOM && !hasUtf16BEBOM)) {
+          
+          docData = StandardCharsets.UTF_8.decode(byteData).toString();
+          doc = parser.parseInput(docData, baseUri);
+          
+          Element meta = doc.select("meta[http-equiv=content-type], meta[charset]").first();
+          if (meta != null) { 
+              String foundCharset = getCharsetFromMetaTag(meta);
+              
+              if (foundCharset != null && !foundCharset.equalsIgnoreCase(StandardCharsets.UTF_8.name())) { 
+                  charsetName = foundCharset;
+                  byteData.rewind();
+                  Charset decodingCharset = Charset.forName(charsetName);
+                  docData = decodingCharset.decode(byteData).toString();
+                  doc = null;
+              }
+          }
+        } else if (hasUtf16LEBOM) {  
+          charsetName = StandardCharsets.UTF_16LE.name();
+          byteData.rewind();
+          CharsetDecoder decoder = StandardCharsets.UTF_16LE.newDecoder();
+          docData = decoder.decode(byteData).toString();
+          doc = parser.parseInput(docData.substring(1), baseUri);
+        
+        } else if (hasUtf16BEBOM){    
+          charsetName = StandardCharsets.UTF_16BE.name();
+          byteData.rewind();
+          CharsetDecoder decoder = StandardCharsets.UTF_16BE.newDecoder();
+          docData = decoder.decode(byteData).toString();
+          doc = parser.parseInput(docData.substring(1), baseUri);
+        } else {                      
+          Charset decodingCharset = Charset.forName(charsetName);
+          docData = decodingCharset.decode(byteData).toString();
+        }
+      
+        if (doc == null) {
+          doc = parser.parseInput(docData, baseUri);
+          doc.outputSettings().charset(charsetName);
+        }
+        return doc;
+    }
+  
+  
+    private static String getCharsetFromMetaTag(Element meta) {
+      if (!meta.hasAttr("http-equiv") && !meta.hasAttr("charset")){
+        return null;
+      }
+
+      if (meta.hasAttr("http-equiv")){
+        return getCharsetFromContentType(meta.attr("content"));
+      }
+
+      String charset = meta.attr("charset");
+      if(!Charset.isSupported(charset)){
+        return null;
+      }
+
+      return charset;
+    }
+
+    private static String getCharsetFromContentType(String contentType) {
+        String[] parts = contentType.split(";");
+        for (String part : parts) {
+          part = part.trim();
+          if (part.toLowerCase().startsWith("charset=")) {
+             return part.substring(8);
+          }
+        }
+        return null;
+    }
+}
+```
+In the repaired version of the function above, I first checked whether the ByteBuffer has a UTF16 Little Endian (LE) or Big Endian (BE) byte order mark (BOM). If it does, then instead of assuming a UTF-8 BOM, we now directly use the appropriate StandardCharset. Then, before we convert our ByteBuffer into a String,

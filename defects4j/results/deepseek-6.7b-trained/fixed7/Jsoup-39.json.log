@@ -1,0 +1,149 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# JSoup incorrectly moves content from the <head> section into <body> for sample URL
+If you load the following URL:
+http://jornutzon.sydneyoperahouse.com/home.htm
+
+into:
+http://try.jsoup.org/
+
+then it will move the content from the "head" section into the "body" section. The URL
+being parsed validates using the W3C validator:
+http://validator.w3.org/check?uri=http%3A%2F%2Fjornutzon.sydneyoperahouse.com%2Fhome.htm&charset=%28detect+automatically%29&doctype=Inline&ss=1&group=0&user-agent=W3C_Validator%2F1.3+http%3A%2F%2Fvalidator.w3.org%2Fservices
+We are using JSoup 1.7.2
+This is an incorrect Java code (src/main/java/org/jsoup/helper/DataUtil.java):
+```java
+static Document parseByteData(ByteBuffer byteData, String charsetName, String baseUri, Parser parser) {
+    String docData;
+    Document doc = null;
+    if (charsetName == null) { // determine from meta. safe parse as UTF-8
+        // look for <meta http-equiv="Content-Type" content="text/html;charset=gb2312"> or HTML5 <meta charset="gb2312">
+        docData = Charset.forName(defaultCharset).decode(byteData).toString();
+        doc = parser.parseInput(docData, baseUri);
+        Element meta = doc.select("meta[http-equiv=content-type], meta[charset]").first();
+        if (meta != null) { // if not found, will keep utf-8 as best attempt
+            String foundCharset;
+            if (meta.hasAttr("http-equiv")) {
+                foundCharset = getCharsetFromContentType(meta.attr("content"));
+                if (foundCharset == null && meta.hasAttr("charset")) {
+                    try {
+                        if (Charset.isSupported(meta.attr("charset"))) {
+                            foundCharset = meta.attr("charset");
+                        }
+                    } catch (IllegalCharsetNameException e) {
+                        foundCharset = null;
+                    }
+                }
+            } else {
+                foundCharset = meta.attr("charset");
+            }
+
+            if (foundCharset != null && foundCharset.length() != 0 && !foundCharset.equals(defaultCharset)) { // need to re-decode
+                foundCharset = foundCharset.trim().replaceAll("[\"']", "");
+                charsetName = foundCharset;
+                byteData.rewind();
+                docData = Charset.forName(foundCharset).decode(byteData).toString();
+                doc = null;
+            }
+        }
+    } else { // specified by content type header (or by user on file load)
+        Validate.notEmpty(charsetName, "Must set charset arg to character set of file to parse. Set to null to attempt to detect from HTML");
+        docData = Charset.forName(charsetName).decode(byteData).toString();
+    }
+    // UTF-8 BOM indicator. takes precedence over everything else. rarely used. re-decodes incase above decoded incorrectly
+    if (docData.length() > 0 && docData.charAt(0) == 65279) {
+        byteData.rewind();
+        docData = Charset.forName(defaultCharset).decode(byteData).toString();
+        docData = docData.substring(1);
+        charsetName = defaultCharset;
+    }
+    if (doc == null) {
+        doc = parser.parseInput(docData, baseUri);
+        doc.outputSettings().charset(charsetName);
+    }
+    return doc;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+private static final Pattern htmlPattern = Pattern.compile("<\\s*\\?xml.*?encoding\\s*=\\s*(?:'|\")([^ >]*)");
+
+static Document parseByteData(ByteBuffer byteData, String charsetName, String baseUri, Parser parser) throws IOException {
+
+
+    ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+    IOUtils.copy(new ByteBufferInputStream(byteData), outputStream);
+    byteData.position(0);
+    outputStream.flush();
+
+    String pageSourceRaw = new String(outputStream.toByteArray(), "UTF-8");
+    Matcher matcher = htmlPattern.matcher(pageSourceRaw);
+    boolean hasXmlDeclaration = matcher.find();
+    String declaringCharset = "";
+
+    if (!hasXmlDeclaration){
+         declaringCharset = charsetName;
+    }else{
+          declaringCharset = matcher.group(1);
+    }
+
+    Output output = new Output(declaringCharset);
+    BufferedReader reader = new BufferedReader(new InputStreamReader(new ByteBufferInputStream(byteData)));
+    
+    int ch; while((ch = reader.read())!= -1)
+        {
+        output.write((char)ch);
+        }
+  
+       output.endDocument();
+      
+    Document d =  Jsoup.parse(new ByteBufferInputStream(output.buffer()), declaringCharset ,baseUri );
+    if(d.childNodesSize()>2&&d.children().get(1).tag().getName().equalsIgnoreCase("head")){
+         org.jsoup.nodes.Node child = d.childNodes().remove(1);
+         d.children().add(child);
+      }
+    return d;
+  }
+
+```
+
+```java
+class Output extends OutputSettings implements Appendable {
+
+public Output(String encoding){
+super();this.charset(encoding);
+}
+
+private int size = 0 ;
+ private void resize(){if (size<data.length)return;byte[] b = new byte[data.length*2];System.arraycopy(data, 0 ,b, 0, data.length);data = b;}
+
+private byte[] data = new byte[4096] ;
+
+@Override public Output append(CharSequence csq)throws IOException{int len=csq.length();resize();if (len>=0) System.arraycopy(csq.toString().getBytes(charset.name()), 0, data, this.size , len);size+=len;return this;}
+ @Override public Output append(CharSequence csq,int start,int end)throws IOException{int len =end -start;append(csq.subSequence(start,end));return this;}
+
+ @Override public Output append(char c) throws IOException{append(Character.toString(c));return this;}
+
+ public ByteBuffer buffer(){return ByteBuffer.wrap(data,0, size);}
+}
+```
+
+```java
+ class ByteBufferInputStream extends InputStream {
+final ByteBuffer buf;
+
+ public ByteBufferInputStream(ByteBuffer buf) {
+   this.buf = buf;
+}
+  public synchronized int read() {
+   return buf.hasRemaining() ? buf.get() & 0xFF : -1;
+}
+}
+```
+# Explanation
+The problem was that jsoup was attempting to process the DOCTYPE before moving any elements around. This means it would have moved all HEAD elements into the body because when processing HTML in real life, you should define the DOCTYPE first, then declare the head before the body starts appearing, after that, your stylesheets can be defined in the head but scriptlets etc must come at the bottom of the body (just like in PHP). In our case, we had previously implemented this rule, so now we just need to adjust the order of element movement during parsing in ```JSoup's``` source code. We made these changes in ```src/main/java/org/jsoup/helper/DataUtil.java``` and added some utility classes described below, they are required because of JSoup's internal mechanisms.
+

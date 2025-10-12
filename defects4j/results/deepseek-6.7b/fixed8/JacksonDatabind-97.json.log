@@ -1,0 +1,139 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# Context attributes are not passed/available to custom serializer if object is in POJO
+Below is a test case where I create a custom serializer and use it to serialize an object 1) in a HashMap and 2) in an ObjectNode. In both cases I pass attribute to the serializer like this:
+mapper.writer().withAttribute("myAttr", "Hello!")
+Serializing HashMap works as expected, but during ObjectNode serialization the attribute is null . It seems that in both cases the custom serializer should get access to the passed attribute and so both lines in the output should contain "Hello!"
+Produced output from running testCase.test()
+{"data":{"aStr":"The value is: Hello!"}}
+{"data":{"aStr":"The value is: NULL"}}
+
+Test case:
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializerProvider;
+import com.fasterxml.jackson.databind.annotation.JsonSerialize;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.fasterxml.jackson.databind.ser.std.StdSerializer;
+
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
+
+public class TestCase {
+  public final static ObjectMapper mapper = new ObjectMapper();
+
+  @JsonSerialize(using = TestCase.CustomSer.class)
+  public static class Data {
+    public String aStr;
+  }
+
+  public static class CustomSer extends StdSerializer<Data> {
+    public CustomSer() {
+      super(Data.class);
+    }
+
+    @Override
+    public void serialize(Data value, JsonGenerator gen, SerializerProvider provider) throws IOException {
+      String attrStr = (String) provider.getAttribute("myAttr");
+      gen.writeStartObject();
+      gen.writeObjectField("aStr", "The value is: " + (attrStr == null ? "NULL" : attrStr));
+      gen.writeEndObject();
+    }
+  }
+
+  public static void test() throws IOException {
+    Data data = new Data();
+    data.aStr = "Hello";
+
+    Map<String, Object> mapTest = new HashMap<>();
+    mapTest.put("data", data);
+
+    ObjectNode treeTest = mapper.createObjectNode();
+    treeTest.putPOJO("data", data);
+
+    String mapOut = mapper.writer().withAttribute("myAttr", "Hello!").writeValueAsString(mapTest);
+    System.out.println(mapOut);
+
+    String treeOut = mapper.writer().withAttribute("myAttr", "Hello!").writeValueAsString(treeTest);
+    System.out.println(treeOut);
+  }
+}
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/node/POJONode.java):
+```java
+public final void serialize(JsonGenerator gen, SerializerProvider ctxt) throws IOException
+{
+    if (_value == null) {
+        ctxt.defaultSerializeNull(gen);
+    } else if (_value instanceof JsonSerializable) {
+        ((JsonSerializable) _value).serialize(gen, ctxt);
+    } else {
+        // 25-May-2018, tatu: [databind#1991] do not call via generator but through context;
+        //    this to preserve contextual information
+        gen.writeObject(_value);
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+// ... existing imports omitted for brevity ...
+
+public abstract class TreeNode implements Comparable<TreeNode>, JsonSerializable {
+    protected static final long serialVersionUID = 1L;
+    
+    /* package */ final ObjectNode parent;
+    /** Node number of this node in its (pre-order) list of children; first child has num 0 */
+    private int nodeNo;
+        
+    /* package */ abstract Stream<? extends TreeNode> children();
+    
+    /* ... remaining code snippet truncated for clarity ... */
+}
+
+public class POJONode extends ValueNode {
+
+    // additional field, to store the context attributes
+    private final transient AttributeContainerImpl myContext;
+  
+    /* ... constructor truncated for readability... */
+
+    // Redefinition of write method with added attributes
+    @Override
+    public void serialize(JsonGenerator jg, SerializerProvider sp) throws IOException, JsonProcessingException {
+       if (this._value instanceof JsonSerializable) {
+            JsonSerializable jsonSerializable = (JsonSerializable) _value;
+            
+            // Adding attributes to the context before invoking serialization
+            MyFactory f = (MyFactory) sp.getConfig().getTypeFactory();
+            JsonProvider provider = f.provider();
+            JsonParser parser  = provider.constructParametricComponent(JsonParser.class);
+            DeserializationContext dc = f.deserializationContext(parser);
+
+            AttributeContainerImpl tmpCtx = (AttributeContainerImpl) dc.getContext();
+            tmpCtx.setAttributes((AttributeSourceImpl) myContext.clone());
+                
+            jsonSerializable.serialize(jg, sp);
+          }
+    }
+}
+
+public class DefaultPrettyPrinter extends PrettyPrinterBase {
+    private static final long serialVersionUID = 1L;
+    
+    /* ... removed fields for clarity... */
+    
+    /* package */ DefaultPrettyPrinter() {
+        // default to human-friendly setting
+        setRootValueSeparator(System.lineSeparator());
+    }
+    
+    /* ... more methods... */
+}
+```
+
+Explanation: The issue you're encountering is because `JsonSerializer` does not automatically propagate the attributes when serializing a `POJONode`. To fix this, we need to manually add attributes to the deserialization context before calling the `serialize()` method on the `JsonSerializable` object. This way, the attributes become available to the custom serializer during the process of serialization. We accomplish this using the `MyFactory` classes which provides us with necessary tools such as constructors for creating instances of different types required and fetching the current deserialization context. Then we clone our original context into a temporary one, adding our attribute source there and finally assigning this back to the context, effectively "propagating" our own attributes up the serialization chain.
+

@@ -15,6 +15,7 @@ from pathlib import Path
 import concurrent.futures as cf
 from contextlib import contextmanager, redirect_stdout, redirect_stderr
 import glob
+import math
 
 ROOT_PATH = '/tmp/playground/'
 DEFECTS4J_PATH = '/home/barty/research/defects4j/framework/bin/defects4j'
@@ -686,8 +687,8 @@ class ValidationStats:
                     self.diff_stats['patch_count'] += 1
                 else:
                     print(f"[DEBUG] PLAUSIBLE patch found but no diff_stats available")
-                
-                ratio = stats.get('preserved_ratio', 0)
+                # 即使没有 diff_stats，也进行分布统计（按0处理）
+                ratio = patch.get('diff_stats', {}).get('preserved_ratio', 0)
                 if ratio > 95:
                     self.diff_stats['preservation_distribution']['high'] += 1
                 elif ratio > 80:
@@ -735,6 +736,34 @@ class ValidationStats:
         
         return top1_rate, top5_rate, top10_rate  # 确保这行一定会执行
 
+    def _pass_at_k(self, n, c, k):
+        """计算单个bug的 pass@k（返回[0,1]）。n为候选数，c为正确数。"""
+        if n <= 0 or c <= 0:
+            return 0.0
+        if k >= n:
+            return 1.0
+        # 1 - C(n-c, k) / C(n, k)
+        try:
+            return 1.0 - (math.comb(n - c, k) / math.comb(n, k))
+        except ValueError:
+            # 防御性：组合异常时按最优处理
+            return 1.0
+
+    def get_pass_at_k(self):
+        """计算平均 pass@1/5/10（百分比）。"""
+        if self.total_bugs == 0:
+            return 0.0, 0.0, 0.0
+        k_values = [1, 5, 10]
+        totals = [0.0, 0.0, 0.0]
+        for bug_id, patches in self.bug_results.items():
+            if patches is None:
+                continue
+            n = len(patches)
+            c = sum(1 for p in patches if p is not None and p.get('patch_status') == 'PLAUSIBLE')
+            for idx, k in enumerate(k_values):
+                totals[idx] += self._pass_at_k(n, c, k)
+        return tuple((t / self.total_bugs) * 100 for t in totals)
+
 def load_previous_results(model_id):
     results_dir = f'defects4j/results/{model_id}'
     previous_results = {}
@@ -751,6 +780,7 @@ def load_previous_results(model_id):
     
     status_summary = []
     
+    # 首先尝试从 *-validated.jsonl 文件加载（旧格式）
     for json_file in glob.glob(os.path.join(results_dir, '*-validated.jsonl')):
         try:
             bug_id = os.path.basename(json_file).replace('-validated.jsonl', '')
@@ -783,6 +813,50 @@ def load_previous_results(model_id):
         except Exception as e:
             print(f"[WARNING] Failed to load previous results from {json_file}: {e}")
     
+    # 如果没有找到 -validated.jsonl 文件，尝试从 fixed*/*.result 文件加载（新格式）
+    if not previous_results:
+        print(f"[INFO] No *-validated.jsonl files found, trying fixed*/*.result files...")
+        for fixed_dir in sorted(glob.glob(os.path.join(results_dir, 'fixed*'))):
+            if not os.path.isdir(fixed_dir):
+                continue
+            for result_file in glob.glob(os.path.join(fixed_dir, '*.json.result')):
+                try:
+                    bug_id = os.path.basename(result_file).replace('.json.result', '')
+                    with open(result_file, 'r') as f:
+                        results = json.load(f)
+                        if results and bug_id not in previous_results:
+                            # 第一次遇到这个bug，初始化结果列表
+                            previous_results[bug_id] = results
+                        elif results and bug_id in previous_results:
+                            # 已经有这个bug的结果，需要扩展列表
+                            previous_results[bug_id].extend(results)
+                except Exception as e:
+                    print(f"[WARNING] Failed to load result from {result_file}: {e}")
+        
+        # 为从.result文件加载的结果生成状态摘要
+        for bug_id, results in previous_results.items():
+            plausible_found = False
+            for idx, patch in enumerate(results, 1):
+                if patch['patch_status'] == 'PLAUSIBLE':
+                    plausible_found = True
+                    status_summary.append({
+                        'bug_id': bug_id,
+                        'date': bug_dates.get(bug_id, 'N/A'),
+                        'status': 'PLAUSIBLE',
+                        'position': idx,
+                        'total_patches': len(results)
+                    })
+                    break
+            
+            if not plausible_found:
+                status_summary.append({
+                    'bug_id': bug_id,
+                    'date': bug_dates.get(bug_id, 'N/A'),
+                    'status': 'FAILED',
+                    'position': None,
+                    'total_patches': len(results)
+                })
+    
     print("\n[PREVIOUS VALIDATION SUMMARY]")
     print("=" * 100)
     print(f"{'Bug ID':15} | {'Date':10} | {'Status':10} | {'Position':10} | {'Total Patches':15}")
@@ -814,6 +888,10 @@ def validate_defects4j(model_id, n_generations):
     print(f"Top-1:  {top1:.2f}%")
     print(f"Top-5:  {top5:.2f}%")
     print(f"Top-10: {top10:.2f}%")
+    pass1, pass5, pass10 = stats.get_pass_at_k()
+    print(f"pass@1:  {pass1:.2f}%")
+    print(f"pass@5:  {pass5:.2f}%")
+    print(f"pass@10: {pass10:.2f}%")
     
     print(f"\n[DEBUG] Total patch count for diff stats: {stats.diff_stats['patch_count']}")  # 添加调试信息
     
@@ -920,7 +998,9 @@ def validate_defects4j(model_id, n_generations):
                     
                     top1, top5, top10 = stats.get_success_rate()
                     print(f"\n[CURRENT PROGRESS] Validated {validated_count}/{total_count} bugs")
+                    pass1, pass5, pass10 = stats.get_pass_at_k()
                     print(f"[CURRENT SUCCESS RATE] Top-1: {top1:.2f}% | Top-5: {top5:.2f}% | Top-10: {top10:.2f}%")
+                    print(f"[CURRENT PASS@K] pass@1: {pass1:.2f}% | pass@5: {pass5:.2f}% | pass@10: {pass10:.2f}%")
                     print("=" * 100)
                     
             except Exception as e:
@@ -932,6 +1012,10 @@ def validate_defects4j(model_id, n_generations):
     print(f"Top-1:  {top1:.2f}%")
     print(f"Top-5:  {top5:.2f}%")
     print(f"Top-10: {top10:.2f}%")
+    pass1, pass5, pass10 = stats.get_pass_at_k()
+    print(f"pass@1:  {pass1:.2f}%")
+    print(f"pass@5:  {pass5:.2f}%")
+    print(f"pass@10: {pass10:.2f}%")
     print("=" * 100)
     
     # 添加diff统计输出
@@ -974,7 +1058,7 @@ def shuffle_validated_patches(candidate_patches):
 def load_and_compare_results(model_id1, model_id2, min_patches=1):
     bug_dates = {}
     try:
-        with open('time.jsonl', 'r') as f:
+        with open('defects4j/time.jsonl', 'r') as f:
             for line in f:
                 data = json.loads(line)
                 bug_id, date = list(data.items())[0]
@@ -991,17 +1075,26 @@ def load_and_compare_results(model_id1, model_id2, min_patches=1):
     
     bug_lengths = {}
     for bug_id in filtered_results1.keys() | filtered_results2.keys():
-        json_file = os.path.join('results', model_id1, 'fixed0', f'{bug_id}.json')
+        # 尝试从dataset获取bug信息
+        json_file = os.path.join('defects4j/dataset', f'{bug_id}.json')
         try:
             with open(json_file, 'r') as f:
                 patch_info = json.load(f)
-                total_length = len(patch_info.get('title', '')) + len(patch_info.get('description', '')) + len(patch_info.get('buggy', ''))
+                total_length = len(patch_info.get('issue_title', '')) + len(patch_info.get('issue_description', '')) + len(patch_info.get('buggy', ''))
                 bug_lengths[bug_id] = total_length
         except Exception as e:
-            print(f"[WARNING] Failed to load patch info for {bug_id}: {e}")
+            # 如果dataset中没有，尝试从结果目录获取
+            json_file = os.path.join('defects4j/results', model_id1, 'fixed0', f'{bug_id}.json')
+            try:
+                with open(json_file, 'r') as f:
+                    patch_info = json.load(f)
+                    total_length = len(patch_info.get('issue_title', '')) + len(patch_info.get('issue_description', '')) + len(patch_info.get('buggy', ''))
+                    bug_lengths[bug_id] = total_length
+            except Exception as e2:
+                print(f"[WARNING] Failed to load patch info for {bug_id}: {e2}")
     
-    all_bugs = sorted(set(filtered_results1.keys()) | set(filtered_results2.keys()))
     common_bugs = set(filtered_results1.keys()) & set(filtered_results2.keys())
+    all_bugs = sorted(common_bugs)
     
     print("\n[VALIDATION COMPARISON SUMMARY]")
     print("=" * 145)
@@ -1094,6 +1187,8 @@ def print_comparison_results(stats1, stats2, model_id1, model_id2):
     
     top1_1, top5_1, top10_1 = stats1.get_success_rate()
     top1_2, top5_2, top10_2 = stats2.get_success_rate()
+    pass1_1, pass5_1, pass10_1 = stats1.get_pass_at_k()
+    pass1_2, pass5_2, pass10_2 = stats2.get_pass_at_k()
     
     metrics = [
         ("Top-1", top1_1, top1_2),
@@ -1102,6 +1197,18 @@ def print_comparison_results(stats1, stats2, model_id1, model_id2):
     ]
     
     for metric_name, val1, val2 in metrics:
+        diff = val2 - val1
+        diff_str = f"{diff:+.2f}%" if diff != 0 else "0.00%"
+        color = '\033[92m' if diff > 0 else '\033[91m' if diff < 0 else '\033[0m'
+        print(f"{metric_name:15} | {val1:>9.2f}% | {val2:>9.2f}% | {color}{diff_str:>10}\033[0m")
+
+    print("-" * 80)
+    pass_metrics = [
+        ("pass@1", pass1_1, pass1_2),
+        ("pass@5", pass5_1, pass5_2),
+        ("pass@10", pass10_1, pass10_2)
+    ]
+    for metric_name, val1, val2 in pass_metrics:
         diff = val2 - val1
         diff_str = f"{diff:+.2f}%" if diff != 0 else "0.00%"
         color = '\033[92m' if diff > 0 else '\033[91m' if diff < 0 else '\033[0m'
@@ -1184,12 +1291,20 @@ if __name__ == '__main__':
     start_val_time = time.time()
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('-m', '--model_id', type=str, required=True)
-    parser.add_argument('-n', '--n_generations', type=int, default=1)
+    parser.add_argument('-m', '--model_id', type=str, required=True, help='主模型ID')
+    parser.add_argument('-n', '--n_generations', type=int, default=1, help='生成次数')
     parser.add_argument('--recalc_diff', action='store_true', help='只重新计算diff统计，不重新运行测试')
+    parser.add_argument('--compare_with', type=str, default=None, help='对比另一个模型的结果')
+    parser.add_argument('--min_patches', type=int, default=10, help='对比时最小patch数量要求（默认10）')
     args = parser.parse_args()
     
     if args.recalc_diff:
         recalculate_diff_stats(args.model_id)
+    elif args.compare_with:
+        # 对比模式
+        print(f"\n[对比模式] 对比 {args.model_id} 和 {args.compare_with}")
+        stats1, stats2 = load_and_compare_results(args.model_id, args.compare_with, args.min_patches)
+        print_comparison_results(stats1, stats2, args.model_id, args.compare_with)
     else:
+        # 验证模式
         validate_defects4j(args.model_id, args.n_generations)

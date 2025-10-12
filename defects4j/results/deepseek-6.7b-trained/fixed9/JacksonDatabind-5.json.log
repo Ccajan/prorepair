@@ -1,0 +1,137 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# Mixin annotations lost when using a mixin class hierarchy with non-mixin interfaces
+In summary, mixin annotations are lost when Jackson scans a parent mixin class with Json annotations followed by an interface implemented by the parent mixin class that does not have the same Json annotations.
+Jackson version: 2.4.0
+Detail:
+I have the following class structure
+public interface Contact {
+    String getCity();
+}
+
+public class ContactImpl implements Contact {
+    public String getCity() { ... }
+}
+
+public class ContactMixin implements Contact {
+    @JsonProperty
+    public String getCity() { return null; }
+}
+
+public interface Person extends Contact {}
+
+public class PersonImpl extends ContactImpl implements Person {}
+
+public class PersonMixin extends ContactMixin implements Person {}
+and I configure a module as
+// There are other getters/properties in the Impl class that do not need to be serialized and so
+// I am using the Mixin to match the interface and explicitly annotate all the inherited methods
+module.disable(MapperFeature.ALLOW_FINAL_FIELDS_AS_MUTATORS)
+    .disable(MapperFeature.AUTO_DETECT_FIELDS)
+    .disable(MapperFeature.AUTO_DETECT_GETTERS)
+    .disable(MapperFeature.AUTO_DETECT_IS_GETTERS)
+    .disable(MapperFeature.INFER_PROPERTY_MUTATORS);
+module.setMixInAnnotation(Person.class, PersonMixin.class);
+When a PersonImpl instance is serialized, city is not included.
+I debugged the code and this is what happens:
+In AnnotatedClass.resolveMemberMethods() the supertypes of PersonImpl are [Person.class, Contact.class, ContactImpl.class] in that order.
+It starts with Person for which it finds PersonMixin and proceeds to AnnotatedClass._addMethodMixIns(). Here the parents list has [PersonMixin, ContactMixin, Contact]. When it processes ContactMixin it adds getCity() with the JsonProperty annotation. Then it processes Contact, doesn't find getCity() in methods map and so creates a new AnnotatedMethod for getCity() with the one from the interface which has no annotation which replaces the one from ContactMixin
+The workaround for this issue is to explicitly add any parent mixins to the module i.e.
+module.setMixInAnnotation(Contact.class, ContactMixin.class);
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/introspect/AnnotatedClass.java):
+```java
+protected void _addMethodMixIns(Class<?> targetClass, AnnotatedMethodMap methods,
+        Class<?> mixInCls, AnnotatedMethodMap mixIns)
+{
+    List<Class<?>> parents = new ArrayList<Class<?>>();
+    parents.add(mixInCls);
+    ClassUtil.findSuperTypes(mixInCls, targetClass, parents);
+    for (Class<?> mixin : parents) {
+        for (Method m : mixin.getDeclaredMethods()) {
+            if (!_isIncludableMemberMethod(m)) {
+                continue;
+            }
+            AnnotatedMethod am = methods.find(m);
+            /* Do we already have a method to augment (from sub-class
+             * that will mask this mixIn)? If so, add if visible
+             * without masking (no such annotation)
+             */
+            if (am != null) {
+                _addMixUnders(m, am);
+                /* Otherwise will have precedence, but must wait
+                 * until we find the real method (mixIn methods are
+                 * just placeholder, can't be called)
+                 */
+            } else {
+                // Well, or, as per [Issue#515], multi-level merge within mixins...
+                    mixIns.add(_constructMethod(m));
+            }
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+private void sortMixinsAndMerge(Class<?> target, Class<?> mixInToAdd,
+        AnnotatedClass acctoUseForResult,
+        Collection<AnnotatedMethod> additionalPropertiesOverride,
+        boolean createViewInclusion)
+{
+    Iterator<Class<?>> iter = _typesBySupertypeOrder(target).iterator();
+    while (iter.hasNext()) {
+        Class<?> c = iter.next();
+        if (_equalsOrSubtype(c, mixInToAdd)) {
+            final Class<?>[] mixins = ModuleBuilder.getAllMixInClasses(c);
+            Collections.sort(Arrays.asList(mixins), SORTER);
+            for (int i = 0; i < mixins.length; ++i) {
+                applyMixins(acctoUseForResult, mixins[i],
+                        additionalPropertiesOverride,
+                        createViewInclusion && !(ModuleBuilder
+                                .hasViewCreator(mixins[i]) || _containsViewProvider(mixins[i])));
+            }
+        }
+    }
+}
+
+private int compare(final Class<?> o1, final Class<?> o2) {
+    if (ModuleBuilder.getAllMixInClasses(o1) == null
+            && ModuleBuilder.getAllMixInClasses(o2) != null) {
+        return -1;
+    } else if (ModuleBuilder.getAllMixInClasses(o1) != null
+            && ModuleBuilder.getAllMixInClasses(o2) == null) {
+        return 1;
+    } else if (ModuleBuilder.getAllMixInClasses(o1) != null) {
+        Class<?>[] c1 = ModuleBuilder.getAllMixInClasses(o1);
+        Class<?>[] c2 = ModuleBuilder.getAllMixInClasses(o2);
+        Set<String> s1 = Util.stringSet(new HashSet<String>(), true);
+        Set<String> s2 = Util.stringSet(new HashSet<String>(), true);
+        for (Class<?> x : c1) {
+            String name = x.getName();
+            if (!s1.contains(name)) {
+                s1.add(name);
+            }
+        }
+        for (Class<?> x : c2) {
+            String name = x.getName();
+            if (!s2.contains(name)) {
+                s2.add(name);
+            }
+        }
+        return Integer.valueOf(s1.size()).compareTo(Integer.valueOf(s2.size()));
+    }
+    return super.compare(o1, o2);
+}
+```
+# Mixin annotations lost when using a mixin class hierarchy with non-mixin interfaces
+
+In summary, mixin annotations are lost when Jackson scans a parent mixin class with Json annotations followed by an interface implemented by the parent mixin class that does not have the same Json annotations.
+Jackson version: 2.4.0
+
+The incorrect Java code is ```java protected void _addMethodMixIns(Class<?> targetClass, AnnotatedMethodMap methods,Class<?> mixInCls, AnnotatedMethodMap mixIns){ List<Class<?>> parents = new ArrayList<Class<?>>(); parents.add(mixInCls); ClassUtil.findSuperTypes(mixInCls, targetClass, parents); for (Class<?> mixin : parents) { for (Method m : mixin.getDeclaredMethods()) { if (!_isIncludableMemberMethod(m)) { continue; } AnnotatedMethod am = methods.find(m); if (am != null) { _addMixUnders(m, am); } else { mixIns.add(_constructMethod(m)); } }} }``` This is how the original code functions, adding the json property on top of the interface, however, when there is a child class that also implements the interface, the properties defined on the interface are ignored, leading to the loss of mixin annotations. To repair the incorrect code, you should make these changes:
+
+1. Modify the sorting function to prioritize the addition of interface implementation methods over those added through a mixin. The code implementing this modification is as follows:
+```java private int compare(final Class<?> o1, final Class<?> o2) { if (ModuleBuilder.getAllMixInClasses(o1) == null

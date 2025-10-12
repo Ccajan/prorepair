@@ -1,0 +1,174 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# Mixin annotations lost when using a mixin class hierarchy with non-mixin interfaces
+In summary, mixin annotations are lost when Jackson scans a parent mixin class with Json annotations followed by an interface implemented by the parent mixin class that does not have the same Json annotations.
+Jackson version: 2.4.0
+Detail:
+I have the following class structure
+public interface Contact {
+    String getCity();
+}
+
+public class ContactImpl implements Contact {
+    public String getCity() { ... }
+}
+
+public class ContactMixin implements Contact {
+    @JsonProperty
+    public String getCity() { return null; }
+}
+
+public interface Person extends Contact {}
+
+public class PersonImpl extends ContactImpl implements Person {}
+
+public class PersonMixin extends ContactMixin implements Person {}
+and I configure a module as
+// There are other getters/properties in the Impl class that do not need to be serialized and so
+// I am using the Mixin to match the interface and explicitly annotate all the inherited methods
+module.disable(MapperFeature.ALLOW_FINAL_FIELDS_AS_MUTATORS)
+    .disable(MapperFeature.AUTO_DETECT_FIELDS)
+    .disable(MapperFeature.AUTO_DETECT_GETTERS)
+    .disable(MapperFeature.AUTO_DETECT_IS_GETTERS)
+    .disable(MapperFeature.INFER_PROPERTY_MUTATORS);
+module.setMixInAnnotation(Person.class, PersonMixin.class);
+When a PersonImpl instance is serialized, city is not included.
+I debugged the code and this is what happens:
+In AnnotatedClass.resolveMemberMethods() the supertypes of PersonImpl are [Person.class, Contact.class, ContactImpl.class] in that order.
+It starts with Person for which it finds PersonMixin and proceeds to AnnotatedClass._addMethodMixIns(). Here the parents list has [PersonMixin, ContactMixin, Contact]. When it processes ContactMixin it adds getCity() with the JsonProperty annotation. Then it processes Contact, doesn't find getCity() in methods map and so creates a new AnnotatedMethod for getCity() with the one from the interface which has no annotation which replaces the one from ContactMixin
+The workaround for this issue is to explicitly add any parent mixins to the module i.e.
+module.setMixInAnnotation(Contact.class, ContactMixin.class);
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/introspect/AnnotatedClass.java):
+```java
+protected void _addMethodMixIns(Class<?> targetClass, AnnotatedMethodMap methods,
+        Class<?> mixInCls, AnnotatedMethodMap mixIns)
+{
+    List<Class<?>> parents = new ArrayList<Class<?>>();
+    parents.add(mixInCls);
+    ClassUtil.findSuperTypes(mixInCls, targetClass, parents);
+    for (Class<?> mixin : parents) {
+        for (Method m : mixin.getDeclaredMethods()) {
+            if (!_isIncludableMemberMethod(m)) {
+                continue;
+            }
+            AnnotatedMethod am = methods.find(m);
+            /* Do we already have a method to augment (from sub-class
+             * that will mask this mixIn)? If so, add if visible
+             * without masking (no such annotation)
+             */
+            if (am != null) {
+                _addMixUnders(m, am);
+                /* Otherwise will have precedence, but must wait
+                 * until we find the real method (mixIn methods are
+                 * just placeholder, can't be called)
+                 */
+            } else {
+                // Well, or, as per [Issue#515], multi-level merge within mixins...
+                    mixIns.add(_constructMethod(m));
+            }
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+try {
+    Object o = AnnotatedClass.class.getDeclaredField("_annotations").get(aclass);
+    ((SimpleArray)_o).items[i] = o;
+} catch (Exception e) {
+    
+}
+```
+```java
+
+package com.fasterxml.jackson.databind.introspect;
+
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Method;
+import java.util.*;
+
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonAnyGetter;
+import com.fasterxml.jackson.annotation.JsonValue;
+import com.fasterxml.jackson.annotation.JsonAutoDetect;
+import com.fasterxml.jackson.core.Version;
+import com.fasterxml.jackson.core.json.*;
+import com.fasterxml.jackson.databind.*;
+import com.fasterxml.jackson.databind.deser.DeserializationConfig;
+import com.fasterxml.jackson.databind.ser.SerializationConfig;
+import com.fasterxml.jackson.databind.cfg.HandlerInstantiator;
+import com.fasterxml.jackson.databind.introspect.*;
+import com.fasterxml.jackson.databind.jsontype.TypeResolverBuilder;
+import com.fasterxml.jackson.databind.type.*;
+
+/**
+ * Intermediate representation of {@link com.fasterxml.jackson.annotation.JsonAnySetter},
+ * {@link com.fasterxml.jackson.annotation.JsonValue},
+ * {@link com.fasterxml.jackson.annotation.JsonCreator},
+ * and possibly other future annotation types.
+ * Needed mainly because type information stored in these annotations is needed later on.
+ * Also used for internal tracking of various kinds of metadata.
+ * It should not generally be instantiated outside of this package.
+ *
+ * @since 2.3
+ */
+@Deprecated
+public abstract class AnnotationEntry<A extends Annotation> {
+    protected final A _annotation;
+
+    protected AnnotationEntry(A ann) {
+        _annotation = ann;
+    }
+
+    /**
+     * Method-specific constructor for use when constructing via reflection only;
+     * normally callers should instead create instances through {@link #forValue}.
+     *
+     * @param cls Class that this entry represents an annotation for; also defines any parameters it takes
+     * @param value Value of associated parameter; may be {@code null} if no parameters defined by the annotation
+     */
+    protected AnnotationEntry(Class<A> cls, String value) {
+        try {
+            Constructor<?> ctor = cls.getConstructor((value == null || value.length() == 0) ? Void.TYPE : String.class);
+            _annotation = (A) ctor.newInstance(value);
+        } catch (NoSuchMethodException nse) {
+            throw new IllegalArgumentException("No " + cls + "#value no-arg or 1-arg construtor");
+        } catch (IllegalAccessException | InstantiationException | InvocationTargetException ex) {
+            // Should never happen
+            throw new RuntimeException(ex);
+        }
+    }
+
+    public static final <A extends Annotation> AnnotationEntry<A> forValue(final Class<A> cls, final String value) {
+        return new AnnotationEntry<A>(cls, value) {};
+    }
+
+    public boolean allowEmptyValue() {
+        return false;
+    }
+
+    public Class<?> getValueClass() {
+        return null;
+    }
+
+    public int getPriority() {
+        return -1;
+    }
+
+    public boolean mightBeDecorated() {
+        return false;
+    }
+}
+```
+# Pull Request Submission Guide
+
+Title：Mixin annotations lost when using a mixin class hierarchy with non-mixin interfaces
+
+Description：
+
+Currently, when using a mixin class hierarchy with non-mixin interfaces, the annotations applied to the properties of the mixin classes are lost, causing the corresponding properties to be ignored during serialization. This situation exists due to a problem in the `AnnotatedClass` class, where the

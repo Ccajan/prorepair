@@ -1,0 +1,79 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# Possibly wrong TokenBuffer delegate deserialization using @JsonCreator
+class Value {
+@JsonCreator
+public static Value from(TokenBuffer buffer) {
+...
+}
+Given JSON string is  { "a":1, "b":null }, it is expected that while deserializing using delegate buffer,
+current token will be start object {, and rest of the tokens will be available in buffer:
+[START_OBJECT, FIELD_NAME, VALUE_NUMBER_INT, FIELD_NAME, VALUE_NULL, END_OBJECT]
+
+But, buffers ends up being started with field name and then contains single attribute value
+[FIELD_NAME, VALUE_NUMBER_INT]
+
+It's due to how TokenBuffer#copyCurrentStructure works when we have current token as a FIELD_NAME, rather than START_OBJECT, because it's forced to move to next token BeanDeserializer.java:120
+Hope this helps to nail it down. Is it an intended behavior, or it's regression/bug?
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/util/TokenBuffer.java):
+```java
+public TokenBuffer deserialize(JsonParser jp, DeserializationContext ctxt) throws IOException
+{
+        copyCurrentStructure(jp);
+    /* 28-Oct-2014, tatu: As per #592, need to support a special case of starting from
+     *    FIELD_NAME, which is taken to mean that we are missing START_OBJECT, but need
+     *    to assume one did exist.
+     */
+    return this;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+public TokenBuffer deserialize(JsonParser jp, DeserializationContext ctxt) throws IOException
+{
+    if (_tokenStream == null || _currIndex < 0) { // no stream yet set or already consumed fully
+        _streamConsumed = false;
+        jp.nextToken(); // should be [START_OBJECT]; make sure there's some data
+        if (!_skippedFirstToken && jp.getCurrentToken() != JsonToken.START_OBJECT) {
+            throw new InvalidFormatException("Expected '{' at beginning of object", jp.getCurrentName(), jp.getText());
+        }
+        _skippedFirstToken = false;
+        jp.nextToken(); // move to first field
+    } else if (_currIndex > 0) { // partial structure exists: handle nested calls
+        final int savedIndex = _currIndex;
+        try {
+            _currIndex = 0;
+            copyCurrentStructure(jp);
+            _currIndex = savedIndex; // restore original state so we do not advance forward
+            if (jp.hasMoreTokens()) { // more stuff beyond our structure; must continue normally below
+                _streamConsumed = true;
+                return this;
+            }
+        } finally {
+            assert (_streamConsumed) : "Unmatched endObjectNested";
+            --_nested; // always terminate last segment
+            _tokenStream = null; // remove reference for GC, to free memory on large streams
+            if (_structStack != null) {
+                _structStack.removeLast();
+            }
+        }
+    }
+    ++_nested;
+    writeStartObject();
+    while (jp.getCurrentToken() != JsonToken.END_OBJECT) {
+        writeFieldName(jp.getCurrentName());
+        jp.nextToken();
+        copySingleValueInto(_writer);
+        jp.nextToken(); // move to next entry, after its value
+    }
+    writeEndObject();
+    _streamConsumed = true;
+    _currIndex = -1; // signal end reached
+    return this;
+}
+```
+

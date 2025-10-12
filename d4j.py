@@ -338,6 +338,22 @@ MODEL_CONFIGS = {
         'base_model': 'merged_models/sft_deepseek7b_noprompt/codellama_merged',
         'adapter_path': None
     },
+    'deepseek-6.7b-trained-difficulty': {
+        'base_model': 'merged_models/sft_deepseek7b_sortedbydifficultyfirst',
+        'adapter_path': None
+    },
+    'deepseek-6.7b-trained-diff': {
+        'base_model': 'merged_models/sft_deepseek7b_sortedbydifffirst',
+        'adapter_path': None
+    },
+    'deepseek-6.7b-trained-diffonly': {
+        'base_model': 'merged_models/sft_deepseek7b_sortedbydiff',
+        'adapter_path': None
+    },
+    'deepseek-6.7b-trained-prorepair': {
+        'base_model': 'merged_models/sft_deepseek7b_prorepair',
+        'adapter_path': None
+    },
     'trained_model_codellama-v1': {
         'base_model': '/data1/czj/model/codeLlama-13b-instruct',
         'adapter_path': '/data1/czj/model/trained_model_codellama_13b-v1'
@@ -614,11 +630,22 @@ def process_files():
                                 full = log_file.read()
                             
                             # 重新提取Java代码
-                            res = extract_first_java_code(full)
+                            try:
+                                res = extract_first_java_code(full.split(EOF)[1])
+                            except (IndexError, AttributeError):
+                                res = None
                             
                             if not res:  # 如果提取失败
-                                print(f"从log文件提取代码失败，跳过 {file_name}")
-                                continue
+                                print(f"从log文件提取代码失败，重新生成 {file_name}")
+                                full, res = cal(file_name.split('.')[0], json_data['buggy'], json_data['issue_title'],
+                                                json_data['issue_description'], json_data['loc'])
+                                if full is None:  # 如果 full 为 None，则说明修复失败，跳过此轮
+                                    print(f"修复失败，跳过 {file_name}")
+                                    continue
+                                
+                                # 保存log文件
+                                with open(log_file_path, 'w', encoding='utf-8') as log_file:
+                                    print(full, file=log_file)
                         else:
                             # 如果log文件不存在，才调用模型生成
                             print(f'Log文件不存在，调用模型生成: {log_file_path}')
@@ -713,9 +740,9 @@ def cal_vllm(bug_id, code, title, description, filename):
             
             # 根据模型格式提取生成的 Java 代码部分
             try:
-                ret = extract_first_java_code('```java\n' + full_text.split(EOF)[-1])
+                ret = extract_first_java_code(complete_text.split(EOF)[-1])
             except (IndexError, AttributeError):
-                ret = extract_first_java_code(full_text)
+                ret = None
             
             if ret:
                 print(f'✅ 成功提取 Java 代码 (第 {retry_count} 次尝试)', flush=True)
@@ -734,39 +761,6 @@ def cal_vllm(bug_id, code, title, description, filename):
         print(f"cal_vllm 执行出错: {e}")
         return [None, None]
 
-def cal_vllm_batch(prompts):
-    """vLLM 批处理推理 - 充分利用显存和并发"""
-    from vllm import SamplingParams
-    print(f"vLLM 批处理: {len(prompts)} 个样本")
-    
-    # vLLM 采样参数
-    sampling_params = SamplingParams(
-        temperature=1.0,
-        top_p=0.9,
-        top_k=50,
-        max_tokens=1024,
-        repetition_penalty=1.1,
-        stop=[tokenizer.eos_token] if tokenizer.eos_token else None,
-    )
-    
-    # vLLM 批量生成 - 自动并发处理
-    outputs = model.generate(prompts, sampling_params)
-    
-    results = []
-    for i, output in enumerate(outputs):
-        full_text = output.outputs[0].text
-        complete_text = prompts[i] + full_text
-        
-        # 提取 Java 代码
-        try:
-            ret = extract_first_java_code(full_text.split('[/INST]')[-1])
-        except IndexError:
-            ret = extract_first_java_code(full_text)
-        
-        results.append([complete_text, ret])
-        print(f"vLLM 批处理样本 {i+1} 完成")
-    
-    return results
 
 def cal(bug_id, code, title, description, filename):
     """推理接口 - 使用vLLM"""

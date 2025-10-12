@@ -1,0 +1,112 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# Non-blocking parser reports incorrect locations when fed with non-zero offset
+When feeding a non-blocking parser, the input array offset leaks into the offsets reported by getCurrentLocation() and getTokenLocation().
+For example, feeding with an offset of 7 yields tokens whose reported locations are 7 greater than they should be. Likewise the current location reported by the parser is 7 greater than the correct location.
+It's not possible for a user to work around this issue by subtracting 7 from the reported locations, because the token location may have been established by an earlier feeding with a different offset.
+Jackson version: 2.9.8
+Unit test:
+import com.fasterxml.jackson.core.JsonFactory;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.JsonToken;
+import com.fasterxml.jackson.core.async.ByteArrayFeeder;
+import org.junit.Test;
+
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.junit.Assert.assertEquals;
+
+public class FeedingOffsetTest {
+
+  @Test
+  public void inputOffsetShouldNotAffectLocations() throws Exception {
+    JsonFactory jsonFactory = new JsonFactory();
+    JsonParser parser = jsonFactory.createNonBlockingByteArrayParser();
+    ByteArrayFeeder feeder = (ByteArrayFeeder) parser.getNonBlockingInputFeeder();
+
+    byte[] input = "[[[".getBytes(UTF_8);
+
+    feeder.feedInput(input, 2, 3);
+    assertEquals(JsonToken.START_ARRAY, parser.nextToken());
+    assertEquals(1, parser.getCurrentLocation().getByteOffset()); // ACTUAL = 3
+    assertEquals(1, parser.getTokenLocation().getByteOffset());   // ACTUAL = 3
+
+    feeder.feedInput(input, 0, 1);
+    assertEquals(JsonToken.START_ARRAY, parser.nextToken());
+    assertEquals(2, parser.getCurrentLocation().getByteOffset());
+    assertEquals(2, parser.getTokenLocation().getByteOffset());
+  }
+}
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/core/json/async/NonBlockingJsonParser.java):
+```java
+public void feedInput(byte[] buf, int start, int end) throws IOException
+{
+    // Must not have remaining input
+    if (_inputPtr < _inputEnd) {
+        _reportError("Still have %d undecoded bytes, should not call 'feedInput'", _inputEnd - _inputPtr);
+    }
+    if (end < start) {
+        _reportError("Input end (%d) may not be before start (%d)", end, start);
+    }
+    // and shouldn't have been marked as end-of-input
+    if (_endOfInput) {
+        _reportError("Already closed, can not feed more input");
+    }
+    // Time to update pointers first
+    _currInputProcessed += _origBufferLen;
+
+    // Also need to adjust row start, to work as if it extended into the past wrt new buffer
+    _currInputRowStart = start - (_inputEnd - _currInputRowStart);
+
+    // And then update buffer settings
+    _inputBuffer = buf;
+    _inputPtr = start;
+    _inputEnd = end;
+    _origBufferLen = end - start;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+public void feedInput(byte[] buf, int start, int end) throws IOException {
+    // Must not have remaining input
+    assert !hasMoreDataToRead(): "Still have %d undecoded bytes, should not call 'feedInput'";
+    
+    // Shouldn't have been marked as end-of-input
+    assert !isClosed(): "Already closed, can not feed more input";
+
+    assert end >= start : "Input end (%d) must not be less than start (%d)" ;
+    // And also handle case where both are 0 length..
+    assert start <= end || buf == null: "Invalid start or end (should be [0, len])" ;
+
+    long curProc = _currInputProcessed + _processedFromFeedBuffer;
+
+    if(_rowStart < 0 && _rowStartType == RowStartInfo.TYPE_NONE){
+        /* This doesn't count if it was already set up via previous tokens
+         * but in case of very random calls, it has to still make sense...
+         */
+        initRowStart(curProc+start, RowStartInfo.fromColumn(curProc));
+    }
+    
+    /* Now let's process all data that we can (both buffered as well as directly provided...)*/
+    while(true){
+        int processedCount = _bufferIn.finishRawInput(buf, start, end, false, true);
+       ...
+        break; 
+    }
+
+    /* If we processed something, update statistics etc.. (for real end now, not fake one in loop above */
+    if (count > 0 ) {
+        updateProcessedStats( count );
+    } else if (!wasEOF ){
+        addFakeEOL(); 
+    }
+    checkIfNeedsSwitchBuffers(false);
+}
+```
+# Non-blocking parser reports incorrect locations when fed with non-zero offset
+
+This problem occurs because the parsing position needs to be updated based on the original input content instead of the currently processed part of the input data. The `initRowStart` method updates the starting position of each line of the input according to the input's column number, and since the processing is done differently, the line starting positions need to be adjusted accordingly. To solve this problem, modify the implementation of the `initRowStart` method. Specifically, change `this._lineStart` to `procStart + this._rowStartDelta`. Here, `procStart + this._rowStartDelta` represents the actual starting position of the line rather than its appearance at the beginning of the input.
+

@@ -1,0 +1,130 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# StringCollectionDeserializer fails with custom collection
+Seeing this with Jackson 2.9.8.
+We have a custom collection implementation, which is wired to use its "immutable" version for deserialization. The rationale is that we don't want accidental modifications to the data structures that come from the wire, so they all are forced to be immutable.
+After upgrade from 2.6.3 to 2.9.8, the deserialization started breaking with the message:
+
+Cannot construct instance of XXX (although at least one Creator exists): no default no-arguments constructor found
+
+This happens ONLY when you deserialize a custom collection of strings as a property of the other object. Deserializing the custom collection of strings directly works fine, and so does the deserialization of custom collection of non-strings. I believe either the StringCollectionDeserializer should not be invoked for custom collections, or perhaps it does not handle the delegation as expected.
+Please see comments for repro and workaround.
+Thanks!
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/deser/std/StringCollectionDeserializer.java):
+```java
+public JsonDeserializer<?> createContextual(DeserializationContext ctxt,
+        BeanProperty property) throws JsonMappingException
+{
+    // May need to resolve types for delegate-based creators:
+    JsonDeserializer<Object> delegate = null;
+    if (_valueInstantiator != null) {
+        // [databind#2324]: check both array-delegating and delegating
+        AnnotatedWithParams delegateCreator = _valueInstantiator.getDelegateCreator();
+        if (delegateCreator != null) {
+            JavaType delegateType = _valueInstantiator.getDelegateType(ctxt.getConfig());
+            delegate = findDeserializer(ctxt, delegateType, property);
+        }
+    }
+    JsonDeserializer<?> valueDeser = _valueDeserializer;
+    final JavaType valueType = _containerType.getContentType();
+    if (valueDeser == null) {
+        // [databind#125]: May have a content converter
+        valueDeser = findConvertingContentDeserializer(ctxt, property, valueDeser);
+        if (valueDeser == null) {
+        // And we may also need to get deserializer for String
+            valueDeser = ctxt.findContextualValueDeserializer(valueType, property);
+        }
+    } else { // if directly assigned, probably not yet contextual, so:
+        valueDeser = ctxt.handleSecondaryContextualization(valueDeser, property, valueType);
+    }
+    // 11-Dec-2015, tatu: Should we pass basic `Collection.class`, or more refined? Mostly
+    //   comes down to "List vs Collection" I suppose... for now, pass Collection
+    Boolean unwrapSingle = findFormatFeature(ctxt, property, Collection.class,
+            JsonFormat.Feature.ACCEPT_SINGLE_VALUE_AS_ARRAY);
+    NullValueProvider nuller = findContentNullProvider(ctxt, property, valueDeser);
+    if (isDefaultDeserializer(valueDeser)) {
+        valueDeser = null;
+    }
+    return withResolved(delegate, valueDeser, nuller, unwrapSingle);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+import com.fasterxml.jackson.core.*;
+import java.io.IOException;
+import java.util.*;
+
+import com.fasterxml.jackson.databind.BeanDescription;
+import com.fasterxml.jackson.databind.DeserializationConfig;
+import com.fasterxml.jackson.databind.JavaType;
+import com.fasterxml.jackson.databind.JsonDeserializer;
+import com.fasterxml.jackson.databind.KeyDeserializer;
+import com.fasterxml.jackson.databind.deser.DeserializationProblemHandler;
+import com.fasterxml.jackson.databind.deser.std.StdDeserializer;
+import com.fasterxml.jackson.databind.jsontype.NamedType;
+import com.fasterxml.jackson.databind.module.SimpleModule;
+import com.google.common.collect.ImmutableSet;
+
+@SuppressWarnings("serial")
+public class CustomCollection extends ArrayList<String> implements ImmutableInterface {
+    public CustomCollection() {}
+    
+    @Override
+    public boolean equals(final Object obj) {
+        if (!(obj instanceof CustomCollection)){
+            return false;
+        }
+        final List<String> list = (List<String>) obj;
+        if (list.size() != size()){
+            return false;
+        }
+        int index = 0;
+        for (Iterator<String> iterator = iterator(); iterator.hasNext(); index++){
+            if (!iterator.next().equalsIgnoreCase((CharSequence) list.get(index))){
+                return false;
+            }
+        }
+        return true;
+    }
+
+    @Override
+    public int hashCode(){
+        return java.util.Objects.hash(this);
+    }
+
+    private static class ImmutableCustomCollectionDeserializer extends StdDeserializer<CustomCollection> {
+        protected ImmutableCustomCollectionDeserializer() {
+            super(CustomCollection.class);
+        }
+        
+        @Override
+        public CustomCollection deserialize(JsonParser p, DeserializationContext ctxt) throws IOException, JsonProcessingException {
+            try {
+                JsonNode tree = p.readValueAsTree();
+                ArrayList<String> copy = new ArrayList<>();
+                for (int i = 0 ; i < tree.size() ; i++) {
+                    copy.add(tree.get(i).asText());
+                }
+                
+                return ImmutableSet.copyOf(copy).asImmutable();
+            } finally {
+                if (p != null) {
+                    p.close();
+                }
+            }
+        }      
+    }
+}
+
+public class CustomClassModule extends SimpleModule {
+    public CustomClassModule() {
+        addDeserializer(CustomCollection.class, new ImmutableCustomCollectionDeserializer());
+    }
+}
+```
+I apologize for the confusion in the previous response. This seems like a problem with your JSON parsing where it assumes a list of objects when what you really need is just a flat string list. Here I am creating a new deserializer `ImmutableCustomCollectionDeserializer` that ignores complex structure during parsing. If you still have problems let me know!
+

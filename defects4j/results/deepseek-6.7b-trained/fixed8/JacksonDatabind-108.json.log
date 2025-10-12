@@ -1,0 +1,87 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# Change of behavior (2.8 -> 2.9) with `ObjectMapper.readTree(input)` with no content
+So, it looks like `readTree()` methods in `ObjectMapper`, `ObjectReader` that take input OTHER than `JsonParser`, and are given "empty input" (only white-space available before end), will
+
+* Return `NullNode` (Jackson 2.x up to and including 2.8)
+* Return `null` (Jackson 2.9)
+
+Latter behavior is what `readTree(JsonParser)` has and will do; but this accidentally changed other methods due to refactoring that unified underlying call handling (and add checking for new `DeserializationFeature.FAIL_ON_TRAILING_TOKENS`). 
+Behavior for this edge case was not being tested, apparently.
+
+Now: since behavior has been changed for all 2.9.x patch versions, I am not sure it should be changed for 2.9 branch. But it seems sub-optimal as behavior, and something to definitely change for 3.0... but probably also for 2.10.
+
+There are multiple things we could do.
+
+1. Change it back to 2.8, to return `NullNode`
+2. Change to throw exception, as "not valid" use case
+3. Change it to return `MissingNode`
+4. Leave as-is, for rest of 2.x.
+
+Although it might seem best to revert it to (1), that seems somewhat wrong, problematic, as it would now not be possible to distinguish between JSON `null` value and missing content.
+And although (2) would probably make sense, if designing API from scratch, it is probably too intrusive.
+
+So I think (3) is the best way: it avoids returning `null` or throwing Exception (both being likely to break 2.9 code), but still allows distinguishing between all possible input cases.
+
+
+
+
+
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/ObjectReader.java):
+```java
+@SuppressWarnings("unchecked")
+    @Override
+    public <T extends TreeNode> T readTree(JsonParser p) throws IOException {
+        return (T) _bindAsTree(p);
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+@SuppressWarnings("unchecked")
+    @Override
+    public <T extends TreeNode> T readTree(final JsonParser p) throws IOException {
+        // Let's first understand why `readTree(JsonParser)` was previously working around
+        // this issue: when parsing is in its final phase (i.e., after all tokens have been parsed)
+        // and there are additional ones remaining (which means they were added later in streaming mode
+            if (p.getCurrentLocation().getCharOffset() >= p.getInputSource().getCharacterStream().in.available()) {
+                switch (p.getCurrentToken()) {
+                    case START_ARRAY:
+                        return (T) new ArrayNode[1];
+                    case START_OBJECT:
+                        return (T) new ObjectNode[1];
+                    default :
+                        break;
+                }
+            }
+         else if (DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES == getConfiguration().getDeserializeFeatures())
+            {
+                if ((p.getCurrentToken()==JsonToken.START_OBJECT || p.getCurrentToken() == JsonToken.START_ARRAY)) {
+                   p.nextValue(); // [1]
+                
+                } else if (p.getCurrentToken() == JsonToken.FIELD_NAME){    
+                    throw ctxt.weirdStringException("No property name expected at this point");
+               } else if (p.getCurrentToken() == JsonToken.END_DOCUMENT) {
+                  return null; // [3]
+               }
+         
+               // And those two branches above ensure it does indeed work correctly regardless of configuration setting
+               while (!shouldSkipSerialization(ctxt._currentName())) { // [2]
+                  /* [3]: here, because `_readerMap` returns empty map instead of MissingNode,
+                      * and same for Arrays / single values. This handles such cases. */
+                     p.nextValue();  
+             }
+            // Now let's fix original issues
+           try {
+              return (T)_bindAsTree(p);
+           } catch (EmptyInputException eie) {
+              return (T) MissingNode.getInstance();
+          }
+        }
+}
+```
+This is your fixed code. We inserted some checks and error handling to properly process these exceptional cases, which include: handling special scenarios during token parsing, returning `MissingNode` instances for unknown properties or unexpected ending of data streams, and processing JSON `null` inputs.
+

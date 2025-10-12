@@ -59,7 +59,7 @@ class TrainingConfig:
     attn_implementation: str = "sdpa"
     
     # 训练参数
-    num_epochs: int = 10
+    num_epochs: int = 3
     batch_size: int = 1
     gradient_accumulation_steps: int = 1
     learning_rate: float = 2e-4

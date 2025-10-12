@@ -1,0 +1,119 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# StringIndexOutOfBoundsException in CharSequenceTranslator
+I found that there is bad surrogate pair handling in the CharSequenceTranslator
+This is a simple test case for this problem.
+\uD83D\uDE30 is a surrogate pair.
+
+@Test
+public void testEscapeSurrogatePairs() throws Exception {
+    assertEquals("\uD83D\uDE30", StringEscapeUtils.escapeCsv("\uD83D\uDE30"));
+}
+
+You'll get the exception as shown below.
+
+java.lang.StringIndexOutOfBoundsException: String index out of range: 2
+	at java.lang.String.charAt(String.java:658)
+	at java.lang.Character.codePointAt(Character.java:4668)
+	at org.apache.commons.lang3.text.translate.CharSequenceTranslator.translate(CharSequenceTranslator.java:95)
+	at org.apache.commons.lang3.text.translate.CharSequenceTranslator.translate(CharSequenceTranslator.java:59)
+	at org.apache.commons.lang3.StringEscapeUtils.escapeCsv(StringEscapeUtils.java:556)
+
+Patch attached, the method affected:
+
+public final void translate(CharSequence input, Writer out) throws IOException
+This is an incorrect Java code (src/main/java/org/apache/commons/lang3/text/translate/CharSequenceTranslator.java):
+```java
+public final void translate(CharSequence input, Writer out) throws IOException {
+    if (out == null) {
+        throw new IllegalArgumentException("The Writer must not be null");
+    }
+    if (input == null) {
+        return;
+    }
+    int pos = 0;
+    int len = input.length();
+    while (pos < len) {
+        int consumed = translate(input, pos, out);
+        if (consumed == 0) {
+            char[] c = Character.toChars(Character.codePointAt(input, pos));
+            out.write(c);
+            pos+= c.length;
+            continue;
+        }
+        // contract with translators is that they have to understand codepoints 
+        // and they just took care of a surrogate pair
+        for (int pt = 0; pt < consumed; pt++) {
+            pos += Character.charCount(Character.codePointAt(input, pos));
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+import java.io.IOException;
+import java.io.Writer;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+
+/**
+ * Abstract base class for implementations of Translate, providing default implementations common
+ * to all subclasses.
+ */
+public abstract class CharSequenceTranslator implements Translator<CharSequence> {
+    
+    public final void translate(CharSequence input, Writer out) throws IOException {
+        if (out == null) {
+            throw new IllegalArgumentException("The Writer must not be null");
+        }
+        if (input == null) {
+            return;
+        }
+        
+        boolean highSurrogateFound = false;
+        int lastIndex = -1;
+        for (int i = 0; i < input.length(); ++i) {
+            
+            final char chr = input.charAt(i);
+            
+            // detecting high surrogates pairs and searching subsequent low surrogates
+            if (!highSurrogateFound && Character.isHighSurrogate(chr)) {
+                highSurrogateFound = true;
+                lastIndex = i;
+                
+            // we have a valid high surrogate followed by its low surrogate => skip them
+            } else if (highSurrogateFound && Character.isLowSurrogate(chr)) {
+                highSurrogateFound = false;
+                lastIndex += 1;
+                
+            } else if (Character.requiresSurrogateTranslation(chr)){
+                  byte[] utfBytes = new String(new char[]{chr}).getBytes(StandardCharsets.UTF_16BE);
+                  
+                // ensure surrogate pairs gets translated correctly even when used within Strings that aren't UTF_16.
+                out.write((char) ((utfBytes[0] << 8) + (utfBytes[1] & 0xff)));
+                
+            } else {
+                if (-1 != lastIndex) {
+                    // write out high surrogate from previously detected sequence
+                    out.write(input, lastIndex, i - lastIndex);
+                    lastIndex = -1;
+                }
+                out.write(chr);
+            }
+        }
+  
+        if (-1 != lastIndex) {
+          // write out any remaining high surrogate from sequence
+          out.write(input, lastIndex, input.length() - lastIndex);
+      }
+  }
+}
+```
+Please note the highlighted parts where I made changes.
+Firstly, `Character.isHighSurrogate` and `Character.isLowSurrogate` were added checks to handle High Surrogate Pair sequences. If it encounters a high surrogate first it will set a flag, then if a next character encounters which is considered as Low surrogate according to `Character.isLowSurrogate` then it increments our position pointer after processing it once, thus avoiding unnecessary processing of following characters.
+Secondly, `Character.requiresSurrogateTranslation` check was included. This means whenever such character is encountered it translates it into two separate characters using standard encoding 'UTF_16BE'. It makes sure it doesn't process High and Low Surrogate Pair together hence solving your issue without additional overhead because of multiple passes on same data due to internal mechanics of the original implementation.
+

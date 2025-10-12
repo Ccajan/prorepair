@@ -1,0 +1,160 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# JsonIdentityInfo incorrectly serializing forward references
+I wrote this small test program to demonstrate the issue:
+import com.fasterxml.jackson.annotation.JsonIdentityInfo;
+import com.fasterxml.jackson.annotation.JsonIdentityReference;
+import com.fasterxml.jackson.annotation.ObjectIdGenerators;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+public class ObjectIdTest {
+
+    public static class Foo {
+
+        @JsonIdentityReference(alwaysAsId = true)
+        public Bar bar1;
+
+        @JsonIdentityReference()
+        public Bar bar2;
+    }
+
+    @JsonIdentityInfo(generator = ObjectIdGenerators.IntSequenceGenerator.class)
+    public static class Bar {
+
+    }
+
+    public static void main(String[] args) throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+
+        // create structure to serialize
+        Foo mo = new Foo();
+        mo.bar1 = new Bar();
+        mo.bar2 = mo.bar1;
+
+        // serialize it
+        System.out.println(mapper.writeValueAsString(mo));
+    }
+
+}
+When executing this test program in the latest version (2.7.4), the output will be {"bar1":1,"bar2":{"@id":2}} - the second field will be written with a new id even though both fields reference the same object. Because of this, writing forward references is essentially impossible.
+The issue seems to be the fact that BeanSerializerBase will always call WritableObjectId.generateId if the referenced object has not been written in plain format yet (https://github.com/FasterXML/jackson-databind/blob/master/src/main/java/com/fasterxml/jackson/databind/ser/std/BeanSerializerBase.java#L600). This will also happen if an id has been generated before.
+It might also be smarter to only generate a new id in WritableObjectId.generateId if that hasn't happened before; as that method doesn't have a javadoc I can't tell how it is supposed to work.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/ser/impl/WritableObjectId.java):
+```java
+public Object generateId(Object forPojo) {
+    // 04-Jun-2016, tatu: As per [databind#1255], need to consider possibility of
+    //    id being generated for "alwaysAsId", but not being written as POJO; regardless,
+    //    need to use existing id if there is one:
+        id = generator.generateId(forPojo);
+    return id;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+package com.fasterxml.jackson.databind.ser.impl;
+
+import java.io.IOException;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+/**
+ * Extension of {@link WritableObjectId} used internally
+ * by Jackson Databind processing operations, where we specifically
+ * want to ensure order preservation of items. Used when constructing
+ * array or object values.
+ */
+public class OrderedWritableObjectId extends WritableObjectId
+{
+    private final Map<Object,Integer> _indexes = new LinkedHashMap<>();
+    
+    /**
+     * Method called when a new value needs to be associated with a given pojo
+     * (and subsequently retrieved later). Note that indexing starts from 1, unlike
+     * original implementation which started at 0.
+     */
+    @Override
+    public int addRef(Object pojo) throws IOException
+    {
+        Integer idx = _indexes.get(pojo);
+        if (idx == null) {
+            /* Since start counting from '1', first entry gets index '1': */
+            idx = _indexes.size() + 1;
+            _indexes.put(pojo, idx);
+        }
+        return idx;
+    }
+    
+    @Override
+    public boolean hasValue(Object pojo)
+    {
+        return _indexes.containsKey(pojo);
+    }
+}
+```
+
+Replace the incorrect Java code (src/main/java/com/fasterxml/jackson/databind/ser/impl/WritableObjectId.java) with this fixed Java code. It adds support for ordered references and improves performance.
+### Response:
+```java
+package com.fasterxml.jackson.databind.ser.impl;
+
+import java.io.IOException;
+import java.util.*;
+
+/**
+ * Extension of {@link WritableObjectId} used internally
+ * by Jackson Databind processing operations, where we specifically
+ * want to ensure order preservation of items. Used when constructing
+ * array or object values.
+ */
+public class OrderedWritableObjectId extends WritableObjectId
+{
+    private final List<Object> _items = new ArrayList<>();
+    private final Set<Object> _knownItems = new HashSet<>();
+    
+    /**
+     * Method called when a new value needs to be associated with a given pojo
+     * (and subsequently retrieved later). Index is 1-based like normal indexes.
+     * Note that if item was added previously, its previous index is returned again.
+     */
+    @Override
+    public int addRef(Object pojo) throws IOException
+    {
+        Integer idx = getIndex(pojo);
+        if (idx == null) {
+            idx = _items.size()+1;
+            _items.add(pojo);
+            _knownItems.add(pojo);
+        }
+        return idx;
+    }
+    
+    protected Integer getIndex(Object pojo) {
+        int ix = 0;
+        Iterator<Object> iter = _items.iterator();
+        while (iter.hasNext()) {
+            if (Objects.equals(iter.next(), pojo)) {
+                break;
+            }
+            ix++;
+        }
+        return (ix == _items.size()) ? null : (ix+1);
+    }
+    
+    @Override
+    public boolean hasValue(Object pojo)
+    {
+        return _knownItems.contains(pojo);
+    }
+    
+    @Override
+    public String toString() {
+        return "[Ordered] size: " + _items.size();
+    }
+}
+```
+We replace all uses of `_indexes` with `_items` and modify some methods so they operate correctly on a list instead of a map. Now, when adding a new reference, we preserve the order. If an identical object is encountered again, we return its original index. Otherwise, we add it to the end of our list. The `getIndex()` function allows us to find out what index a particular object had when it was last seen. Finally, the `toString()` function helps debugging.
+
