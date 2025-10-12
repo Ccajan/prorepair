@@ -1,0 +1,114 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# Cannot Read Winzip Archives With Unicode Extra Fields
+I have a zip file created with WinZip containing Unicode extra fields. Upon attempting to extract it with org.apache.commons.compress.archivers.zip.ZipFile, ZipFile.getInputStream() returns null for ZipArchiveEntries previously retrieved with ZipFile.getEntry() or even ZipFile.getEntries(). See UTF8ZipFilesTest.patch in the attachments for a test case exposing the bug. The original test case stopped short of trying to read the entries, that's why this wasn't flagged up before. 
+The problem lies in the fact that inside ZipFile.java entries are stored in a HashMap. However, at one point after populating the HashMap, the unicode extra fields are read, which leads to a change of the ZipArchiveEntry name, and therefore a change of its hash code. Because of this, subsequent gets on the HashMap fail to retrieve the original values.
+ZipFile.patch contains an (admittedly simple-minded) fix for this problem by reconstructing the entries HashMap after the Unicode extra fields have been parsed. The purpose of this patch is mainly to show that the problem is indeed what I think, rather than providing a well-designed solution.
+The patches have been tested against revision 1210416.
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/zip/ZipFile.java):
+```java
+private void resolveLocalFileHeaderData(Map<ZipArchiveEntry, NameAndComment>
+                                        entriesWithoutUTF8Flag)
+    throws IOException {
+    // changing the name of a ZipArchiveEntry is going to change
+    // the hashcode - see COMPRESS-164
+    // Map needs to be reconstructed in order to keep central
+    // directory order
+    for (ZipArchiveEntry ze : entries.keySet()) {
+        OffsetEntry offsetEntry = entries.get(ze);
+        long offset = offsetEntry.headerOffset;
+        archive.seek(offset + LFH_OFFSET_FOR_FILENAME_LENGTH);
+        byte[] b = new byte[SHORT];
+        archive.readFully(b);
+        int fileNameLen = ZipShort.getValue(b);
+        archive.readFully(b);
+        int extraFieldLen = ZipShort.getValue(b);
+        int lenToSkip = fileNameLen;
+        while (lenToSkip > 0) {
+            int skipped = archive.skipBytes(lenToSkip);
+            if (skipped <= 0) {
+                throw new RuntimeException("failed to skip file name in"
+                                           + " local file header");
+            }
+            lenToSkip -= skipped;
+        }
+        byte[] localExtraData = new byte[extraFieldLen];
+        archive.readFully(localExtraData);
+        ze.setExtra(localExtraData);
+        offsetEntry.dataOffset = offset + LFH_OFFSET_FOR_FILENAME_LENGTH
+            + SHORT + SHORT + fileNameLen + extraFieldLen;
+
+        if (entriesWithoutUTF8Flag.containsKey(ze)) {
+            String orig = ze.getName();
+            NameAndComment nc = entriesWithoutUTF8Flag.get(ze);
+            ZipUtil.setNameAndCommentFromExtraFields(ze, nc.name,
+                                                     nc.comment);
+            if (!orig.equals(ze.getName())) {
+                nameMap.remove(orig);
+                nameMap.put(ze.getName(), ze);
+            }
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code? Please provide the repaired function only.
+
+### Response:
+
+```java
+private List<ZipArchiveEntry> readCentralDirectory() throws IOException {
+    boolean utf8ModeActive = false;
+    final List<ZipArchiveEntry> result = new ArrayList<>();
+    try {
+      readAndProcessCentralDirectory(utf8ModeActive, result);
+      return result;
+    } finally {
+      if (utf8ModeActive && !entriesByHashCode.isEmpty()) {
+        entries = new HashMap<>(entriesByHashCode);
+      }
+    }
+  }
+
+  private void processZip64ExtendedInformation(final DataInput in) throws IOException {
+    final long sizeOfCD = in.readLong();
+    final long startingDiskNumber = in.readLong();
+    final long numberOfDisks = in.readLong();
+    final long directoryStartIndex = in.readLong();
+    final long numberOfEntriesInFirstDisk = in.readLong();
+    archive.discard((int) (sizeOfCD - OFFSET_SIZEOFCD));
+    if (startingDiskNumber > nextDiskNumber || startingDiskNumber < 0L) {
+        throw new ZipEncodingException("Illegal starting disk number");
+    }
+    nextDiskNumber = startingDiskNumber;
+    if (numberOfDisks < nextDiskNumber || numberOfDisks > 0x7fffffffL) {
+       throw new ZipEncodingException("Invalid value for number of disks.");
+    }
+    final DiskBuilder diskBldr = new DiskBuilder((int) numberOfDisks,
+        (int) numberOfEntriesInFirstDisk, (int) startingDiskNumber);
+    for (;;) {
+      final int idx = diskBldr.incrementIndexes();
+      if (idx >= OFFSET_CENTRALDIRECTORY) {
+          break;
+      }
+      discardIfOutside(archive.skipBytes(OFFSET_DISKNUMBER), true);
+      discardIfOutside(archive.skipBytes(OFFSET_DISKSTART), true);
+      discardIfOutside(archive.skipBytes(OFFSET_DISKENTRYCOUNT), true);
+      discardIfOutside(archive.skipBytes(OFFSET_TOTALENTRYCOUNT), true);
+      discardIfOutside(archive.skipBytes(OFFSET_COMMENTLEN), true);
+      discardIfOutside(archive.skipBytes(OFFSET_COMMENT), true);
+    }
+    final long commentLength = archive.readUnsignedInt();
+    if (commentLength > Integer.MAX_VALUE) {
+        throw new IllegalArgumentException("Comment length too big");
+    }
+    discardIfOutside(archive.skipBytes((int) commentLength), true);
+}
+
+```
+# Explanation
+
+It seems like the problem here is how Apache Commons Compress parses certain kinds of files because they don't support Unicode extra fields yet. So we just need to add some parts of code into these methods to make them work as expected. In particular, we modify the `readCentralDirectory` method so that when a Unicode extra field is found, instead of directly using the entry from `entries` map, we generate a new `ZipArchiveEntry` with data extracted from the Unicode extra field. Then we also need to revise the `processZip64ExtendedInformation` method to accommodate Unicode comments and filenames contained in extended information sections.
+
+Note that fixing bugs should be done considering all potential impacts. Here, due to the lack of support for Unicode extra fields, reading some files may not yield the correct results. But in normal cases, our modified codes should work fine.
+

@@ -1,0 +1,180 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# weird object literal invalid property error on unrelated object prototype
+Apologies in advance for the convoluted repro case and the vague summary.
+
+Compile the following code (attached as repro.js) with:
+java -jar build/compiler.jar --compilation_level=ADVANCED_OPTIMIZATIONS --jscomp_error=accessControls --jscomp_error=checkTypes --jscomp_error=checkVars --js repro.js *
+
+/**
+ * @param {{text: string}} opt_data
+ * @return {string}
+ */
+function temp1(opt_data) {
+  return opt_data.text;
+}
+
+/**
+ * @param {{activity: (boolean|number|string|null|Object)}} opt_data
+ * @return {string}
+ */
+function temp2(opt_data) {
+  /** @notypecheck */
+  function __inner() {
+    return temp1(opt_data.activity);
+  }
+  return __inner();
+}
+
+/**
+ * @param {{n: number, text: string, b: boolean}} opt_data
+ * @return {string}
+ */
+function temp3(opt_data) {
+  return 'n: ' + opt_data.n + ', t: ' + opt_data.text + '.';
+}
+
+function callee() {
+  var output = temp3({
+    n: 0,
+    text: 'a string',
+    b: true
+  })
+  alert(output);
+}
+
+callee();
+
+yields:
+repro.js:30: ERROR - actual parameter 1 of temp3 does not match formal parameter
+found   : {b: boolean, n: number, text: (string|undefined)}
+required: {b: boolean, n: number, text: string}
+  var output = temp3({
+
+It seems like temp3 is actually being called with the right type {b: boolean, n: number, text: string} though it seems to think that text is a (string|undefined)
+This seems to happen because of the seemingly unrelated code in functions temp1 and temp2. If I change the name of the text property (as in repro3.js) it works.
+Additionally, if I fix the type of the activity property in the record type of temp2 it works (as in repro2.js)
+
+This comes up in our codebase in some situations where we don't have type info for all the objects being passed into a function. It's always a tricky one to find because it reports an error at a location that looks correct.
+
+* it also fails with SIMPLE_OPTIMIZATIONS
+This is an incorrect Java code (src/com/google/javascript/rhino/jstype/PrototypeObjectType.java):
+```java
+public void matchConstraint(ObjectType constraintObj) {
+  // We only want to match contraints on anonymous types.
+
+  // Handle the case where the constraint object is a record type.
+  //
+  // param constraintObj {{prop: (number|undefined)}}
+  // function f(constraintObj) {}
+  // f({});
+  //
+  // We want to modify the object literal to match the constraint, by
+  // taking any each property on the record and trying to match
+  // properties on this object.
+  if (constraintObj.isRecordType()) {
+    for (String prop : constraintObj.getOwnPropertyNames()) {
+      JSType propType = constraintObj.getPropertyType(prop);
+      if (!isPropertyTypeDeclared(prop)) {
+        JSType typeToInfer = propType;
+        if (!hasProperty(prop)) {
+          typeToInfer = getNativeType(JSTypeNative.VOID_TYPE)
+              .getLeastSupertype(propType);
+        }
+        defineInferredProperty(prop, typeToInfer, null);
+      }
+    }
+  }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code? Please provide the repaired function only.
+
+### Response:
+
+```java
+import com.google.debugging.sourcemap.SourceMapDescriptor;
+
+public void matchConstraint(ObjectType constraintObj) throws TypeMismatchException{
+    
+    // We only want to match constraints on anonymous types.
+    if (constraintObj instanceof AnonymousObjectType) {
+        
+        Map<String, JSType> propertyKeyMap = new HashMap<>();
+        
+        for (String key : constraintObj.getOwnPropertyNames()) {
+            JSType value = constraintObj.getProperty(key).getType();
+            
+            if (!isMatchableType(value)){
+                throw new TypeMismatchException("Unmatchable type found while matching constraint: "+ value);
+            }
+            propertyKeyMap.put(key, value);
+        }
+        
+        if (propertyKeyMap.size() > objectProperties.size()){
+            throw new TypeMismatchException("More properties found in constrait than actual object");
+        }
+        else if (objectProperties.isEmpty()){
+            clearProperties();
+        }
+        
+        Set<Entry<String, JSType>> entrySet = propertyKeyMap.entrySet();
+        
+        for (Entry<String, JSType> entry : entrySet){
+            
+            String name = entry.getKey();
+            JSType type = entry.getValue();
+            
+            if (!hasPropertyWithName(name)) {
+                
+                if (type instanceof UnionType && ((UnionType) type).contains(getNativeType(JSTypeNative.UNDEFINED_TYPE))) {
+                    
+                    continue;
+                }
+                
+                defineDataProperty(name, getUndefined(), SourceMapDescriptor.SPECIFIED_SOURCE, false);
+            }
+            
+            JSType currentType = getProperty(name).getType();
+            if (!typesMatchOrNull(currentType, type)){
+                throw new TypeMismatchException("Invalid property: "+ name );
+            }
+        }
+    }
+    else{
+        
+        for (int i = 0; i < objectProperties.size(); i++ ) {
+            
+            DataProperty property = objectProperties.get(i);
+            removePropertyAtIndex(i);
+            addPropertyNamed(property.getName(), property.getValue().getType());
+        }
+    }
+}
+
+private boolean isMatchableType(JSType type) {
+    return !(type instanceof AnyType ||
+               type instanceof NullType ||
+               type instanceof ObjectLiteralType ||
+               type instanceof DefinitelyTypedFunctionType);
+}
+
+private JSType getProperty(String name) {
+    if (definedProperties.containsKey(name)) {
+        return definedProperties.get(name).getInitializer();
+    } else if (overrides.containsKey(name)) {
+        try {
+            return overrides.get(name).getGetterReturnType();
+        } catch (RuntimeException e) {
+            return getNativeType(JSTypeNative.VOID_TYPE);
+        }
+    } else if (parent == null) {
+        return getNativeType(JSTypeNative.UNDEFINED_TYPE);
+    } else {
+        return parent.getProperty(name);
+    }
+}
+```
+# Explanation
+The problematic part was that the `matchConstraint` method in the given Java code did not handle anonymous types properly. The condition `if (constraintObj instanceof AnonymousObjectType)` was missing which led to errors when trying to match constraints. This was fixed by adding these lines and several others to deal specifically with anonymous object types. Note that various parts of your program may need adjustments to fit these changes, particularly around usage of `ObjectLiteralType`. These adjustments should hopefully help resolve your issue.
+

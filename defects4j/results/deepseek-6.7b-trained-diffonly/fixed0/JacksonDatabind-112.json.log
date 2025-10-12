@@ -1,0 +1,108 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# StringCollectionDeserializer fails with custom collection
+Seeing this with Jackson 2.9.8.
+We have a custom collection implementation, which is wired to use its "immutable" version for deserialization. The rationale is that we don't want accidental modifications to the data structures that come from the wire, so they all are forced to be immutable.
+After upgrade from 2.6.3 to 2.9.8, the deserialization started breaking with the message:
+
+Cannot construct instance of XXX (although at least one Creator exists): no default no-arguments constructor found
+
+This happens ONLY when you deserialize a custom collection of strings as a property of the other object. Deserializing the custom collection of strings directly works fine, and so does the deserialization of custom collection of non-strings. I believe either the StringCollectionDeserializer should not be invoked for custom collections, or perhaps it does not handle the delegation as expected.
+Please see comments for repro and workaround.
+Thanks!
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/deser/std/StringCollectionDeserializer.java):
+```java
+public JsonDeserializer<?> createContextual(DeserializationContext ctxt,
+        BeanProperty property) throws JsonMappingException
+{
+    // May need to resolve types for delegate-based creators:
+    JsonDeserializer<Object> delegate = null;
+    if (_valueInstantiator != null) {
+        // [databind#2324]: check both array-delegating and delegating
+        AnnotatedWithParams delegateCreator = _valueInstantiator.getDelegateCreator();
+        if (delegateCreator != null) {
+            JavaType delegateType = _valueInstantiator.getDelegateType(ctxt.getConfig());
+            delegate = findDeserializer(ctxt, delegateType, property);
+        }
+    }
+    JsonDeserializer<?> valueDeser = _valueDeserializer;
+    final JavaType valueType = _containerType.getContentType();
+    if (valueDeser == null) {
+        // [databind#125]: May have a content converter
+        valueDeser = findConvertingContentDeserializer(ctxt, property, valueDeser);
+        if (valueDeser == null) {
+        // And we may also need to get deserializer for String
+            valueDeser = ctxt.findContextualValueDeserializer(valueType, property);
+        }
+    } else { // if directly assigned, probably not yet contextual, so:
+        valueDeser = ctxt.handleSecondaryContextualization(valueDeser, property, valueType);
+    }
+    // 11-Dec-2015, tatu: Should we pass basic `Collection.class`, or more refined? Mostly
+    //   comes down to "List vs Collection" I suppose... for now, pass Collection
+    Boolean unwrapSingle = findFormatFeature(ctxt, property, Collection.class,
+            JsonFormat.Feature.ACCEPT_SINGLE_VALUE_AS_ARRAY);
+    NullValueProvider nuller = findContentNullProvider(ctxt, property, valueDeser);
+    if (isDefaultDeserializer(valueDeser)) {
+        valueDeser = null;
+    }
+    return withResolved(delegate, valueDeser, nuller, unwrapSingle);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code? Please provide the repaired function only.
+
+### Response:
+
+```java
+public class StringCustomCollection implements List<String> {
+    
+    private ImmutableList<String> list;
+    
+    public static class CustomSerializer extends StdSerializer<ImmutableList<String>> {
+        
+        protected CustomSerializer() {
+            super(ImmutableList.class);
+        }
+        
+        @Override
+        public void serialize(
+                ImmutableList<String> value, JsonGenerator gen, SerializerProvider provider) 
+                throws IOException, JsonProcessingException {
+            
+            if (!value.isEmpty()) {
+                gen.writeStartArray();
+                
+                for (String string : value) {
+                    gen.writeString(string);
+                }
+                
+                gen.writeEndArray();
+            }
+        }
+    }
+    
+    @JsonDeserialize(using = StringCollectionDeserializer.class)
+    public void setData(@JsonProperty("data") List<String> data) {
+        this.list = ImmutableList.copyOf(data);
+    }
+}
+```
+I hope this helps! You can register this custom serializer during mapping configuration like below.
+
+```java
+ObjectMapper mapper = new ObjectMapper();
+mapper.registerModule(new JavaTimeModule());
+mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+mapper.setDateFormat(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss"));
+mapper.addMixIn(ImmutableList.class, StringCustomCollection.CustomSerializer.class);
+```
+Remember to import necessary classes.
+# java.util.ArrayList instead of your custom collection.
+The error occurs because you define a custom collection but do not provide a no-argument constructor. Without a no-arg constructor, Jackson cannot instantiate your custom collection without knowing how to initialize its elements (which your custom collection doesn't currently provide). So this is why `Cannot construct instance of XXX (although at least one Creator exists): no default no-arguments constructor found`. In order to fix this problem, simply add a no-argument constructor in your custom collection. Here, I chose ArrayList because it meets your requirements.
+# Use custom collection as List
+As per the question, the custom collection is used as List. Therefore, there might be instances where Jackson tries to put values into the custom collection instead of creating a new one. To prevent such scenarios, make sure to override several methods from the List interface. Currently, my above solution seems suitable for most cases. If further help is needed, please let me know.
+# Change from custom collection to normal List
+It's possible that after upgrading Jackson, the original custom collection has been replaced by a built-in one. But since Jackson still uses the original class name when performing operations on custom collections, some problems related to custom collection handling may appear again. Therefore, it is suggested to first ensure that the original custom collection is working properly before switching to built-in ones.
+# Use Jackson built-in @JsonIgnoreProperties
+A better way to ignore specific fields during deserialization is using `@JsonIgnoreProperties(ignoreUnknown = true)` annotation on the target class. This method provides more flexibility and ensures backward compatibility. However, this method does not apply to nested properties, i.e., properties within objects. Nested properties must be individually ignored through `@JsonIgnore` annotation. Ignoring unknown properties on a class level can significantly reduce boilerplate code and improve readability. It is generally recommended to use this method unless there are good reasons not to use it.
+

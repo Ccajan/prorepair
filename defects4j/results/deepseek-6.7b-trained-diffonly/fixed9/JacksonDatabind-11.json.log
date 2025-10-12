@@ -1,0 +1,124 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# Problem resolving locally declared generic type
+(reported by Hal H)
+Case like:
+class Something {
+    public <T extends Ruleform> T getEntity()
+    public <T extends Ruleform> void setEntity(T entity) 
+}
+appears to fail on deserialization.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/type/TypeFactory.java):
+```java
+protected JavaType _fromVariable(TypeVariable<?> type, TypeBindings context)
+{
+    final String name = type.getName();
+    // 19-Mar-2015: Without context, all we can check are bounds.
+    if (context == null) {
+        // And to prevent infinite loops, now need this:
+        return _unknownType();
+    } else {
+        // Ok: here's where context might come in handy!
+        /* 19-Mar-2015, tatu: As per [databind#609], may need to allow
+         *   unresolved type variables to handle some cases where bounds
+         *   are enough. Let's hope it does not hide real fail cases.
+         */
+        JavaType actualType = context.findType(name);
+        if (actualType != null) {
+            return actualType;
+        }
+    }
+
+    /* 29-Jan-2010, tatu: We used to throw exception here, if type was
+     *   bound: but the problem is that this can occur for generic "base"
+     *   method, overridden by sub-class. If so, we will want to ignore
+     *   current type (for method) since it will be masked.
+     */
+    Type[] bounds = type.getBounds();
+
+    // With type variables we must use bound information.
+    // Theoretically this gets tricky, as there may be multiple
+    // bounds ("... extends A & B"); and optimally we might
+    // want to choose the best match. Also, bounds are optional;
+    // but here we are lucky in that implicit "Object" is
+    // added as bounds if so.
+    // Either way let's just use the first bound, for now, and
+    // worry about better match later on if there is need.
+
+    /* 29-Jan-2010, tatu: One more problem are recursive types
+     *   (T extends Comparable<T>). Need to add "placeholder"
+     *   for resolution to catch those.
+     */
+    context._addPlaceholder(name);
+    return _constructType(bounds[0], context);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code? Please provide the repaired function only.
+
+### Response:
+
+```java
+private class PlaceHolderType extends SimpleType
+{
+    private static final long serialVersionUID = 1L;
+    protected PlaceHolderType(int id, Class<?> rawClass) { super(id, rawClass); };
+    @Override
+    public boolean isContainerType() { return true; }
+    @Override
+    public CollectionType withContentType(Type contentType)
+    {
+        return new ArrayType(getId(), contentType, rawClass());
+    }
+};
+
+@SuppressWarnings("unchecked")
+public JavaType resolveFully(JavaType t) throws JsonMappingException
+{
+    while (t instanceof ParameterizedType) {
+        ParameterizedType pt = (ParameterizedType) t;
+        if (!pt.isWrapperType()) {
+            break;
+        }
+        t = ((SimpleType)t).contentType();
+    }
+
+    /* Special treatment of place holders when found in generic argument:
+     *  if a placeholder points to itself, treat it as such: it must be circular reference.
+     */
+    if (_circularRefCounter != 0 && t instanceof TypeFactory.PlaceHolderType) {
+        return t;
+    }
+    ++_circularRefCounter;
+
+    TypeBindings bindings = t.getBindings();
+    assert bindings != null;
+    int size = bindings.size();
+    if (bindings.isEmpty()) {
+        --_circularRefCounter;
+        return t;
+    }
+    ArrayList<Binding<?>> list = new ArrayList<>(size);
+    for (Entry<String, JavaType> entry : bindings.entrySet()) {
+        String name = entry.getKey();
+        JavaType binding = entry.getValue();
+        assert name != null;
+        if (binding instanceof TypeFactory.PlaceHolderType) {
+            String refName = ((TypeFactory.PlaceHolderType) binding).getBoundName();
+            assert refName != null;
+            assert name.equals(refName);
+            // Now we have to resolve this placeholder. This could result into self-reference case above
+            binding = resolveFully(_recursionGuard ? UNRESOLVED : binding);
+            assert binding != UNRESOLVED;
+        }
+        list.add(new Binding<>(name, binding));
+    }
+    bindings = new TypeBindings(list, t.getTypeParameters());
+    t = new TypeFactory.GenericType(t.getRawClass(), (Type[]) t.getActualTypeArguments(), bindings, (JavaType[]) t.getTypeParameters());
+    --_circularRefCounter;
+    return t;
+}
+```
+# Explanation
+The original Java code had a problem with local-declared generic types during deserialization. It couldn't find the corresponding type parameter during deserialization. To fix this issue, I modified the Java code by introducing a `resolveFully` method. In the `resolveFully` method, a `while` loop is used to eliminate wrapper types and continue until reaching a non-wrapper type. After that, it checks if the encountered type is a placeholder. If yes, it uses `UNRESOLVED` instead of the placeholder to avoid infinite recursion. Finally, a `GenericType` object is created using the information obtained from the placeholder.
+

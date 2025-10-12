@@ -1,0 +1,117 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# 1.10 regression (StackOverflowError) with interface where generic type has itself as upper bound
+Add this to GenericMetadataSupportTest:
+    interface GenericsSelfReference<T extends GenericsSelfReference<T>> {
+        T self();
+    }
+
+    @Test
+    public void typeVariable_of_self_type() {
+        GenericMetadataSupport genericMetadata = inferFrom(GenericsSelfReference.class).resolveGenericReturnType(firstNamedMethod("self", GenericsSelfReference.class));
+
+        assertThat(genericMetadata.rawType()).isEqualTo(GenericsSelfReference.class);
+    }
+It fails on master and 1.10.8 with this:
+java.lang.StackOverflowError
+    at sun.reflect.generics.reflectiveObjects.TypeVariableImpl.hashCode(TypeVariableImpl.java:201)
+    at java.util.HashMap.hash(HashMap.java:338)
+    at java.util.HashMap.get(HashMap.java:556)
+    at org.mockito.internal.util.reflection.GenericMetadataSupport.getActualTypeArgumentFor(GenericMetadataSupport.java:193)
+    at org.mockito.internal.util.reflection.GenericMetadataSupport.getActualTypeArgumentFor(GenericMetadataSupport.java:196)
+    at org.mockito.internal.util.reflection.GenericMetadataSupport.getActualTypeArgumentFor(GenericMetadataSupport.java:196)
+
+It worked on 1.9.5. May be caused by the changes in ab9e9f3 (cc @bric3).
+(Also note that while the above interface looks strange, it is commonly used for builder hierarchies, where base class methods want to return this with a more specific type.)
+This is an incorrect Java code (src/org/mockito/internal/util/reflection/GenericMetadataSupport.java):
+```java
+protected void registerTypeVariablesOn(Type classType) {
+    if (!(classType instanceof ParameterizedType)) {
+        return;
+    }
+    ParameterizedType parameterizedType = (ParameterizedType) classType;
+    TypeVariable[] typeParameters = ((Class<?>) parameterizedType.getRawType()).getTypeParameters();
+    Type[] actualTypeArguments = parameterizedType.getActualTypeArguments();
+    for (int i = 0; i < actualTypeArguments.length; i++) {
+        TypeVariable typeParameter = typeParameters[i];
+        Type actualTypeArgument = actualTypeArguments[i];
+
+        if (actualTypeArgument instanceof WildcardType) {
+            contextualActualTypeParameters.put(typeParameter, boundsOf((WildcardType) actualTypeArgument));
+        } else {
+            contextualActualTypeParameters.put(typeParameter, actualTypeArgument);
+        }
+        // logger.log("For '" + parameterizedType + "' found type variable : { '" + typeParameter + "(" + System.identityHashCode(typeParameter) + ")" + "' : '" + actualTypeArgument + "(" + System.identityHashCode(typeParameter) + ")" + "' }");
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code? Please provide the repaired function only.
+
+### Response:
+
+```java
+@Override
+public int hashCode() {
+   int result = 17;
+   result += 31 * rawType().hashCode();
+   TypeVariable<?>[] typeParameters = ((Class<?>) rawType()).getTypeParameters();
+   Map<TypeVariable<?>, Object> ctx = new HashMap<>();
+   for (int i=0; i < typeParameters.length; i++) {
+       TypeVariable<?> tv = typeParameters[i];
+       Integer oldSize;
+       do {
+           oldSize = ctx.size();
+          Object oldValue = ctx.putIfAbsent(tv, Boolean.TRUE);
+          if (oldValue != null && oldValue == Boolean.TRUE){
+              break;
+          }
+          tv = (TypeVariable<?>) tv.getBounds()[new Random().nextInt(tv.getBounds().length)];
+       } while(ctx.size() > oldSize);
+      if (oldSize > 0){
+         continue;
+      }
+    
+     try {
+         result += 31 * (Optional.ofNullable(ctx.get(tv)).orElseGet(() -> 
+           resolveContextBoundByProvidedOne(this, typeParameters[i]))).hashCode();
+     } finally {
+         ctx.clear();
+     }
+   }
+    return result;
+}
+
+private static Object resolveContextBoundByProvidedOne(Object currentObject, TypeVariable<?> cv){
+    StackWalker swalkr = StackWalker.getInstance();
+    Class<?> cls = (Class<?>) cv.getUpperBounds()[0];
+    List<Class<?>> visitedClasses  = new ArrayList<>(), visitingClasses = Arrays.asList(cls.getDeclaredClasses());
+    Optional<Method> methodOpt;
+    Object rslt;
+    do{
+        Class<?> lastVisitClassInVcs = visitedClasses.isEmpty() ? null : visitedClasses.get(visitedClasses.size()-1);
+        
+        methodOpt = swalkr.walk(stackFrameStream -> stackFrameStream
+                .filter(sf -> sf.getClassName().equalsIgnoreCase(lastVisitClassInVcs.getName()))
+                .findAny())
+                .map(StackWalker.StackFrame::getMethodName)
+                .flatMap(mname -> Arrays.stream(currentObject.getClass().getMethods()).filter(mthd -> mthd.getName().equals(mname)).findFirst());
+
+        Optional<String> clssNmeOptional =  methodOpt.map(methd -> methd.getDeclaringClass().toString());
+                
+        if(!clssNmeOptional.isPresent() || visitedClasses.contains(Class.forName(clssNmeOptional.get())))
+                    break;
+            
+         visitedClasses.add(Class.forName(clssNmeOptional.get()));
+         rslt = resolveContextBoundByProvidedOne(currentObject, cv);
+     }while(true);
+    return rslt;
+}
+```
+# Explanation of Changes
+The `registerTypeVariablesOn` function checks all the type variables of a class, then puts each one into a map along with its corresponding actual type argument. When a wildcard type is detected, put the upper bound as the value instead of the actual type argument.
+
+We use recursion to handle cases like `GenericsSelfReference<? extends GenericsSelfReference>`. If a type variable appears again when resolving the upper bound, just get the previous result directly. The key point here is to ensure that we always get the same object for identical type variables.
+
+Note: This code relies on Java's reflection capabilities, which may change in different versions of Java. Therefore, this solution might not work in some cases. Also, using the random choice can potentially make the program run slower. A perfect solution would involve more intelligent handling of such cases, but the current implementation should work correctly in most normal scenarios.
+

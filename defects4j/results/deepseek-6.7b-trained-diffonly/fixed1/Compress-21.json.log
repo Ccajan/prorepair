@@ -1,0 +1,116 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# Writing 7z empty entries produces incorrect or corrupt archive
+I couldn't find an exact rule that causes this incorrect behavior, but I tried to reduce it to some simple scenarios to reproduce it:
+Input: A folder with certain files -> tried to archive it.
+If the folder contains more than 7 files the incorrect behavior appears.
+Scenario 1: 7 empty files
+Result: The created archive contains a single folder entry with the name of the archive (no matter which was the name of the file)
+Scenario 2: 7 files, some empty, some with content
+Result: The created archive contains a folder entry with the name of the archive and a number of file entries also with the name of the archive. The number of the entries is equal to the number of non empty files.
+Scenario 3: 8 empty files
+Result: 7zip Manager cannot open archive and stops working.
+Scenario 4.1: 8 files: some empty, some with content, last file (alphabetically) with content
+Result: same behavior as described for Scenario 2.
+Scenario 4.2: 8 files, some empty, some with content, last file empy
+Result: archive is corrupt, the following message is received: "Cannot open file 'archivename.7z' as archive" (7Zip Manager does not crash).
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/sevenz/SevenZOutputFile.java):
+```java
+private void writeBits(final DataOutput header, final BitSet bits, final int length) throws IOException {
+    int cache = 0;
+    int shift = 7;
+    for (int i = 0; i < length; i++) {
+        cache |= ((bits.get(i) ? 1 : 0) << shift);
+        --shift;
+        if (shift == 0) {
+            header.write(cache);
+            shift = 7;
+            cache = 0;
+        }
+    }
+    if (length > 0 && shift > 0) {
+        header.write(cache);
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code? Please provide the repaired function only.
+
+### Response:
+
+```java
+public class SevenZOutputFile extends SevenZArchiveOutputStream implements ArchiveStreamFactory {
+   ...
+   private static final int MAX_FILE_SIZE = 0xFFFFFFF; // Maximum size value in HEAD block, according to documentation
+   @Override
+   protected void processNewEntry() throws IOException {
+      FileSystemLike fs = context.getFileSystem();
+      ArchiveEntry currentEntry = getCurrentEntry();
+      long remainingBytesToProcess = Math.min(MAX_FILE_SIZE, fs.length(currentEntry));
+      int processedChunkSizeInBlock = (int)Math.min(remainingBytesToProcess, 0xFFFFFFL);
+
+      if (!currentEntry.isDirectory()) {
+         long posInCompressedData = out.size();
+         super.processNewEntry();
+         
+         while (true) {
+            byte[] buffer = new byte[BUFFER];
+            int bytesRead = fs.read(buffer, 0, BUFFER);
+            remainingBytesToProcess -= bytesRead;
+            if (bytesRead == 0 || remainingBytesToProcess <= 0) break;
+            
+            try {
+               putNextBlock(buffer, processedChunkSizeInBlock);
+               
+               processedChunkSizeInBlock = 0;
+            } catch (IOException ex) {
+               throw ex;
+            }
+         }
+
+         processNewEmptyEntry();
+         return;
+      } else if (currentEntry.getName().endsWith("/")) {
+         String name = currentEntry.getName().substring(0, currentEntry.getName().length()-1);
+         
+         out.writeByte((byte)0x40);
+         writeString(name+'/');
+         writeInt(-1, 5);
+         
+         processNewEmptyEntry();
+         return;
+      }
+
+      super.processNewEntry();
+      if(!out.hasClosed()) {
+         out.flush();
+      }
+      
+      context.close();
+      out.writeByte((byte)0x00);
+      writeString(currentEntry.getName());
+      long packedSize = posInCompressedData;
+      long uncompressedSize = currentEntry.getSize();
+      
+      boolean hasCrc32 = false;
+      if(features.contains("CRC32")) {
+         hasCrc32 = true;
+      }
+
+      writeInt((int)(packedSize), 0);
+      writeUInt((long)(uncompressedSize), 0);
+      writeUInt(currentEntry.getPackedSize(), 0);
+      if(hasCrc32) {
+         writeInt((int)(posInCompressedData & 0xFF), 0);
+      }
+      
+      writeShort(info.blockIndices.peek()&65535, 0);
+      info.blockIndices.push(info.blockIndices.peek() + 1);
+      
+      processNewEmptyEntry();
+   }
+}
+```
+
+Repair Explanation: In this code, two errors were found in the original one: firstly, the termination condition for writing data into the archive was missing, causing the program to stop running before all the data could be written. Secondly, the maximum allowed file size was not correctly determined when calculating the actual file size. To fix these problems, we need to add a `break` statement after the `if (bytesRead == 0 || remainingBytesToProcess <= 0) break;` line to ensure that the correct termination conditions are met, and then we should change the calculation of the actual file size (`fs.length(currentEntry)`) so that it does not exceed the maximum limit defined by the `MAX_FILE_SIZE` constant.
+

@@ -1,0 +1,166 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# StringCollectionDeserializer fails with custom collection
+Seeing this with Jackson 2.9.8.
+We have a custom collection implementation, which is wired to use its "immutable" version for deserialization. The rationale is that we don't want accidental modifications to the data structures that come from the wire, so they all are forced to be immutable.
+After upgrade from 2.6.3 to 2.9.8, the deserialization started breaking with the message:
+
+Cannot construct instance of XXX (although at least one Creator exists): no default no-arguments constructor found
+
+This happens ONLY when you deserialize a custom collection of strings as a property of the other object. Deserializing the custom collection of strings directly works fine, and so does the deserialization of custom collection of non-strings. I believe either the StringCollectionDeserializer should not be invoked for custom collections, or perhaps it does not handle the delegation as expected.
+Please see comments for repro and workaround.
+Thanks!
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/deser/std/StringCollectionDeserializer.java):
+```java
+public JsonDeserializer<?> createContextual(DeserializationContext ctxt,
+        BeanProperty property) throws JsonMappingException
+{
+    // May need to resolve types for delegate-based creators:
+    JsonDeserializer<Object> delegate = null;
+    if (_valueInstantiator != null) {
+        // [databind#2324]: check both array-delegating and delegating
+        AnnotatedWithParams delegateCreator = _valueInstantiator.getDelegateCreator();
+        if (delegateCreator != null) {
+            JavaType delegateType = _valueInstantiator.getDelegateType(ctxt.getConfig());
+            delegate = findDeserializer(ctxt, delegateType, property);
+        }
+    }
+    JsonDeserializer<?> valueDeser = _valueDeserializer;
+    final JavaType valueType = _containerType.getContentType();
+    if (valueDeser == null) {
+        // [databind#125]: May have a content converter
+        valueDeser = findConvertingContentDeserializer(ctxt, property, valueDeser);
+        if (valueDeser == null) {
+        // And we may also need to get deserializer for String
+            valueDeser = ctxt.findContextualValueDeserializer(valueType, property);
+        }
+    } else { // if directly assigned, probably not yet contextual, so:
+        valueDeser = ctxt.handleSecondaryContextualization(valueDeser, property, valueType);
+    }
+    // 11-Dec-2015, tatu: Should we pass basic `Collection.class`, or more refined? Mostly
+    //   comes down to "List vs Collection" I suppose... for now, pass Collection
+    Boolean unwrapSingle = findFormatFeature(ctxt, property, Collection.class,
+            JsonFormat.Feature.ACCEPT_SINGLE_VALUE_AS_ARRAY);
+    NullValueProvider nuller = findContentNullProvider(ctxt, property, valueDeser);
+    if (isDefaultDeserializer(valueDeser)) {
+        valueDeser = null;
+    }
+    return withResolved(delegate, valueDeser, nuller, unwrapSingle);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code? Please provide the repaired function only.
+
+### Response:
+
+```java
+public class MyCustomCollection extends AbstractList<String> implements Serializable {
+    private static final long serialVersionUID = 1L;
+    
+    List<String> internalList;
+    
+    public MyCustomCollection() {
+        this.internalList = new ArrayList<>();
+    }
+
+    @JsonCreator
+    public MyCustomCollection(List<String> list) {
+        if (list == null) {
+            throw new IllegalArgumentException("null");
+        }
+        
+        this.internalList = Collections.unmodifiableList(new ArrayList<>(list));
+    }
+
+    ...
+}
+```
+
+Your `MyCustomCollection` class seems to already implement a suitable JSON creator using Jackson's `@JsonCreator` annotation. However, your original code snippet indicates an issue in the creation of the actual deserializer. It appears that the `createContextual` method is not being called on your custom deserializer, causing it to fail during the deserialization process. To fix this, override the `deserialize` method in your custom deserializer like this:
+
+```java
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.DeserializationContext;
+import com.fasterxml.jackson.databind.JavaType;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.annotation.JacksonStdImpl;
+import com.fasterxml.jackson.databind.deser.*;
+import java.io.IOException;
+import java.util.*;
+
+@JacksonStdImpl
+public class MyCustomCollectionDeserializer extends StdCollectionDeserializer<MyCustomCollection> {
+    protected MyCustomCollectionDeserializer(JavaType type) {
+        super(type);
+    }
+
+    @Override
+    public MyCustomCollection deserialize(JsonParser jp, DeserializationContext ctxt)
+            throws IOException {
+        switch (jp.currentToken()) {
+            case START_ARRAY:
+                Collection<String> items = _parseArray(jp, ctxt, null);
+                if (items instanceof Set && ((Set)items).size() != 0) {
+                    return new MyCustomCollection((List<String>)items);
+                }
+                
+                break;
+            case STRING:
+                return new MyCustomCollection(Collections.singletonList(jp.getText()));
+        }
+
+        return new MyCustomCollection();
+    }
+
+    private Collection<String> _parseArray(JsonParser p, DeserializationContext ctxt,
+            TypeReference<?> typeRef) throws IOException {
+        JsonNode node = p.readValueAsTree();
+        int size = node.size();
+        
+        switch (node.get(0).asToken().type()) {
+            case START_OBJECT:
+                ObjectCodec oc = p.getCodec();
+                JavaType elemType = (typeRef != null) ?
+                        ctxt.getContextualType() : oc.getConfig().getDeserializationType(_elemClass);
+                Collection<Object> elements = oc.readValue(node.traverse(), elemType);
+                return convertElementsToStrings(elements);
+            
+            default:
+                List<String> result = new ArrayList<>(size);
+                while (result.size() < size) {
+                    JsonToken t = p.nextToken();
+                    if (t == null || t == JsonToken.END_ARRAY) {
+                        break;
+                    }
+                    
+                    result.add(p.getText());
+                }
+                
+                return result;
+        }
+    }
+
+    private Collection<String> convertElementsToStrings(Collection<Object> elements) {
+        List<String> result = new ArrayList<>(elements.size());
+        for (Object element : elements) {
+            if (element == null) {
+                result.add(null);
+            } else if (!(element instanceof String)) {
+                try {
+                    element = element.toString();
+                } catch (Throwable ignored) {
+                }
+            }
+            
+            if (element != null) {
+                result.add((String) element);
+            }
+        }
+        
+        return result;
+    }
+}
+```
+
+Ensure that your Jackson configuration correctly registers your
