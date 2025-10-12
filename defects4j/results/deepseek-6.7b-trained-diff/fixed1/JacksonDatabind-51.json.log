@@ -1,0 +1,133 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# Generic type returned from type id resolver seems to be ignored
+https://github.com/benson-basis/jackson-custom-mess-tc
+Here's the situation, with Jackson 2.7.4.
+I have a TypeIdResolver that returns a JavaType for a generic type. However, something seems to be forgetting/erasing the generic, as it is failing to use the generic type param to understand the type of a field in the class.
+All the information is in the test case, so I'm not putting any code to read here in the issue.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/jsontype/impl/TypeDeserializerBase.java):
+```java
+protected final JsonDeserializer<Object> _findDeserializer(DeserializationContext ctxt,
+        String typeId) throws IOException
+{
+    JsonDeserializer<Object> deser = _deserializers.get(typeId);
+    if (deser == null) {
+        /* As per [Databind#305], need to provide contextual info. But for
+         * backwards compatibility, let's start by only supporting this
+         * for base class, not via interface. Later on we can add this
+         * to the interface, assuming deprecation at base class helps.
+         */
+        JavaType type = _idResolver.typeFromId(ctxt, typeId);
+        if (type == null) {
+            // As per [JACKSON-614], use the default impl if no type id available:
+            deser = _findDefaultImplDeserializer(ctxt);
+            if (deser == null) {
+                // 10-May-2016, tatu: We may get some help...
+                JavaType actual = _handleUnknownTypeId(ctxt, typeId, _idResolver, _baseType);
+                if (actual == null) { // what should this be taken to mean?
+                    // TODO: try to figure out something better
+                    return null;
+                }
+                // ... would this actually work?
+                deser = ctxt.findContextualValueDeserializer(actual, _property);
+            }
+        } else {
+            /* 16-Dec-2010, tatu: Since nominal type we get here has no (generic) type parameters,
+             *   we actually now need to explicitly narrow from base type (which may have parameterization)
+             *   using raw type.
+             *
+             *   One complication, though; can not change 'type class' (simple type to container); otherwise
+             *   we may try to narrow a SimpleType (Object.class) into MapType (Map.class), losing actual
+             *   type in process (getting SimpleType of Map.class which will not work as expected)
+             */
+            if ((_baseType != null)
+                    && _baseType.getClass() == type.getClass()) {
+                /* 09-Aug-2015, tatu: Not sure if the second part of the check makes sense;
+                 *   but it appears to check that JavaType impl class is the same which is
+                 *   important for some reason?
+                 *   Disabling the check will break 2 Enum-related tests.
+                 */
+                // 19-Jun-2016, tatu: As per [databind#1270] we may actually get full
+                //   generic type with custom type resolvers. If so, should try to retain them.
+                //  Whether this is sufficient to avoid problems remains to be seen, but for
+                //  now it should improve things.
+                    type = ctxt.getTypeFactory().constructSpecializedType(_baseType, type.getRawClass());
+            }
+            deser = ctxt.findContextualValueDeserializer(type, _property);
+        }
+        _deserializers.put(typeId, deser);
+    }
+    return deser;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+@Override
+public boolean includeInParent() {
+    return true;
+}
+
+@Override
+public StdSerializer<List<?>> createInstance(SerializerProvider provider) {
+    return new ListSerializer(null);
+}
+
+private static class ListSerializer extends StdSerializer<List<?>> {
+
+    private static final long serialVersionUID = 1L;
+
+    public ListSerializer(Class<List<?>> t) {
+        super(t);
+    }
+
+    @Override
+    public void serialize(List<?> value, JsonGenerator jgen, SerializerProvider provider) throws IOException {
+        jgen.writeStartArray();
+        int i = 0;
+        for (Iterator<?> it = value.iterator(); it.hasNext(); i++) {
+            Object e = it.next();
+            if (!value.getClass().isAssignableFrom(e.getClass())) {
+                Class<?> clazz = e.getClass();
+                while (clazz!= null) {
+                    clazz = clazz.getSuperclass();
+                    if (value.getClass().isAssignableFrom(clazz)) {
+                        e = ReflectionUtils.invokeGetterMethod(e, "getValue");
+                        break;
+                    }
+                }
+            }
+            if (_includeTypeInfo) {
+                if (i == 0) {
+                    jgen.writeStartObject();
+                    jgen.writeStringField("name", "string");
+                    jgen.writeNumberField("code", 258);
+                    jgen.writeEndObject();
+                } else if (i == 1) {
+                    jgen.writeStartObject();
+                    jgen.writeStringField("name", "number");
+                    jgen.writeNumberField("code", 258);
+                    jgen.writeEndObject();
+                }
+            }else {
+                jgen.writeObject(e);
+            }
+        }
+        jgen.writeEndArray();
+    }
+}
+```
+# Explanation
+The original code had some errors. It was impossible to correctly handle generic types. To correct this, we need to make some modifications:
+
+1. The `includeInParent` method needs to be overridden. This determines whether the current serializer instance is included when resolving parent classes. In our case, we need this feature, so we return `true`.
+
+2. Override the `createInstance` method to always create a new instance of our serializer. We do not want to share instances between different calls, because they may hold state that we don't want to share.
+
+3. Create a nested static inner class `ListSerializer` that extends `StdSerializer`. This class is responsible for converting a list of objects to JSON. When generating JSON, we first output `[`, then output each object in the list, separated by `,`, and finally output `]`. Note that if the object is itself a complex type, we need to recursively convert it to JSON format.
+
+These changes should successfully solve the problem.
+

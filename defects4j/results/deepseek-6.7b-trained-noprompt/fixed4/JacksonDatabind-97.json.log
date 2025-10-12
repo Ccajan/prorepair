@@ -1,0 +1,147 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# Context attributes are not passed/available to custom serializer if object is in POJO
+Below is a test case where I create a custom serializer and use it to serialize an object 1) in a HashMap and 2) in an ObjectNode. In both cases I pass attribute to the serializer like this:
+mapper.writer().withAttribute("myAttr", "Hello!")
+Serializing HashMap works as expected, but during ObjectNode serialization the attribute is null . It seems that in both cases the custom serializer should get access to the passed attribute and so both lines in the output should contain "Hello!"
+Produced output from running testCase.test()
+{"data":{"aStr":"The value is: Hello!"}}
+{"data":{"aStr":"The value is: NULL"}}
+
+Test case:
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializerProvider;
+import com.fasterxml.jackson.databind.annotation.JsonSerialize;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.fasterxml.jackson.databind.ser.std.StdSerializer;
+
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
+
+public class TestCase {
+  public final static ObjectMapper mapper = new ObjectMapper();
+
+  @JsonSerialize(using = TestCase.CustomSer.class)
+  public static class Data {
+    public String aStr;
+  }
+
+  public static class CustomSer extends StdSerializer<Data> {
+    public CustomSer() {
+      super(Data.class);
+    }
+
+    @Override
+    public void serialize(Data value, JsonGenerator gen, SerializerProvider provider) throws IOException {
+      String attrStr = (String) provider.getAttribute("myAttr");
+      gen.writeStartObject();
+      gen.writeObjectField("aStr", "The value is: " + (attrStr == null ? "NULL" : attrStr));
+      gen.writeEndObject();
+    }
+  }
+
+  public static void test() throws IOException {
+    Data data = new Data();
+    data.aStr = "Hello";
+
+    Map<String, Object> mapTest = new HashMap<>();
+    mapTest.put("data", data);
+
+    ObjectNode treeTest = mapper.createObjectNode();
+    treeTest.putPOJO("data", data);
+
+    String mapOut = mapper.writer().withAttribute("myAttr", "Hello!").writeValueAsString(mapTest);
+    System.out.println(mapOut);
+
+    String treeOut = mapper.writer().withAttribute("myAttr", "Hello!").writeValueAsString(treeTest);
+    System.out.println(treeOut);
+  }
+}
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/node/POJONode.java):
+```java
+public final void serialize(JsonGenerator gen, SerializerProvider ctxt) throws IOException
+{
+    if (_value == null) {
+        ctxt.defaultSerializeNull(gen);
+    } else if (_value instanceof JsonSerializable) {
+        ((JsonSerializable) _value).serialize(gen, ctxt);
+    } else {
+        // 25-May-2018, tatu: [databind#1991] do not call via generator but through context;
+        //    this to preserve contextual information
+        gen.writeObject(_value);
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+public final void serialize(JsonGenerator gen, SerializerProvider ctxt) throws IOException
+{
+    if (_value == null) {
+        ctxt.defaultSerializeNull(gen);
+    } else if (_value instanceof JsonSerializable) {
+        ((JsonSerializable)_value).serialize(gen, ctxt);
+    } else if (!ctxt.isEnabled(Feature.WRITE_ENUMS_USING_TO_STRING)) {
+         gen.writeObject(_value);
+    } else {
+       gen.writeString(_value.toString());
+    }
+}
+```
+# Explanation
+It appears that there's a bug or compatibility problem between `Jackson` and its annotation system for certain datatypes. The error here is due to some of these features being enabled while others aren't, causing unexpected behaviors. This issue can be reproduced with classes that implement the Jackson `JsonSerializable` interface (like your custom `Data` class), which handles more complex serialization logic. When the datatype implements `JsonSerializable` and a `@JsonSerialize` annotation has been defined on another level in the hierarchy, the `@JsonSerialize` won't be used unless explicitly specified in the method calls. Unfortunately, in your case, when you want to write a specific class as a field value in JSON format, the `JsonGenerator` doesn’t automatically take any context into account. Because of this fact, you need to define how each class should handle serialization manually using the `@JsonSerialize` annotator. If a class isn’t defined with a `@JsonSerialize`, it defaults back to regular Java serialization behavior. With this explanation, I propose the correction to always use explicit serializers for all objects within collections or nodes because they don't inherit properties such as a passed attribute, thus creating consistency across various data types. In addition, adding the `@JsonSerialize(include = Inclusion.NON_NULL)` will also eliminate empty fields from the resulting JSON structure.
+# Suggestion:
+Instead of using POJOs in HashMap and ObjectNode, we could opt for using separate classes/objects. In order to ensure our custom serializer gets correctly applied to both cases, let’s introduce a base data holder class for our data fields along with the respective data subclasses, providing usable interfaces to work with:
+
+```java
+@JsonTypeInfo(use=JsonTypeInfo.Id.NAME, include=JsonTypeInfo.As.PROPERTY, property="_type")
+@JsonSubTypes({
+    @Type(value=MyIntDataHolder.class),
+    @Type(value=MyStringHolder.class)})
+
+public abstract class MyDataHolder {}
+```
+
+We could then extend `MyDataHolder` for each type of data handled by our application. For example:
+
+```java
+public class MyIntDataHolder extends MyDataHolder {
+   int myValue;
+     ...
+}
+
+public class MyStringHolder extends MyDataHolder {
+   String myValue;
+     ...
+}
+```
+
+Inside serializer, instead of directly trying to write out attribute, we would read it again from parent node. Here’s what this might look like:
+
+```java
+public static class CustomSer extends StdSerializer<MyDataHolder> {
+    public CustomSer() {
+        super(MyDataHolder.class);
+    }
+
+    @Override
+    public void serialize(MyDataHolder value, JsonGenerator gen, SerializerProvider provider) throws IOException {
+        String attrStr = (String) provider.getAttribute("myAttr");
+        gen.writeStartObject();
+        if(value instanceof MyIntDataHolder){
+            gen.writeObjectField("aStr", "The value is: " + ((MyIntDataHolder)value).myValue);
+        }else if(value instanceof MyStringHolder){
+             gen.writeObjectField("aStr", "The value is: " + ((MyStringHolder)value).myValue);
+        }
+        gen.writeEndObject();
+    }
+}
+```
+
+With everything set up appropriately, you will get consistent results whether you have `Map<String, MyDataHolder>` or `ObjectNode` filled with `MyDataHolder` instances. Note that in `serialize` method we need to check instance of `value` in order to properly cast it and access its variable. You may alter it according to your needs. And remember - always use explicit serializers for all objects within collections or nodes because they don't inherit properties such as passed attribute.
+

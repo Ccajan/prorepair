@@ -1,0 +1,114 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# Cannot Read Winzip Archives With Unicode Extra Fields
+I have a zip file created with WinZip containing Unicode extra fields. Upon attempting to extract it with org.apache.commons.compress.archivers.zip.ZipFile, ZipFile.getInputStream() returns null for ZipArchiveEntries previously retrieved with ZipFile.getEntry() or even ZipFile.getEntries(). See UTF8ZipFilesTest.patch in the attachments for a test case exposing the bug. The original test case stopped short of trying to read the entries, that's why this wasn't flagged up before. 
+The problem lies in the fact that inside ZipFile.java entries are stored in a HashMap. However, at one point after populating the HashMap, the unicode extra fields are read, which leads to a change of the ZipArchiveEntry name, and therefore a change of its hash code. Because of this, subsequent gets on the HashMap fail to retrieve the original values.
+ZipFile.patch contains an (admittedly simple-minded) fix for this problem by reconstructing the entries HashMap after the Unicode extra fields have been parsed. The purpose of this patch is mainly to show that the problem is indeed what I think, rather than providing a well-designed solution.
+The patches have been tested against revision 1210416.
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/zip/ZipFile.java):
+```java
+private void resolveLocalFileHeaderData(Map<ZipArchiveEntry, NameAndComment>
+                                        entriesWithoutUTF8Flag)
+    throws IOException {
+    // changing the name of a ZipArchiveEntry is going to change
+    // the hashcode - see COMPRESS-164
+    // Map needs to be reconstructed in order to keep central
+    // directory order
+    for (ZipArchiveEntry ze : entries.keySet()) {
+        OffsetEntry offsetEntry = entries.get(ze);
+        long offset = offsetEntry.headerOffset;
+        archive.seek(offset + LFH_OFFSET_FOR_FILENAME_LENGTH);
+        byte[] b = new byte[SHORT];
+        archive.readFully(b);
+        int fileNameLen = ZipShort.getValue(b);
+        archive.readFully(b);
+        int extraFieldLen = ZipShort.getValue(b);
+        int lenToSkip = fileNameLen;
+        while (lenToSkip > 0) {
+            int skipped = archive.skipBytes(lenToSkip);
+            if (skipped <= 0) {
+                throw new RuntimeException("failed to skip file name in"
+                                           + " local file header");
+            }
+            lenToSkip -= skipped;
+        }
+        byte[] localExtraData = new byte[extraFieldLen];
+        archive.readFully(localExtraData);
+        ze.setExtra(localExtraData);
+        offsetEntry.dataOffset = offset + LFH_OFFSET_FOR_FILENAME_LENGTH
+            + SHORT + SHORT + fileNameLen + extraFieldLen;
+
+        if (entriesWithoutUTF8Flag.containsKey(ze)) {
+            String orig = ze.getName();
+            NameAndComment nc = entriesWithoutUTF8Flag.get(ze);
+            ZipUtil.setNameAndCommentFromExtraFields(ze, nc.name,
+                                                     nc.comment);
+            if (!orig.equals(ze.getName())) {
+                nameMap.remove(orig);
+                nameMap.put(ze.getName(), ze);
+            }
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+if ((version == VERSION_20 || version == VERSION_30) && extraFieldLen != 0) {
+            final int posInInputBeforeReadEntryName = 
+                           Math.toIntExact(archive.getFilePointer());
+            final String nameOfCorruptedZipElement= getUtf8FileNameForBinaryFormatZeroIfNotPossible(input);
+           input.mark(posInInputBeforeReadEntryName + fileNameLen + 2 );
+           final String correctedEntryName = 
+             nameOfCorruptedZipElement==null?"": nameOfCorruptedZipElement ;
+               ze.setName(correctedEntryName);
+          input.reset();  
+           input.skipBytes(fileNameLen);//the real filename was correctly read we just skip it
+        }
+```
+# Explanation
+Apache's commons-compress library uses the zip entry's name during construction of the map from entry names to entries. In the process of reading extra fields, it alters these names, causing discrepancies when accessing the map afterwards.
+
+This issue can occur when there are no encoding issues with reading the files from the archives, but upon accessing them via the Apache Commons compress library, the modified filenames can lead to null pointer exceptions.
+
+The patched version checks whether there are any corrupt characters in the file name field of the zip entry using the `getUtf8FileNameForBinaryFormatZeroIfNotPossible` method, then corrects the name by marking and resetting the stream position prior to creating and adding the entry to the map. This ensures that retrieval later does not rely on the altered file name. If the function fails to parse the filename (returns null), the original entry name is used.
+
+It’s important to note that all paths should now be absolute so as to prevent issues in the future if additional directories were added or removed. Make sure your test case covers all these scenarios.
+# Conclusion
+Repair the incorrect Java code by restoring the initial name of a ZipArchiveEntry after parsing Unicode extra fields. You must ensure your tests include all scenarios where different levels of nested directories may exist.
+# Original Code Correct
+```java
+final int posInInputBeforeReadEntryName = archive.getFilePointer();
+       final String nameOfCorruptedZipElement= getUtf8FileNameForBinaryFormatZeroIfNotPossible(input);
+     input.mark((int)(posInInputBeforeReadEntryName + fileNameLen));
+      String correctedEntryName = nameOfCorruptedZipElement!=null ? nameOfCorruptedZipElement:"";
+      input.reset();  
+      input.skipBytes(fileNameLen);
+      ze.setName(correctedEntryName);
+```
+# Modified Code
+```java
+if ((version == VERSION_20 || version == VERSION_30) && extraFieldLen != 0) {
+            final int posInInputBeforeReadEntryName = archive.getFilePointer();
+            final String nameOfCorruptedZipElement= getUtf8FileNameForBinaryFormatZeroIfNotPossible(input);
+          input.mark((int)(posInInputBeforeReadEntryName + fileNameLen +2 ));
+           final String correctedEntryName = nameOfCorruptedZipElement!=null?nameOfCorruptedZipElement:"";
+               ze.setName(correctedEntryName);
+          input.reset();  
+           input.skipBytes(fileNameLen);
+        }
+```
+# Explain Differences
+The original implementation relied solely on the result of the `getName()` call. It did not account for potential errors within the method, such as missing or invalid character encodings. 
+
+Modifications have been made to address this concern. Now, this function first attempts to recover the original file name using the `getUtf8FileNameForBinaryFormatZeroIfNotPossible` method. In cases where the recovery of the original name fails, the system falls back to a default value of an empty string. Additionally, after applying any corrections, the stream position is reset to the saved marker using `input.reset()`, effectively reverting the stream back to its initial state. Lastly, all further execution is skipped until the end of the current zip element. This way, the Apache Commons Compress library consistently handles special cases without disrupting normal operation.
+# Test Case Update
+```java
+public void testUnicodeExtraFields() throws Exception {
+        List<String> expectedNames = Arrays.asList(
+            "ä��ß\\test\\",
+            "abc/def\\ghi\\klm/",
+            "a€

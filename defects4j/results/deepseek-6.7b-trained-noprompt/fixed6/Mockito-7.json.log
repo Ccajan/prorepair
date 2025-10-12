@@ -1,0 +1,150 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# Deep stubbing with generic responses in the call chain is not working
+Deep stubbing will throw an Exception if multiple generics occur in the call chain. For instance, consider having a mock myMock1 that provides a function that returns a generic T. If T also has a function that returns a generic, an Exception with the message "Raw extraction not supported for : 'null'" will be thrown.
+As an example the following test will throw an Exception:
+public class MockitoGenericsDeepStubTest {
+
+    @Test
+    public void discoverDeepMockingOfGenerics() {
+        MyClass1 myMock1 = mock(MyClass1.class, RETURNS_DEEP_STUBS);
+
+        when(myMock1.getNested().getNested().returnSomething()).thenReturn("Hello World.");
+    }
+
+    public static interface MyClass1 <MC2 extends MyClass2> {
+        public MC2 getNested();
+    }
+
+    public static interface MyClass2<MC3 extends MyClass3> {
+        public MC3 getNested();
+    }
+
+    public static interface MyClass3 {
+        public String returnSomething();
+    }
+}
+You can make this test run if you step into the class ReturnsDeepStubs and change the method withSettingsUsing to return MockSettings with ReturnsDeepStubs instead of ReturnsDeepStubsSerializationFallback as default answer:
+private MockSettings withSettingsUsing(GenericMetadataSupport returnTypeGenericMetadata, MockCreationSettings parentMockSettings) {
+    MockSettings mockSettings = returnTypeGenericMetadata.hasRawExtraInterfaces() ?
+            withSettings().extraInterfaces(returnTypeGenericMetadata.rawExtraInterfaces())
+            : withSettings();
+
+    return propagateSerializationSettings(mockSettings, parentMockSettings)
+            .defaultAnswer(this);
+}
+However, this breaks other tests and features.
+I think, the issue is that further generics are not possible to be mocked by ReturnsDeepStubsSerializationFallback since the GenericMetadataSupport is "closed" at this point.
+Thanks and kind regards
+Tobias
+This is an incorrect Java code (src/org/mockito/internal/util/reflection/GenericMetadataSupport.java):
+```java
+private void readTypeVariables() {
+    for (Type type : typeVariable.getBounds()) {
+        registerTypeVariablesOn(type);
+    }
+    registerTypeVariablesOn(getActualTypeArgumentFor(typeVariable));
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+package org.mockito.internal.util.reflection;
+
+import java.lang.reflect.*;
+import java.io.Serializable;
+
+/**
+ * This class is used for storing metadata about a Java generic like Class, type parameters etc.
+ */
+public final class GenericMetadata implements Serializable, GenericMetadataSupport {
+    private final Type type;
+    // [...]
+
+    /**
+     * creates new {@link GenericMetadata} based on given raw {@code type}. This constructor does some simple checks to see whether the raw type itself supports the interfaces required to be returned from it via reflection API.
+     * 
+     * @param type - raw type to wrap around
+     */
+    public GenericMetadata(Type type) {
+        Preconditions.checkNotNull(type, "Given 'raw' type cannot be null");
+        this.type = type;
+        
+        // The line below will cause a failure when there are nested generics
+//        if (!isSupportedByReflectionApi(type)) {
+//            throw new UnsupportedOperationException(
+//                    "Provided raw generic type [" + type + "] is not directly accessible through reflection APIs!");
+//        }
+    }
+
+    protected boolean isSupportedByReflectionApi(Type type) {
+        try {
+            Class.forName(type.getTypeName());
+            return true;
+        } catch (Throwable e) {
+            
+        }
+        return false;
+    }
+
+    /**
+     * Checks whether or not we have any actual arguments for this generic.
+     * 
+     * @since 2.8.45
+     */
+    public boolean hasActualArguments() {
+        return type instanceof ParameterizedType && ((ParameterizedType) type).getActualTypeArguments().length > 0;
+    }
+
+    /**
+     * Gives you all actual arguments for this generic. Please note that if the result contains itself then most probably it's recursive type definition.
+     * 
+     * @return Array of all argument types (and self references) that were provided within brackets while representing this generic. Never returns {@code null}, even when no such arguments were provided.
+     * @since 2.8.45
+     */
+    public Type[] getActualArguments() {
+        if(!hasActualArguments()) {
+            return new Type[]{};
+        } else {
+            return ((ParameterizedType) type).getActualTypeArguments();
+        }
+    }
+
+    // [...]
+}
+```
+# Solution
+```java
+import org.mockito.stubbing.OngoingStubbing;
+import org.mockito.exceptions.base.MockitoException;
+
+public final class Mockito {
+    private Mockito() {}
+
+    /**
+     * Returns stubber which sets up deep stub mode for next methods invocation. Including those within inner classes
+     * <p>
+     * Note: For inner classes, use more than one calls to this method to reach them. Example:
+     * <pre>{@code
+     *   when(parent.innerField.superInnerField...).thenReturn(val);
+     * }</pre>
+     * Also note that setting up stubs won't break if a field doesn't exist anymore, so ensure all your fields exists when you set up your mocks.
+     *
+     * @param <T> type of object being stubbed
+     * @param maybeMock may be uninitialized proxy, possibly initialized real instance or may be initializing mock
+     * @return Ongoing stubbing for deeper objects to be set up. Use this handle to setup the expected behaviour of fields or methods to return.
+     * @throws IllegalArgumentException if given {@code maybeMock} isn't initialized mock
+     */
+    public static <T> OngoingStubbing<T> when(MaybeMock<T> maybeMock){
+        verifyInitialized(maybeMock);
+        return new OngoingStubbingImpl<>((T)maybeMock.getUnsafe(), MockSettingsHolder.mockSettingsFor(maybeMock));
+    }
+    private static void verifyInitialized(MaybeMock<?> maybeMock) {
+        Object mock = maybeMock.getUnsafe();
+        if!(mock instanceof Initializable){
+            throw new MockitoException("Mockito does not allow interaction with objects that haven't been initialized yet."+
+                    "\nMake sure you init Mocks with `RETURNS_DEEP_STUBS` setting before making interactions with their fields/methods."+
+                   

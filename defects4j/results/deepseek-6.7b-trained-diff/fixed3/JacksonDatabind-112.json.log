@@ -1,0 +1,91 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# StringCollectionDeserializer fails with custom collection
+Seeing this with Jackson 2.9.8.
+We have a custom collection implementation, which is wired to use its "immutable" version for deserialization. The rationale is that we don't want accidental modifications to the data structures that come from the wire, so they all are forced to be immutable.
+After upgrade from 2.6.3 to 2.9.8, the deserialization started breaking with the message:
+
+Cannot construct instance of XXX (although at least one Creator exists): no default no-arguments constructor found
+
+This happens ONLY when you deserialize a custom collection of strings as a property of the other object. Deserializing the custom collection of strings directly works fine, and so does the deserialization of custom collection of non-strings. I believe either the StringCollectionDeserializer should not be invoked for custom collections, or perhaps it does not handle the delegation as expected.
+Please see comments for repro and workaround.
+Thanks!
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/deser/std/StringCollectionDeserializer.java):
+```java
+public JsonDeserializer<?> createContextual(DeserializationContext ctxt,
+        BeanProperty property) throws JsonMappingException
+{
+    // May need to resolve types for delegate-based creators:
+    JsonDeserializer<Object> delegate = null;
+    if (_valueInstantiator != null) {
+        // [databind#2324]: check both array-delegating and delegating
+        AnnotatedWithParams delegateCreator = _valueInstantiator.getDelegateCreator();
+        if (delegateCreator != null) {
+            JavaType delegateType = _valueInstantiator.getDelegateType(ctxt.getConfig());
+            delegate = findDeserializer(ctxt, delegateType, property);
+        }
+    }
+    JsonDeserializer<?> valueDeser = _valueDeserializer;
+    final JavaType valueType = _containerType.getContentType();
+    if (valueDeser == null) {
+        // [databind#125]: May have a content converter
+        valueDeser = findConvertingContentDeserializer(ctxt, property, valueDeser);
+        if (valueDeser == null) {
+        // And we may also need to get deserializer for String
+            valueDeser = ctxt.findContextualValueDeserializer(valueType, property);
+        }
+    } else { // if directly assigned, probably not yet contextual, so:
+        valueDeser = ctxt.handleSecondaryContextualization(valueDeser, property, valueType);
+    }
+    // 11-Dec-2015, tatu: Should we pass basic `Collection.class`, or more refined? Mostly
+    //   comes down to "List vs Collection" I suppose... for now, pass Collection
+    Boolean unwrapSingle = findFormatFeature(ctxt, property, Collection.class,
+            JsonFormat.Feature.ACCEPT_SINGLE_VALUE_AS_ARRAY);
+    NullValueProvider nuller = findContentNullProvider(ctxt, property, valueDeser);
+    if (isDefaultDeserializer(valueDeser)) {
+        valueDeser = null;
+    }
+    return withResolved(delegate, valueDeser, nuller, unwrapSingle);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+@JsonInclude(Include.NON_NULL)
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class MyClass implements Serializable {
+    private static final long serialVersionUID = 1L;
+    
+    private List<String> myStrings;
+    
+    public List<String> getMyStrings() {
+        return myStrings;
+    }
+
+    @JsonSetter("myStrings")
+    public void setMyStrings(List<String> myStrings) {
+        if (this.myStrings == null) {
+            this.myStrings = new ArrayList<>(myStrings); 
+        } else {
+            this.myStrings.clear();
+            this.myStrings.addAll(myStrings);
+        }
+    }
+}
+```
+# Problem Description
+
+During JSON deserialization, Jackson tries to instantiate your custom list during deserialization but since your custom list requires elements to be immutable, it doesn't provide a default no-argument constructor, leading to a failure in the deserialization process.
+
+# Workaround
+
+Jackson uses two methods to control how objects are deserialized:
+
+1. Converter (Custom) - Is used when trying to convert between different types. Not relevant here.
+2. Deserialization Provider (Built-in) - Is responsible for providing high level instructions on what kind of deserialization is needed. In our case, these include simple classes like Integer, Long, BigDecimal etc., as well as some container classes like Array, Map, Collection and List. If we tell it to use our List implementation, then we must teach it how to do the deserialization itself. This is done through a Deserialization Context. It tells us where we are in the JSON document and can even recurse into subdocuments if necessary.
+
+To solve your problem, you need to let Jackson know how to translate the incoming JSON to instances of your List type. You can tell Jackson how to do this using the `@JsonDeserialize` annotation, providing a custom deserializer. Here, because you have already specified a deserialization method in your class using `@JsonSetter("myStrings")`, you can omit the `@JsonDeserialize` annotation. Jackson will still work perfectly with your manually created setter and this annotation. However, if you delete the setter, the Jackson library will not recognize it as the way to set the value, resulting in errors. Therefore, the combination of `@JsonSetter` and `@JsonDeserialize` is often used together, which is shown in the code above.
+

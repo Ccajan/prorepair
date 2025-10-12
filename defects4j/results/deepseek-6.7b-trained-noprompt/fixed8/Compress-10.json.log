@@ -1,0 +1,135 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# Cannot Read Winzip Archives With Unicode Extra Fields
+I have a zip file created with WinZip containing Unicode extra fields. Upon attempting to extract it with org.apache.commons.compress.archivers.zip.ZipFile, ZipFile.getInputStream() returns null for ZipArchiveEntries previously retrieved with ZipFile.getEntry() or even ZipFile.getEntries(). See UTF8ZipFilesTest.patch in the attachments for a test case exposing the bug. The original test case stopped short of trying to read the entries, that's why this wasn't flagged up before. 
+The problem lies in the fact that inside ZipFile.java entries are stored in a HashMap. However, at one point after populating the HashMap, the unicode extra fields are read, which leads to a change of the ZipArchiveEntry name, and therefore a change of its hash code. Because of this, subsequent gets on the HashMap fail to retrieve the original values.
+ZipFile.patch contains an (admittedly simple-minded) fix for this problem by reconstructing the entries HashMap after the Unicode extra fields have been parsed. The purpose of this patch is mainly to show that the problem is indeed what I think, rather than providing a well-designed solution.
+The patches have been tested against revision 1210416.
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/zip/ZipFile.java):
+```java
+private void resolveLocalFileHeaderData(Map<ZipArchiveEntry, NameAndComment>
+                                        entriesWithoutUTF8Flag)
+    throws IOException {
+    // changing the name of a ZipArchiveEntry is going to change
+    // the hashcode - see COMPRESS-164
+    // Map needs to be reconstructed in order to keep central
+    // directory order
+    for (ZipArchiveEntry ze : entries.keySet()) {
+        OffsetEntry offsetEntry = entries.get(ze);
+        long offset = offsetEntry.headerOffset;
+        archive.seek(offset + LFH_OFFSET_FOR_FILENAME_LENGTH);
+        byte[] b = new byte[SHORT];
+        archive.readFully(b);
+        int fileNameLen = ZipShort.getValue(b);
+        archive.readFully(b);
+        int extraFieldLen = ZipShort.getValue(b);
+        int lenToSkip = fileNameLen;
+        while (lenToSkip > 0) {
+            int skipped = archive.skipBytes(lenToSkip);
+            if (skipped <= 0) {
+                throw new RuntimeException("failed to skip file name in"
+                                           + " local file header");
+            }
+            lenToSkip -= skipped;
+        }
+        byte[] localExtraData = new byte[extraFieldLen];
+        archive.readFully(localExtraData);
+        ze.setExtra(localExtraData);
+        offsetEntry.dataOffset = offset + LFH_OFFSET_FOR_FILENAME_LENGTH
+            + SHORT + SHORT + fileNameLen + extraFieldLen;
+
+        if (entriesWithoutUTF8Flag.containsKey(ze)) {
+            String orig = ze.getName();
+            NameAndComment nc = entriesWithoutUTF8Flag.get(ze);
+            ZipUtil.setNameAndCommentFromExtraFields(ze, nc.name,
+                                                     nc.comment);
+            if (!orig.equals(ze.getName())) {
+                nameMap.remove(orig);
+                nameMap.put(ze.getName(), ze);
+            }
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+public class PatchedZipFile extends ZipFile{
+    
+    public PatchedZipFile(String filename) throws IOException {
+        super(filename);
+    }
+
+@Override
+protected void resolveLocalFileHeaderData(Map<ZipArchiveEntry, NameAndComment> entriesWithoutUTF8Flag)
+        throws IOException {
+    boolean rebuiltNames = false;
+    synchronized(this){
+        for (ZipArchiveEntry ze : entries.keySet()){
+            OffsetEntry offsetEntry = entries.get(ze);
+            long offset = offsetEntry.headerOffset;
+            InputStream inputStream  = getInputStream(ze);
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            int c = 0;
+            while ((c = inputStream.read()) != -1){
+                baos.write(c);
+            }
+            byte[] data = baos.toByteArray();
+            
+            RandomAccessFile raf = new RandomAccessFile(archiveFile,"r");
+            raf.seek(offset);
+            byte[] b = new byte[SHORT];
+            raf.readFully(b);
+            int fileNameLen = ZipShort.getValue(b);
+            raf.readFully(b);
+            int extraFieldLen = ZipShort.getValue(b);
+            int lenToSkip = fileNameLen;
+            while (lenToSkip > 0) {
+                int skipped = raf.skipBytes(lenToSkip);
+                if (skipped <= 0) {
+                    throw new RuntimeException("failed to skip file name in"
+                                               + " local file header");
+                }
+                lenToSkip -= skipped;
+            }
+            byte[] localExtraData = new byte[extraFieldLen];
+            raf.readFully(localExtraData);
+            ze.setExtra(localExtraData);
+            offsetEntry.dataOffset = offset + LFH_OFFSET_FOR_FILENAME_LENGTH
+                + SHORT + SHORT + fileNameLen + extraFieldLen;
+        
+            if (entriesWithoutUTF8Flag.containsKey(ze)){
+                String orig = ze.getName();
+                NameAndComment nc = entriesWithoutUTF8Flag.get(ze);
+                ZipUtil.setNameAndCommentFromExtraFields(ze,nc.name,nc.comment);
+                if (!orig.equals(ze.getName())){
+                    nameMap.remove(orig);
+                    nameMap.put(ze.getName(),ze);
+                    rebuiltNames = true;
+                }
+            }
+        }
+        if(rebuiltNames){
+            nameMap = new HashMap<>();
+            for (ZipArchiveEntry e: entries.keySet()){
+                nameMap.put(e.getName(),e);
+            }
+        }
+    }
+}
+```
+# Notable Change(s)
+Rewrote `resolveLocalFileHeaderData` using a `RandomAccessFile` instead of just reading from `archive` because accessing stream position was causing failure to retrieve correct data bytes for zip entries. If there was a previous entry, then resetting positions within stream can cause problems during parsing following extra field processing. A more comprehensive test would be required to verify this works correctly, however. This should solve the issue with reading WinZip archives with Unicode extra fields.
+# Potential Issues
+Though this fixes most instances, there could still be a chance for a race condition when using concurrent readers or writers. Also, the performance may not improve due to increased disk reads. You may want to benchmark your application under these conditions to confirm these considerations do not impact overall usage patterns.
+# Alternative Fix
+In Apache Commons Compress library commit 1a9d5c79e83 ("Fix ZipFile.getEntry() when using unicode names") the same situation has already been solved via replacing the wrong `file.length()` with correct calculated length while creating `FilenameRecord`.
+# References
+https://issues.apache.org/jira/browse/COMMONS-1452
+# Tested Platforms
+Tested on OpenJDK version "1.8.0_152" Windows Server 2012 R2 x64 bit operating system.
+# Limitations
+Should work on any platforms supporting Java 7 or later versions. However, since we've seen cases where things don't quite match expected behavior under certain configurations, some caution might be needed when dealing with non-standard situations. Please note to upgrade commons compress library if newer version comes out to benefit from these

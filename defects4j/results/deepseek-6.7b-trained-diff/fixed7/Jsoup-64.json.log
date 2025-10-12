@@ -1,0 +1,151 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# Incorrect handling of self-closing tags noframes, style and title cause remainder of document to be html-escaped
+Given the input:
+<html>
+<head>
+	<style />   <!-- < - - this is the culprit -->
+</head>
+<body>
+	<p>Whatever</p>
+</body>
+</html>
+JSoup 1.8.2 and also http://try.jsoup.org/~lJwWpjXYUSTBeBZhdEnS3Mt56g4 will produce:
+    <html>
+     <head> 
+      <style></style>
+     </head>
+     <body>
+       &lt;/head&gt; &lt;body&gt; &lt;p&gt;Whatever&lt;/p&gt; &lt;/body&gt; &lt;/html&gt;
+     </body>
+    </html>
+With <title/> instead of <style/>, the result is different but still wrong (http://try.jsoup.org/~BZ3uoMki-r904fZxUOWJgLJO7r8 ):
+<html>
+ <head> 
+  <title></title>
+ </head>
+ <body>
+   &lt;/head&gt;  
+  <p>Whatever</p>  
+ </body>
+</html>
+That weirdness was fixed for <script> with Issue #305: http://try.jsoup.org/~3Ms6TQCrrdaA_uPgxgURYYvwFAg
+<html>
+ <head> 
+  <script></script> 
+ </head> 
+ <body> 
+  <p>Whatever</p>  
+ </body>
+</html>
+Looking at the source, it seems only the HtmlTreeBuilderState handling for <noframes>, <style> and <title> in the methods handleRawText and handleRcData doesn't get along with the self-closing tags.
+Any other tagname I've checked (and I tried to cover all branches of that case StartTag switch) results in a good parse similar to the <script> case, which is what I'd expect.
+Thanks for looking into this!
+This is an incorrect Java code (src/main/java/org/jsoup/parser/HtmlTreeBuilderState.java):
+```java
+private static void handleRawtext(Token.StartTag startTag, HtmlTreeBuilder tb) {
+    tb.insert(startTag);
+    tb.tokeniser.transition(TokeniserState.Rawtext);
+    tb.markInsertionMode();
+    tb.transition(Text);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+private enum TokeniserState implements State{
+        ...
+		Script,
+        Rawtext,
+        ...
+	}
+private interface State {...}
+private static class Data implements State {
+	private boolean complete = false;
+	private final Attributes attributes = new Attributes();
+	final Emitter emit() {
+		return emit;
+	}
+	boolean isComplete(){ return complete;}
+	void add(Attribute attr){
+		if(attributes.get(attr.key()) == null)
+			attributes.put(attr);
+	};
+};
+private class MyTokenizer implements Tokenizer{
+		...
+		@Override public Token nextToken(){
+			 if (hasError() ) return null;
+				switch (state) {
+					case Script:
+						return script();
+					case Title:
+						return title();
+					case NoFrame:
+						return noFrames();
+					case Style:
+						return style();
+					default:
+						break;
+				}
+		}
+		...
+		private Token style() {
+    		final String data = "<style>";
+    		final String endTag = "/style>";
+    		final int indexOfEndTag = buf.indexOf(endTag);
+    		final Token token;
+    		if (buf.charAt(0) == '<') {
+        		if (indexOfEndTag != -1 && indexOfEndTag == buf.length() - endTag.length()) {
+            		buf.delete(0, indexOfEndTag + endTag.length());
+            		emit(data).tag("style").attr(emptyAttrs()).complete(true);
+            		nextCleanBuffer();
+            		position++;
+            		token = Token.create(TokenType.EOF);
+            } else {
+            	buf.deleteCharAt(0);
+            	emit().data(data).tag("style");
+            	position += data.length();
+            	token = Token.create(TokenType.TAG, position, position);
+            }
+    		}else {
+    			toleranterror("Closing tags must not have any attributes", 0);
+    			return error(TokenType.EOF);
+    		}
+    		state = TokeniserState.DATA;
+    		return token;
+		}
+		private Token noFrames() {
+			String s = "#DEFAULT";
+    		final int indexOfEndTag = buf.indexOf("-->");
+    		final Token token;
+    		if (buf.charAt(0) == '<') {
+        		if (indexOfEndTag != -1 && indexOfEndTag + 2 == buf.length()) {
+            		buf.delete(0, indexOfEndTag + 2);
+            		emit(s).tag("noscript").complete(true);
+            		nextCleanBuffer();
+            		position++;
+            		token = Token.create(TokenType.EOF);
+            } else {
+            	buf.deleteCharAt(0);
+            	emit().data(s).tag("noscript");
+            	position += s.length();
+            	token = Token.create(TokenType.TAG, position, position);
+            }
+    		}else {
+    			toleranterror("Closing tags must not have any attributes", 0);
+    			return error(TokenType.EOF);
+    		}
+    		state = TokeniserState.DATA;
+    		return token;
+		}
+		...
+	};
+```
+# Explanation:
+The problem occurs because there are no corresponding closing tags for `style` and `noframes` elements. The parser assumes these elements can contain inline text content until it encounters another such element or a closing tag for some other kind of HTML element. However, since those elements cannot contain inline text content according to the HTML specifications, the parser does not actually see the end of the `style` or `noframes` sections, so it keeps reading from there, causing unexpected behavior like escaping everything after these sections.
+
+To fix this, we need to implement these two kinds of elements as a special kind of self-closing tag. We accomplish this by adding new conditions to the token parsing code to recognize these two types of tags, and then treat them differently from regular tags. This way, JSoup will see them as empty elements that need no matching closing tag, just like the `img` and `input` tags. Note that implementing these changes requires understanding of how

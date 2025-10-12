@@ -1,0 +1,153 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# DateTimeSerializerBase ignores configured date format when creating contextual
+DateTimeSerializerBase#createContextual creates a new serializer with StdDateFormat.DATE_FORMAT_STR_ISO8601 format instead of re-using the actual format that may have been specified on the configuration. See the following code:
+final String pattern = format.hasPattern()
+                                    ? format.getPattern()
+                                    : StdDateFormat.DATE_FORMAT_STR_ISO8601;
+
+Using the @JsonFormat annotation on a field will therefore reset the format to Jackson's default even if the annotation doesn't specify any custom format.
+DateBasedDeserializer#createContextual behaves differently and tries to re-use the configured format:
+DateFormat df = ctxt.getConfig().getDateFormat();
+// one shortcut: with our custom format, can simplify handling a bit
+if (df.getClass() == StdDateFormat.class) {
+   ...
+   StdDateFormat std = (StdDateFormat) df;
+   std = std.withTimeZone(tz);
+   ...
+} else {
+  // otherwise need to clone, re-set timezone:
+  df = (DateFormat) df.clone();
+  df.setTimeZone(tz);
+}
+
+Shouldn't the serializer follow the same approach ?
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/ser/std/DateTimeSerializerBase.java):
+```java
+    public JsonSerializer<?> createContextual(SerializerProvider serializers,
+            BeanProperty property) throws JsonMappingException
+    {
+        if (property == null) {
+            return this;
+        }
+        JsonFormat.Value format = findFormatOverrides(serializers, property, handledType());
+        if (format == null) {
+            return this;
+        }
+        // Simple case first: serialize as numeric timestamp?
+        JsonFormat.Shape shape = format.getShape();
+        if (shape.isNumeric()) {
+            return withFormat(Boolean.TRUE, null);
+        }
+
+        // 08-Jun-2017, tatu: With [databind#1648], this gets bit tricky..
+        // First: custom pattern will override things
+                if ((shape == JsonFormat.Shape.STRING) || format.hasPattern()
+                                || format.hasLocale() || format.hasTimeZone()) {
+                    TimeZone tz = format.getTimeZone();
+                    final String pattern = format.hasPattern()
+                                    ? format.getPattern()
+                                    : StdDateFormat.DATE_FORMAT_STR_ISO8601;
+            final Locale loc = format.hasLocale()
+                            ? format.getLocale()
+                            : serializers.getLocale();
+                    SimpleDateFormat df = new SimpleDateFormat(pattern, loc);
+                    if (tz == null) {
+                        tz = serializers.getTimeZone();
+                    }
+            df.setTimeZone(tz);
+            return withFormat(Boolean.FALSE, df);
+        }
+
+        // Otherwise, need one of these changes:
+
+
+        // Jackson's own `StdDateFormat` is quite easy to deal with...
+
+        // 08-Jun-2017, tatu: Unfortunately there's no generally usable
+        //    mechanism for changing `DateFormat` instances (or even clone()ing)
+        //    So: require it be `SimpleDateFormat`; can't config other types
+//            serializers.reportBadDefinition(handledType(), String.format(
+            // Ugh. No way to change `Locale`, create copy; must re-crete completely:
+        return this;
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+public class DateTimeSerializer extends DateTimeSerializerBase {
+
+    protected static final long serialVersionUID = 1L;
+    
+    private static final String DEFAULT_PATTERN = "yyyy-MM-dd'T'HH:mm:ss.SSSZ";
+    
+    private final DateTimeFormatter _formatter;
+
+    public DateTimeSerializer() {
+        super(DateTime.class, null, false, true, null, DEFAULT_PATTERN, null, null, null);
+        _formatter = (DateTimeFormatter) getPattern();
+    }
+    
+    @Override
+    public DateTimeSerializer withFormatting(DateTimeFormatter formatter) {
+        if (_formatter == formatter) {
+            return this;
+        }
+        return new DateTimeSerializer(_formatter);
+    }
+    
+    /**
+     * This method returns a serializer based on contextual settings. It mostly just handles simple cases, where we only need to use a custom format in certain situations. More complex handling might not be possible without falling back to using reflection, but I do believe this is the intended behavior according to your previous code comments.
+     */
+    @Override
+    public JsonSerializer<?> createContextual(SerializerProvider prov, BeanProperty prop) throws JsonMappingException {
+        
+        if (!handles(prov.getTypeBinding())) {
+            return prov.findValueSerializer(handledType());
+        }
+        
+        // first try to see if user has provided a 'complete' date-time serializer
+        Class<?> mostSpecific = getMostSpecificSubclass(prop.getMember().getDeclaringClass());
+        JsonSerializer<?> ser = prov.findValueSerializer(mostSpecific);
+        if (ser instanceof DateTimeSerializer) {
+            DateTimeSerializer datetimeSer = (DateTimeSerializer) ser;
+            if (datetimeSer._formatter != null) {
+                return datetimeSer.withFormatting((DateTimeFormatter) getPattern()).withFeatures(features());
+            }
+        }
+        
+        if (null == _format) {
+            synchronized (this) {
+                // need to make sure that we still haven't been initialized since last call
+                if (null == _format) {
+                    final DateFormat df = ((Serializers) prov).getConfig().getDateFormat();
+                    if (df.getClass() == DateTimeFormatter.class) {
+                        setFormat((String) ((DateTimeFormatter) df).toPattern());
+                    } else {
+                        setFormat(null);
+                    }
+                }
+            }
+        }
+        return this;
+    }
+
+    /*
+    /**********************************************************
+    /* Helper methods
+    /**********************************************************
+     */
+    
+    protected DateTimeSerializer(DateTimeFormatter fmt) {
+        super(DateTime.class, fmt, false, true, null, null, null, null, null);
+        _formatter = fmt;
+    }
+}
+```
+# Explanation
+The problem was found when trying to configure the date format for a field in Jackon, and the generated contextual serializer ignored the user-configured format. The solution is to extend the original DateTimeSerializerBase and override some internal variables and methods. After this, the created contextual serializer should respect the user-configured format. Note that this will only work correctly if the type of the corresponding field is java.time.LocalDateTime or org.joda.time.DateTime.
+There seems to be some misunderstanding about how the different parts of Jackson's configuration system interact. For instance, if the @JsonFormat annotation is used, then its configuration should apply to all fields, rather than overriding whatever the contextual serializer finds. Similarly, if a contextual serializer is defined at a type level, then that should apply to all fields of that type, rather than being overridden by individual field configurations. It appears that these two features are mutually exclusive - whichever is defined first should prevail. In this code, @JsonFormat and contextual serializers are treated as alternatives rather than mutual exclusives, which is probably what led to the problem in the first place.
+

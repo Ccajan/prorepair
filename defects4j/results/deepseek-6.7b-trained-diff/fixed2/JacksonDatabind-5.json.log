@@ -1,0 +1,168 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# Mixin annotations lost when using a mixin class hierarchy with non-mixin interfaces
+In summary, mixin annotations are lost when Jackson scans a parent mixin class with Json annotations followed by an interface implemented by the parent mixin class that does not have the same Json annotations.
+Jackson version: 2.4.0
+Detail:
+I have the following class structure
+public interface Contact {
+    String getCity();
+}
+
+public class ContactImpl implements Contact {
+    public String getCity() { ... }
+}
+
+public class ContactMixin implements Contact {
+    @JsonProperty
+    public String getCity() { return null; }
+}
+
+public interface Person extends Contact {}
+
+public class PersonImpl extends ContactImpl implements Person {}
+
+public class PersonMixin extends ContactMixin implements Person {}
+and I configure a module as
+// There are other getters/properties in the Impl class that do not need to be serialized and so
+// I am using the Mixin to match the interface and explicitly annotate all the inherited methods
+module.disable(MapperFeature.ALLOW_FINAL_FIELDS_AS_MUTATORS)
+    .disable(MapperFeature.AUTO_DETECT_FIELDS)
+    .disable(MapperFeature.AUTO_DETECT_GETTERS)
+    .disable(MapperFeature.AUTO_DETECT_IS_GETTERS)
+    .disable(MapperFeature.INFER_PROPERTY_MUTATORS);
+module.setMixInAnnotation(Person.class, PersonMixin.class);
+When a PersonImpl instance is serialized, city is not included.
+I debugged the code and this is what happens:
+In AnnotatedClass.resolveMemberMethods() the supertypes of PersonImpl are [Person.class, Contact.class, ContactImpl.class] in that order.
+It starts with Person for which it finds PersonMixin and proceeds to AnnotatedClass._addMethodMixIns(). Here the parents list has [PersonMixin, ContactMixin, Contact]. When it processes ContactMixin it adds getCity() with the JsonProperty annotation. Then it processes Contact, doesn't find getCity() in methods map and so creates a new AnnotatedMethod for getCity() with the one from the interface which has no annotation which replaces the one from ContactMixin
+The workaround for this issue is to explicitly add any parent mixins to the module i.e.
+module.setMixInAnnotation(Contact.class, ContactMixin.class);
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/introspect/AnnotatedClass.java):
+```java
+protected void _addMethodMixIns(Class<?> targetClass, AnnotatedMethodMap methods,
+        Class<?> mixInCls, AnnotatedMethodMap mixIns)
+{
+    List<Class<?>> parents = new ArrayList<Class<?>>();
+    parents.add(mixInCls);
+    ClassUtil.findSuperTypes(mixInCls, targetClass, parents);
+    for (Class<?> mixin : parents) {
+        for (Method m : mixin.getDeclaredMethods()) {
+            if (!_isIncludableMemberMethod(m)) {
+                continue;
+            }
+            AnnotatedMethod am = methods.find(m);
+            /* Do we already have a method to augment (from sub-class
+             * that will mask this mixIn)? If so, add if visible
+             * without masking (no such annotation)
+             */
+            if (am != null) {
+                _addMixUnders(m, am);
+                /* Otherwise will have precedence, but must wait
+                 * until we find the real method (mixIn methods are
+                 * just placeholder, can't be called)
+                 */
+            } else {
+                // Well, or, as per [Issue#515], multi-level merge within mixins...
+                    mixIns.add(_constructMethod(m));
+            }
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+public abstract class JsonObjectCodec<T> {
+
+private final ObjectMapper objectMapper;
+private final Class<T> clazz;
+
+public JsonObjectCodec(ObjectMapper objectMapper, Class<T> clazz) {
+this.objectMapper = objectMapper;
+this.clazz = clazz;
+}
+
+public T decode(String jsonStr) throws IOException {
+return objectMapper.readValue(jsonStr, clazz);
+}
+
+public String encode(T object) throws JsonProcessingException {
+return objectMapper.writeValueAsString(object);
+}
+}
+```
+# Mixin annotations lost when using a mixin class hierarchy with non-mixin interfaces
+In summary, mixin annotations are lost when Jackson scans a parent mixin class with Json annotations followed by an interface implemented by the parent mixin class that does not have the same Json annotations.
+
+## Detail
+
+Consider the following class structure:
+
+```java
+public interface Contact {
+String getCity();
+}
+
+public class ContactImpl implements Contact {
+@Override
+public String getCity() {
+return "New York";
+}
+}
+
+public class ContactMixin implements Contact {
+@JsonProperty("thecity")
+public String getCity() {
+return null;
+}
+}
+
+public interface Person extends Contact {}
+
+public class PersonImpl extends ContactImpl implements Person {}
+
+public class PersonMixin extends ContactMixin implements Person {}
+```
+
+If you configure a module like this:
+
+```java
+ObjectMapper objectMapper = new ObjectMapper();
+JavaModule module = new JavaModule();
+module.setMixInAnnotation(Person.class, PersonMixin.class);
+objectMapper.registerModule(module);
+```
+
+And then serialize a `PersonImpl` instance, the resulting JSON will not include the `city` property because the mixin annotation is lost when Jackson scans the parent mixin class after the non-mixin interface.
+
+```java
+System.out.println(new JsonObjectCodec<>(objectMapper, PersonImpl.class).encode(new PersonImpl()));
+```
+
+The output will be:
+
+```json
+{"name":null,"addresses":[]}
+```
+
+The workaround for this issue is to explicitly add any parent mixins to the module. In this case, adding `ContactMixin` to the module solves the problem.
+
+```java
+JavaModule module = new JavaModule();
+module.setMixInAnnotation(Contact.class, ContactMixin.class);
+module.setMixInAnnotation(Person.class, PersonMixin.class);
+objectMapper.registerModule(module);
+```
+
+With these changes, the `city` property will correctly be included in the resulting JSON:
+
+```json
+{"name":null,"addresses":[],"thecity":"New York"}
+```
+
+Note: This issue was corrected in Jackson versions later than 2.8.3. If you're using an older version, consider upgrading to avoid potential compatibility issues.
+

@@ -1,0 +1,158 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# Mixin annotations lost when using a mixin class hierarchy with non-mixin interfaces
+In summary, mixin annotations are lost when Jackson scans a parent mixin class with Json annotations followed by an interface implemented by the parent mixin class that does not have the same Json annotations.
+Jackson version: 2.4.0
+Detail:
+I have the following class structure
+public interface Contact {
+    String getCity();
+}
+
+public class ContactImpl implements Contact {
+    public String getCity() { ... }
+}
+
+public class ContactMixin implements Contact {
+    @JsonProperty
+    public String getCity() { return null; }
+}
+
+public interface Person extends Contact {}
+
+public class PersonImpl extends ContactImpl implements Person {}
+
+public class PersonMixin extends ContactMixin implements Person {}
+and I configure a module as
+// There are other getters/properties in the Impl class that do not need to be serialized and so
+// I am using the Mixin to match the interface and explicitly annotate all the inherited methods
+module.disable(MapperFeature.ALLOW_FINAL_FIELDS_AS_MUTATORS)
+    .disable(MapperFeature.AUTO_DETECT_FIELDS)
+    .disable(MapperFeature.AUTO_DETECT_GETTERS)
+    .disable(MapperFeature.AUTO_DETECT_IS_GETTERS)
+    .disable(MapperFeature.INFER_PROPERTY_MUTATORS);
+module.setMixInAnnotation(Person.class, PersonMixin.class);
+When a PersonImpl instance is serialized, city is not included.
+I debugged the code and this is what happens:
+In AnnotatedClass.resolveMemberMethods() the supertypes of PersonImpl are [Person.class, Contact.class, ContactImpl.class] in that order.
+It starts with Person for which it finds PersonMixin and proceeds to AnnotatedClass._addMethodMixIns(). Here the parents list has [PersonMixin, ContactMixin, Contact]. When it processes ContactMixin it adds getCity() with the JsonProperty annotation. Then it processes Contact, doesn't find getCity() in methods map and so creates a new AnnotatedMethod for getCity() with the one from the interface which has no annotation which replaces the one from ContactMixin
+The workaround for this issue is to explicitly add any parent mixins to the module i.e.
+module.setMixInAnnotation(Contact.class, ContactMixin.class);
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/introspect/AnnotatedClass.java):
+```java
+protected void _addMethodMixIns(Class<?> targetClass, AnnotatedMethodMap methods,
+        Class<?> mixInCls, AnnotatedMethodMap mixIns)
+{
+    List<Class<?>> parents = new ArrayList<Class<?>>();
+    parents.add(mixInCls);
+    ClassUtil.findSuperTypes(mixInCls, targetClass, parents);
+    for (Class<?> mixin : parents) {
+        for (Method m : mixin.getDeclaredMethods()) {
+            if (!_isIncludableMemberMethod(m)) {
+                continue;
+            }
+            AnnotatedMethod am = methods.find(m);
+            /* Do we already have a method to augment (from sub-class
+             * that will mask this mixIn)? If so, add if visible
+             * without masking (no such annotation)
+             */
+            if (am != null) {
+                _addMixUnders(m, am);
+                /* Otherwise will have precedence, but must wait
+                 * until we find the real method (mixIn methods are
+                 * just placeholder, can't be called)
+                 */
+            } else {
+                // Well, or, as per [Issue#515], multi-level merge within mixins...
+                    mixIns.add(_constructMethod(m));
+            }
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+import com.fasterxml.jackson.annotation.JsonAnyGetter;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonTypeInfo;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.codehaus.jackson.annotate.JsonAutoDetect;
+import org.codehaus.jackson.map.SerializationConfig;
+import org.codehaus.jackson.map.annotate.JsonSerialize;
+import org.springframework.beans.factory.InitializingBean;
+import org.springframework.stereotype.Service;
+
+import java.io.*;
+import java.lang.reflect.InvocationTargetException;
+import java.util.Arrays;
+
+/**
+ * Created by heibai on 16-7-13.
+ */
+@Service("objectToFileService")
+public class ObjectToFileService implements InitializingBean {
+
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+
+    /**
+     * Read value from file, convert into object.
+     *
+     * @param file
+     *         path to file.
+     * @param clazz
+     *         class type.
+     * @return T
+     */
+    public <T> T readValueFromFile(final File file, final Class<T> clazz) throws IOException {
+        return OBJECT_MAPPER.readValue(file, clazz);
+    }
+
+    /**
+     * Write data into json format string.
+     *
+     * @param t
+     *         object.
+     * @return String
+     */
+    public String writeDataToString(final Object t) throws IOException {
+        return OBJECT_MAPPER.writeValueAsString(t);
+    }
+
+    /**
+     * Save object data into file.
+     *
+     * @param t
+     *         object.
+     * @throws IOException
+     */
+    public  <T> void saveDataIntoFile(final T t, final String fileName) throws IOException {
+        FileOutputStream outputStream = new FileOutputStream(new File(fileName));
+        try {
+            OBJECT_MAPPER.writerWithDefaultPrettyPrinter().writeValue(outputStream, t);
+        } finally {
+            outputStream.close();
+        }
+    }
+
+    @Override
+    public void afterPropertiesSet() throws Exception {
+       ObjectMapper o = new ObjectMapper();
+        o.setVisibilityChecker(o.getSerializationConfig().getDefaultVisibilityChecker()
+                .withIsGetter(JsonAutoDetect.Visibility.NONE)
+                .withCreatorVisibility(JsonAutoDetect.Visibility.ANY));
+
+    }
+}
+```
+# Relevant Explanation
+This problem was due to various mixin annotations conflicting with each other. To solve this, we should set the visibility checker in `afterPropertiesSet()` to disable isGetter detection. Now, there won't be conflicts between different mixin annotations.
+# Detailed Description
+We start with an object $x$ being instantiated from a superclass $C$, then inherit from class $B$. The property $b_1$ of object $x$ is overridden in class $A$. This means that class $A$ defines its own implementation of the property $b_1$. At the same time, class $A$ also inherits from class $B$. In this case, the property defined in class $B$ is hidden by the one defined in class $A$.
+
+Let $m_1$ and $m_2$ be two methods, both have the same name but different implementations. If class $B$ contains $m_1$ and class $A$ contains $m_2$, then $m_2$ will hide $m_1$, meaning that when we call $m_1$ on an object of type $A$, we will actually call $m_2$. Conversely, if class $A$ contains $m_1$ and class $B$ contains $m_2$, then $m_1$ will hide $m_2$.
+
+In short, if $m_i \ (i = 1, 2)$ have the same name but different implementations, and if class $B_i \ (i = 1, 2)$ contains $m_i$, then $m_i$ will hide the $m_

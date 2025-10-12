@@ -1,0 +1,129 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# Incorrect handling of self-closing tags noframes, style and title cause remainder of document to be html-escaped
+Given the input:
+<html>
+<head>
+	<style />   <!-- < - - this is the culprit -->
+</head>
+<body>
+	<p>Whatever</p>
+</body>
+</html>
+JSoup 1.8.2 and also http://try.jsoup.org/~lJwWpjXYUSTBeBZhdEnS3Mt56g4 will produce:
+    <html>
+     <head> 
+      <style></style>
+     </head>
+     <body>
+       &lt;/head&gt; &lt;body&gt; &lt;p&gt;Whatever&lt;/p&gt; &lt;/body&gt; &lt;/html&gt;
+     </body>
+    </html>
+With <title/> instead of <style/>, the result is different but still wrong (http://try.jsoup.org/~BZ3uoMki-r904fZxUOWJgLJO7r8 ):
+<html>
+ <head> 
+  <title></title>
+ </head>
+ <body>
+   &lt;/head&gt;  
+  <p>Whatever</p>  
+ </body>
+</html>
+That weirdness was fixed for <script> with Issue #305: http://try.jsoup.org/~3Ms6TQCrrdaA_uPgxgURYYvwFAg
+<html>
+ <head> 
+  <script></script> 
+ </head> 
+ <body> 
+  <p>Whatever</p>  
+ </body>
+</html>
+Looking at the source, it seems only the HtmlTreeBuilderState handling for <noframes>, <style> and <title> in the methods handleRawText and handleRcData doesn't get along with the self-closing tags.
+Any other tagname I've checked (and I tried to cover all branches of that case StartTag switch) results in a good parse similar to the <script> case, which is what I'd expect.
+Thanks for looking into this!
+This is an incorrect Java code (src/main/java/org/jsoup/parser/HtmlTreeBuilderState.java):
+```java
+private static void handleRawtext(Token.StartTag startTag, HtmlTreeBuilder tb) {
+    tb.insert(startTag);
+    tb.tokeniser.transition(TokeniserState.Rawtext);
+    tb.markInsertionMode();
+    tb.transition(Text);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+// Note that comments on src/test/java/org/jsoup/integration/ParseTest.java line 380 could provide some pointers as well.
+
+@Test
+public void testSelfClosingTags() throws Exception {
+  Document doc = Jsoup.parse("<a href=\"foo\"/> <br /> <img src=\"bar\"/>");
+  assertEquals("<html><head></head><body><a href=\"foo\" rel=\"nofollow\"></a> <br /> <img src=\"bar\"/></body></html>", doc.html());
+}
+```
+# Explanation
+These tests ensure that certain HTML elements render correctly when used as self-closing tags. To make sure these elements work as intended, we need to adjust `handleRawText` function under the condition that the next token is EOF. We accomplish this by moving our code to this branch, replacing raw text mode, and adding an unconditional return from transition functions. After making these changes, restarting the server, and rerunning the failing unit tests, they should pass now.
+# Code
+```java
+// Repaired java code (src/main/java/org/jsoup/parser/HtmlTreeBuilderState.java):
+
+private static Token.Tag handleRawText(Token.StartTag startTag, HtmlTreeBuilder tb) {
+    Token token = new Token(Token.Tag.RAWTEXT, startTag.attributes(), startTag.toString());
+    if (!tb.insert(token)) {
+        // Insert failed, restore state before insertion. This ensures that the output is consistent even if an error occurs during the insertion process.
+        tb.restoreUntilLastMark();
+        return null;
+    }
+    
+    Token.Tag tagName = token.isEndOfDocument() ? Token.Tag.EOF : Token.Tag.valueOf(startTag.tagName().toUpperCase());
+
+    if (tb.parserSettings.isSupportSelfCloseTags()) {            
+        
+            if(!startTag.hasAttributeKey("id")&&tagName == Token.Tag.STYLE||tagName == Token.Tag.TITLE||tagName == Token.Tag.NOFRAMES){               
+              if(!tb.tokeniser.input.subSequence(tb.tokeniser.tokenOffset,(int)Math.min(tb.tokeniser.tokenOffset+6,tb.tokeniser.input.length())).equals("/>")){         
+                 boolean b=true;
+                  while(b){                     
+                     int c = tb.tokeniser.advance();
+                    if(Character.toLowerCase((char)c)==tagName.name().toLowerCase().charAt(0)){                      
+                       tb.tokeniser.backup();
+                        b=false;
+                    }else if(c==-1){
+                         return null;
+                    }
+                   }                
+              }
+              
+              tb.tokeniser.unexpectedCharacterError(tagName.name());
+              return null;
+           }     
+          
+          
+            if ((tagName == Token.Tag.BR || tagName == Token.Tag.HR || tagName == Token.Tag.IMG || tagName == Token.Tag.INPUT || tagName == Token.Tag.LINK || tagName == Token.Tag.BASE || tagName == Token.Tag.META)) {
+                tb.tokeniser.backUpToStartTag(tagName.name());
+            } else if(tagName == Token.Tag.SCRIPT){
+                  String scriptContent="";
+                  boolean b=true;
+                  int c=tb.tokeniser.tokenOffset;
+                  do{
+                      if(c>=tb.tokeniser.input.length()){
+                          break;
+                      }
+                      char cha=tb.tokeniser.input.charAt(c++);
+                      if(cha=='<'){
+                          b=false;
+                      }
+                      if(b){
+                          scriptContent+=cha;
+                      }
+                  }while(true);
+                  Token scriptToken=new Token(Token.Tag.SCRIPT,"",scriptContent);
+                  tb.tokeniser.advance();
+                  tb.tokeniser.skipSpaces();
+                  tb.tokeniser.expect('/');
+                  tb.tokeniser.advance();
+                  tb.tokeniser.skipSpaces();
+                  tb.tokeniser.expect('>');
+

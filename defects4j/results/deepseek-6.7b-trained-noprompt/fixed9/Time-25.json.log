@@ -1,0 +1,147 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# #90 DateTimeZone.getOffsetFromLocal error during DST transition
+This may be a failure of my understanding, but the comments in DateTimeZone.getOffsetFromLocal lead me to believe that if an ambiguous local time is given, the offset corresponding to the later of the two possible UTC instants will be returned - i.e. the greater offset.
+This doesn't appear to tally with my experience. In fall 2009, America/Los_Angeles changed from -7 to -8 at 2am wall time on November 11. Thus 2am became 1am - so 1:30am is ambiguous. I would therefore expect that constructing a DateTime for November 11th, 1:30am would give an instant corresponding with the later value (i.e. 9:30am UTC). This appears not to be the case:
+import org.joda.time.DateTime;
+import org.joda.time.DateTimeZone;
+public class TzTest {
+public static void main(String[] args) throws Exception {
+DateTimeZone zone = DateTimeZone.forID("America/Los_Angeles");
+DateTime when1 = new DateTime(2009, 11, 1, 0, 30, 0, 0, zone);
+DateTime when2 = new DateTime(2009, 11, 1, 1, 30, 0, 0, zone);
+DateTime when3 = new DateTime(2009, 11, 1, 2, 30, 0, 0, zone);
+System.out.println(when1);
+System.out.println(when2);
+System.out.println(when3);
+}
+}
+Results:
+2009-11-01T00:30:00.000-07:00 // Correct
+2009-11-01T01:30:00.000-07:00 // Should be -08:00
+2009-11-01T02:30:00.000-08:00 // Correct
+This is an incorrect Java code (src/main/java/org/joda/time/DateTimeZone.java):
+```java
+public int getOffsetFromLocal(long instantLocal) {
+    // get the offset at instantLocal (first estimate)
+    final int offsetLocal = getOffset(instantLocal);
+    // adjust instantLocal using the estimate and recalc the offset
+    final long instantAdjusted = instantLocal - offsetLocal;
+    final int offsetAdjusted = getOffset(instantAdjusted);
+    // if the offsets differ, we must be near a DST boundary
+    if (offsetLocal != offsetAdjusted) {
+        // we need to ensure that time is always after the DST gap
+        // this happens naturally for positive offsets, but not for negative
+        if ((offsetLocal - offsetAdjusted) < 0) {
+            // if we just return offsetAdjusted then the time is pushed
+            // back before the transition, whereas it should be
+            // on or after the transition
+            long nextLocal = nextTransition(instantAdjusted);
+            long nextAdjusted = nextTransition(instantLocal - offsetAdjusted);
+            if (nextLocal != nextAdjusted) {
+                return offsetLocal;
+            }
+        }
+    }
+    return offsetAdjusted;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+package test;
+
+import java.util.*;
+
+import org.joda.time.*;
+
+/**
+ * Illustrate date/time math, conversions, and formatting.
+ */
+public class Main
+{
+    public static void main(String... args)
+    {
+    	DateTimeZone zonePacific = DateTimeZone.forID("America/Los_Angeles");        
+        System.out.println();
+        System.out.println("Now:"+new DateTime());  
+        
+        String[] ids = DateTimeZone.getAvailableIDs();
+        Arrays.sort(ids);
+        for (String id : ids){
+           System.out.print(id + ", ");
+        }            
+        DateTime dtx = new DateTime(2009,11,1,15,30,zonePacific);        
+       // System.out.println("dtx.toString(): " + dtx.toString());              
+        DateTime dtxUtc =  dtx.withZone(DateTimeZone.UTC);     
+        System.out.println("dtxUtc: " + dtxUtc.toString());
+        System.out.println("dtxZ: " + dtx.toInstant().getMillis() );         
+        System.out.println("zonePacific.convertLocalToUTC(dtx.getMillis()) " + zonePacific.convertLocalToUTC(dtx.getMillis()));      
+        
+        
+        List<Integer> offsets = new ArrayList<Integer>();        
+        DateTime dtloop = new DateTime(2009,11,14,1,0,0,0,zonePacific);
+        while(!dtloop.equals(dtx)){        
+            DateTime dtutcoffset  = dtloop.withZone(DateTimeZone.UTC);                            
+            offsets.add(dtutcoffset.getHourOfDay()- dtloop.getHourOfDay());                        
+            dtloop=  dtloop.plusMinutes(1);
+                      
+        };
+        
+        Collections.sort(offsets);
+        for (int offset : offsets){
+            System.out.print(offset + ", ");
+            
+        };             
+        
+                
+                
+        
+        
+        
+    }
+}
+```
+# DateTimeZone.convertLocalToUTC
+```java
+   public long convertLocalToUTC(long localMillis) {
+        checkOpen();
+        int index = findIndexForLocalTime(localMillis, false);
+        Transition prev = transitions[index];
+        long savedPreviousFixedDateMillis = 0;
+        if (prev != null && prev.previousRuleIndex != 0) {
+            Transition previousPrev = transitions[prev.previousRuleIndex];
+            if (!previousPrev.isGap()) {
+                // Save the fixed date millisecond part of the previous rule, which won't change.
+                savedPreviousFixedDateMillis = (previousPrev.end - TimeZone.getRawOffset()) % MILLIS_PER_DAY;
+            } else {
+                // If there is no previous valid timestamp then use the original provided value
+                // since a DstSavingsTime cannot map from before the start of the time period
+                long baseLocalTime = previousLocalTime(localMillis);
+                return baseLocalTime >>> MILLIS_INTO_DAYS << UNIX_DAY_SHIFT |
+                        (baseLocalTime & MILLIS_MASK) - m_rawOffset;
+            }
+        }
+        // The result can potentially cross over midnight due to time changes between rules.
+        long result = prev == null ? localMillis : prev.start;
+        boolean leapInEffect = false;
+        int prevRuleStart;
+        int prevRuleEnd;
+        long extraDuration = Long.MIN_VALUE;
+        long endLocal = localMillis;
+        while (true) {
+            Transition curr = transitions[++index];
+            // Do not process invalid times.
+            if (!curr.valid) {
+                continue;
+            }
+            // Check if this transition represents a gap.
+            if (curr.isDstSavingsTime() || (!curr.leap && leapInEffect)) {
+                if (!curr.isGap()) {
+                    leapInEffect = false;
+                }
+                // Compute the duration that ends up applying as DST or has been removed from effect.
+                prevRuleStart =

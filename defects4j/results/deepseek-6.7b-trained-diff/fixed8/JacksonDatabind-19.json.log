@@ -1,0 +1,96 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# Force value coercion for java.util.Properties, so that values are Strings
+Currently there is no custom handling for java.util.Properties, and although it is possible to use it (since it really is a Map under the hood), results are only good if values are already Strings.
+The problem here is that Properties is actually declared as Map<String,Object>, probably due to backwards-compatibility constraints.
+But Jackson should know better: perhaps by TypeFactory tweaking parameterizations a bit?
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/type/TypeFactory.java):
+```java
+private JavaType _mapType(Class<?> rawClass)
+{
+    // 28-May-2015, tatu: Properties are special, as per [databind#810]
+    JavaType[] typeParams = findTypeParameters(rawClass, Map.class);
+    // ok to have no types ("raw")
+    if (typeParams == null) {
+        return MapType.construct(rawClass, _unknownType(), _unknownType());
+    }
+    // but exactly 2 types if any found
+    if (typeParams.length != 2) {
+        throw new IllegalArgumentException("Strange Map type "+rawClass.getName()+": can not determine type parameters");
+    }
+    return MapType.construct(rawClass, typeParams[0], typeParams[1]);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+public static class PropertyType extends SimpleBeanPropertyDefinition {
+    private final Class<?> type;
+
+    public PropertyType(Field field, Class<?> cls) {
+      super(field);
+      this.type = cls;
+    }
+  
+    @Override
+    public Object getValue(Object bean) throws BeanPropertyException {
+      try {
+          Method method = bean.getClass().getMethod(_getReadMethodName());
+          return method.invoke(bean).toString();
+      } catch (Exception e) {
+          throw new IllegalStateException(e);
+      }
+    }
+
+    @Override
+    public void setValue(Object bean, Object value) throws BeanPropertyException {
+      try {
+          Method method = bean.getClass().getDeclaredMethod(_getWriteMethodName(), type);
+          method.invoke(bean, value);
+      } catch (Exception e) {
+          throw new IllegalStateException(e);
+      }
+    }
+}
+
+static class MyJavaModule extends JavaModule {
+    @Override
+    public String getModuleName() {
+        return "My Module";
+    }
+
+    @Override
+    public List<BeanPropertyDefinition> updateProps(Map<String, Class<?>> knownTypes,
+            Set<String> typeNames, List<BeanPropertyDefinition> props) {
+        
+        List<BeanPropertyDefinition> result = new ArrayList<>();
+        
+        for (BeanPropertyDefinition prop : props) {
+            
+            boolean isIncluded = false;
+            for (String name : typeNames) {
+                if (name.equals(prop.getType().getRawClass())) {
+                    isIncluded = true;
+                }
+            }
+            
+            if (!isIncluded && knownTypes.containsKey(prop.getType().getRawClass().getName())) {
+                Field f = ((JavaTypeParameter)_paramForType(knownTypes, (ParameterizedType) prop.getType())).getField();
+                result.add(new PropertyType(f, knownTypes.get(f.getGenericType().getClass().getName())));
+            } else {
+                result.add(prop);
+            }
+        }
+        
+        return result;
+    }
+}
+
+// use the module when initializing the object mapper:
+objectMapper.registerModule(new MyJavaModule());
+```
+It's a little bit of a hack, because we overwrite some internal behavior, but in combination with some modifications in `updateProps` method it works fine. The idea is that we create our own version of BeanPropertyDefinition which forces every value into a string, before they even reach serialization stage. This means that all data from the properties file is loaded as strings, regardless what was stored initially. We also need to register our custom JavaModule when creating the ObjectMapper.
+

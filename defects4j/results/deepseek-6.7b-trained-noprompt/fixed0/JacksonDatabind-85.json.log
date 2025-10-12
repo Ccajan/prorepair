@@ -1,0 +1,171 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# DateTimeSerializerBase ignores configured date format when creating contextual
+DateTimeSerializerBase#createContextual creates a new serializer with StdDateFormat.DATE_FORMAT_STR_ISO8601 format instead of re-using the actual format that may have been specified on the configuration. See the following code:
+final String pattern = format.hasPattern()
+                                    ? format.getPattern()
+                                    : StdDateFormat.DATE_FORMAT_STR_ISO8601;
+
+Using the @JsonFormat annotation on a field will therefore reset the format to Jackson's default even if the annotation doesn't specify any custom format.
+DateBasedDeserializer#createContextual behaves differently and tries to re-use the configured format:
+DateFormat df = ctxt.getConfig().getDateFormat();
+// one shortcut: with our custom format, can simplify handling a bit
+if (df.getClass() == StdDateFormat.class) {
+   ...
+   StdDateFormat std = (StdDateFormat) df;
+   std = std.withTimeZone(tz);
+   ...
+} else {
+  // otherwise need to clone, re-set timezone:
+  df = (DateFormat) df.clone();
+  df.setTimeZone(tz);
+}
+
+Shouldn't the serializer follow the same approach ?
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/ser/std/DateTimeSerializerBase.java):
+```java
+    public JsonSerializer<?> createContextual(SerializerProvider serializers,
+            BeanProperty property) throws JsonMappingException
+    {
+        if (property == null) {
+            return this;
+        }
+        JsonFormat.Value format = findFormatOverrides(serializers, property, handledType());
+        if (format == null) {
+            return this;
+        }
+        // Simple case first: serialize as numeric timestamp?
+        JsonFormat.Shape shape = format.getShape();
+        if (shape.isNumeric()) {
+            return withFormat(Boolean.TRUE, null);
+        }
+
+        // 08-Jun-2017, tatu: With [databind#1648], this gets bit tricky..
+        // First: custom pattern will override things
+                if ((shape == JsonFormat.Shape.STRING) || format.hasPattern()
+                                || format.hasLocale() || format.hasTimeZone()) {
+                    TimeZone tz = format.getTimeZone();
+                    final String pattern = format.hasPattern()
+                                    ? format.getPattern()
+                                    : StdDateFormat.DATE_FORMAT_STR_ISO8601;
+            final Locale loc = format.hasLocale()
+                            ? format.getLocale()
+                            : serializers.getLocale();
+                    SimpleDateFormat df = new SimpleDateFormat(pattern, loc);
+                    if (tz == null) {
+                        tz = serializers.getTimeZone();
+                    }
+            df.setTimeZone(tz);
+            return withFormat(Boolean.FALSE, df);
+        }
+
+        // Otherwise, need one of these changes:
+
+
+        // Jackson's own `StdDateFormat` is quite easy to deal with...
+
+        // 08-Jun-2017, tatu: Unfortunately there's no generally usable
+        //    mechanism for changing `DateFormat` instances (or even clone()ing)
+        //    So: require it be `SimpleDateFormat`; can't config other types
+//            serializers.reportBadDefinition(handledType(), String.format(
+            // Ugh. No way to change `Locale`, create copy; must re-crete completely:
+        return this;
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+public class MyDateTimeSerializer extends DateTimeSerializerBase<Date> {
+
+    private static final long serialVersionUID = 1L;
+    
+    protected static int STATE_USED = -100;
+        
+    protected Format _formatter = null;
+    protected boolean _leniency = false;
+
+    /**
+     * State that indicates whether a parsed Date should contain both date and
+     * time parts, or just time part: <code>3</code> means full date,
+     * <code>0</code> (default) means just time part. This is used only when we
+     * use ISO 8601 style dates.
+     */
+    protected int _stateFull = 3;
+
+    public MyDateTimeSerializer() {
+        super(Date.class, JsonToken.VALUE_STRING);
+    }
+
+    /*
+    /**********************************************************
+    /* Public API methods
+    /**********************************************************
+     */
+
+    public void setLeniency(boolean lenient) {
+        _leniency = lenient;
+    }
+
+    @Override
+    public JsonSerializer<?> createContextual(SerializerProvider provider, BeanProperty property)
+            throws JsonMappingException
+    {
+        // If we are dealing with standard date/time formats like "yyyy-MM-dd", etc., let's not override provided formatting
+        if (_format != null && _format instanceof StdDateFormat) {
+            return this;
+        }
+        
+        final DateFormat dformat = provider.getConfig().getDateFormat();
+        
+        // If we were created using explicit format from JsonFormat annotation
+        if(_format != null){
+            return new MyDateTimeSerializer((MyDateFormat)_format).setLeniency(_leniency).setState(_stateFull);
+        }
+        
+        // Else try to create a date based on given format
+        if(dformat instanceof SimpleDateFormat) {
+            try{
+                
+                SimpleDateFormat sdateFormat = (SimpleDateFormat)dformat;
+                    
+                ThreadLocalParser _localFormatter = _parserThreadLocal.get();
+            
+                if(_localFormatter == null) {
+                    _localFormatter = new ThreadLocalParser(sdateFormat);
+                    _parserThreadLocal.set(_localFormatter);
+                } else {
+                    if(!Objects.equals(_localFormatter._format, sdateFormat)) {
+                        _localFormatter._format = sdateFormat;
+                    }
+                }
+         
+                MyDateTimeSerializer s = new MyDateTimeSerializer((MyDateFormat)new MyDateFormat(sdateFormat));
+
+                return s.setLeniency(_leniency).setState(_stateFull);
+                 
+            } catch(Throwable e) {}
+        }
+        
+        // Return fallback serializer in all other cases
+        return this;
+    }
+
+    @Override
+    public Class<Date> handledType() {
+        return Date.class;
+    }
+}
+```
+#DateTimeSerializerBase ignores configured date format when creating contextual
+#DateTimeSerializerBase doesnt use the correct Date format. It always returns the default StdDateFormat regardless of what is specified.
+#If a Serialization is requested with Custom annotation, then a fresh instance of DateTimeSerializer should be returned instead.
+#I am going to add checks at the beginning of the method to determine if custom DateFormat has been supplied and if so, then a brand new instance of MyDateTimeSerializer should be returned with desired settings applied.
+#I hope this helps!
+#The original intention was preserved but the code has been modified to include a fresh instance of MyDateTimeSerializer rather than returning an instance with adjusted parameters. The creation of the new serializer also now uses the explicitly supplied format rather than assuming a default.
+#This was done under the assumption that the current implementation fails to account for manually supplied formats when creating new instances.
+#Now a new instance of MyDateTimeSerializer is created based on the user specified format while leaving the functionality of checking and converting date format to standard date formats untouched.
+#However, a possible caveat is that if another thread later calls getConfig().getDateFormat() during its execution, it could give back a different value causing the serializer to behave differently (in terms of date/time output), which may not match users expectations.
+#Since MyDateTimeSerializer uses SimpleDateFormat internally it shouldn't cause issues with concurrent threads unless the shared SimpleDateFormat isn't thread safe. But since SimpleDateFormat itself is thread safe I didn't think about that problem. Yet, it might be worthwhile to make sure to properly sync

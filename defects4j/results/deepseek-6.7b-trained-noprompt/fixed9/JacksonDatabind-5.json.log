@@ -1,0 +1,195 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# Mixin annotations lost when using a mixin class hierarchy with non-mixin interfaces
+In summary, mixin annotations are lost when Jackson scans a parent mixin class with Json annotations followed by an interface implemented by the parent mixin class that does not have the same Json annotations.
+Jackson version: 2.4.0
+Detail:
+I have the following class structure
+public interface Contact {
+    String getCity();
+}
+
+public class ContactImpl implements Contact {
+    public String getCity() { ... }
+}
+
+public class ContactMixin implements Contact {
+    @JsonProperty
+    public String getCity() { return null; }
+}
+
+public interface Person extends Contact {}
+
+public class PersonImpl extends ContactImpl implements Person {}
+
+public class PersonMixin extends ContactMixin implements Person {}
+and I configure a module as
+// There are other getters/properties in the Impl class that do not need to be serialized and so
+// I am using the Mixin to match the interface and explicitly annotate all the inherited methods
+module.disable(MapperFeature.ALLOW_FINAL_FIELDS_AS_MUTATORS)
+    .disable(MapperFeature.AUTO_DETECT_FIELDS)
+    .disable(MapperFeature.AUTO_DETECT_GETTERS)
+    .disable(MapperFeature.AUTO_DETECT_IS_GETTERS)
+    .disable(MapperFeature.INFER_PROPERTY_MUTATORS);
+module.setMixInAnnotation(Person.class, PersonMixin.class);
+When a PersonImpl instance is serialized, city is not included.
+I debugged the code and this is what happens:
+In AnnotatedClass.resolveMemberMethods() the supertypes of PersonImpl are [Person.class, Contact.class, ContactImpl.class] in that order.
+It starts with Person for which it finds PersonMixin and proceeds to AnnotatedClass._addMethodMixIns(). Here the parents list has [PersonMixin, ContactMixin, Contact]. When it processes ContactMixin it adds getCity() with the JsonProperty annotation. Then it processes Contact, doesn't find getCity() in methods map and so creates a new AnnotatedMethod for getCity() with the one from the interface which has no annotation which replaces the one from ContactMixin
+The workaround for this issue is to explicitly add any parent mixins to the module i.e.
+module.setMixInAnnotation(Contact.class, ContactMixin.class);
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/introspect/AnnotatedClass.java):
+```java
+protected void _addMethodMixIns(Class<?> targetClass, AnnotatedMethodMap methods,
+        Class<?> mixInCls, AnnotatedMethodMap mixIns)
+{
+    List<Class<?>> parents = new ArrayList<Class<?>>();
+    parents.add(mixInCls);
+    ClassUtil.findSuperTypes(mixInCls, targetClass, parents);
+    for (Class<?> mixin : parents) {
+        for (Method m : mixin.getDeclaredMethods()) {
+            if (!_isIncludableMemberMethod(m)) {
+                continue;
+            }
+            AnnotatedMethod am = methods.find(m);
+            /* Do we already have a method to augment (from sub-class
+             * that will mask this mixIn)? If so, add if visible
+             * without masking (no such annotation)
+             */
+            if (am != null) {
+                _addMixUnders(m, am);
+                /* Otherwise will have precedence, but must wait
+                 * until we find the real method (mixIn methods are
+                 * just placeholder, can't be called)
+                 */
+            } else {
+                // Well, or, as per [Issue#515], multi-level merge within mixins...
+                    mixIns.add(_constructMethod(m));
+            }
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.io.*;
+public class Main {
+    
+    static ObjectMapper om = new ObjectMapper();
+    
+    public static void main(String[] args) throws IOException {
+        
+       // Create person object. 
+       Person p = new Person("New York");
+     
+        // Serialize object
+        om.writeValue(new File("person.json"), p);
+        System.out.println(om.writerWithDefaultPrettyPrinter().writeValueAsString(p));
+        
+        
+    }
+    
+    
+    public static abstract class Contact {
+        protected String city;
+        
+        public Contact(String city){
+           this.city = city;
+        }
+
+        @JsonProperty
+        public String getCity(){
+            return city;
+        }
+         
+    }
+    
+    
+    public static class Person extends Contact {
+        
+        public Person(String city) {
+            super(city);
+        }
+        
+    }
+}
+```
+# Mixin annotations lost when using a mixin class hierarchy with non-mixin interfaces
+## Summary
+Mixin annotations are lost when Jackson scans a parent mixin class with Json annotations followed by an interface implemented by the parent mixin class that does not have the same Json annotations. In your case, Jackson prioritizes the methods defined in the interface over those declared in the mixin classes. This discrepancy occurs because the type of the parent object determines the lookup order for methods.
+
+To rectify this, ensure that the `Contact` interface is also mixed. You could create another `ContactMixin` for the `Contact` interface to handle the common JSON properties across both classes. Afterwards, apply `@JsonTypeInfo` and `@JsonSubTypes` annotations on the `Contact` interface to indicate its type information. Finally, assign `@JsonSubTypes.Type` to each of the implementing classes.
+
+```java
+import com.fasterxml.jackson.annotation.*;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.io.File;
+import java.io.IOException;
+
+public class Main {
+
+    public static void main(String[] args) throws IOException {
+
+        // Set up object mapper
+        ObjectMapper objectMapper = new ObjectMapper();
+        objectMapper.enable(SerializationFeature.INDENT_OUTPUT);
+        objectMapper.disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
+
+        // Register mixins
+        SimpleModule module = new SimpleModule();
+        module.setMixInAnnotation(Contact.class, ContactMixin.class);
+        module.setMixInAnnotation(Person.class, PersonMixin.class);
+        objectMapper.registerModule(module);
+
+        // Create instances
+        Contact c = new ContactImpl("London");
+        Contact p = new PersonImpl("New York");
+
+        // Serialize instances
+        objectMapper.writeValue(new File("contact.json"), c);
+        objectMapper.writeValue(new File("person.json"), p);
+
+    }
+
+    @JsonTypeInfo(use = JsonTypeInfo.Id.NAME, include = JsonTypeInfo.As.WRAPPER_OBJECT)
+    @JsonSubTypes({
+            @JsonSubTypes.Type(value = ContactImpl.class),
+            @JsonSubTypes.Type(value = PersonImpl.class)})
+    public interface Contact {
+        String getCity();
+    }
+
+    public class ContactImpl implements Contact {
+        private final String city;
+        public ContactImpl(String city) { this.city = city; }
+        public String getCity() { return this.city; }
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public class ContactMixin {
+        @JsonCreator
+        public ContactMixin(@JsonProperty("city") String city) {
+            super();
+        }
+        @JsonProperty
+        public String getCity() {
+            return null;
+        }
+    }
+
+    public interface Person extends Contact {}
+
+    public class PersonImpl extends ContactImpl implements Person {}
+
+    public class PersonMixin extends ContactMixin implements Person {}
+
+}
+```
+
+By employing these adjustments, Mixin annotations should persist even through the use of a mixin class hierarchy with non-mixin interfaces, thus ensuring proper handling of JSON serial

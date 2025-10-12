@@ -1,0 +1,177 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# Resetting the default namespace causes a serious endless loop when requesting .asPath() on a node.
+sample smaller case:
+
+<...>
+ <b:foo xmlns:b="bla" xmlns="test111">    <!--  No nodes are placed in the tree within ns "test111" but the attribute is still there.-->
+  <b:bar>a</b:bar>                         <!-- is in ns 'bla' -->
+  <test xmlns=""></test>                   <!-- does not have a namespace -->
+ </b:foo>
+</...>
+
+when requesting .asPath() on the 'test' node, it loops in org.apache.commons.jxpath.ri.NamespaceResolver.getPrefix(NodePointer, String), 
+and if it didn't loop it would create a wrong xpath '//b:fo/null:test' DOMNodePointer.asPath().
+So I think that the fix should be in org.apache.commons.jxpath.ri.model.dom.DOMNodePointer.asPath()
+
+....
+                    String ln = DOMNodePointer.getLocalName(node);
+                    String nsURI = getNamespaceURI();
+                    if (nsURI == null) {
+                        buffer.append(ln);
+                        buffer.append('[');
+                        buffer.append(getRelativePositionByName()).append(']');
+                    }
+                    else {
+                        String prefix = getNamespaceResolver().getPrefix(nsURI);
+                        if (prefix != null) {
+...
+
+should become
+
+...
+                    String ln = DOMNodePointer.getLocalName(node);
+                    String nsURI = getNamespaceURI();
+                    if (nsURI == null || nsURI.length() == 0) { // check for empty string which means that the node doesn't have a namespace.
+                        buffer.append(ln);
+                        buffer.append('[');
+                        buffer.append(getRelativePositionByName()).append(']');
+                    }
+                    else {
+                        String prefix = getNamespaceResolver().getPrefix(nsURI);
+                        if (prefix != null) {
+...
+This is an incorrect Java code (src/java/org/apache/commons/jxpath/ri/model/dom/DOMNodePointer.java):
+```java
+public static String getNamespaceURI(Node node) {
+    if (node instanceof Document) {
+        node = ((Document) node).getDocumentElement();
+    }
+
+    Element element = (Element) node;
+
+    String uri = element.getNamespaceURI();
+    if (uri == null) {
+        String prefix = getPrefix(node);
+        String qname = prefix == null ? "xmlns" : "xmlns:" + prefix;
+
+        Node aNode = node;
+        while (aNode != null) {
+            if (aNode.getNodeType() == Node.ELEMENT_NODE) {
+                Attr attr = ((Element) aNode).getAttributeNode(qname);
+                if (attr != null) {
+                    return attr.getValue();
+                }
+            }
+            aNode = aNode.getParentNode();
+        }
+        return null;
+    }
+    return uri;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+import org.w3c.dom.Node;
+import org.w3c.dom.Element;
+import org.w3c.dom.Attr;
+
+public class DOMNodePointer implements NodePointer{
+
+private Node node;
+    
+    public DOMNodePointer(Node node){
+        this.node = node;
+    }
+@Override
+    public Object getValue(){
+       return node.getNodeValue();
+   }
+@Override
+    public void setValue(Object value){
+       node.setNodeValue((String)value);
+   }
+@Override
+    public String asPath(){
+      StringBuilder buffer = new StringBuilder();
+recursiveAsPath(buffer, this.node, true);
+return buffer.toString();
+}
+
+private boolean recursiveAsPath(StringBuilder buf, Node n, boolean force){
+        if (!force && n.getNodeType() != Node.ELEMENT_NODE){
+            return false;
+        }
+        
+        String ln = n.getLocalName();
+        String nsURI = getNamespaceURI(n);
+        
+        if (nsURI == null || nsURI.isEmpty()) {            
+            buf.insert(0,"/"+ln+"["+getIndex(n)+"]");
+            return true;
+        }else {
+            String prefix = NamespaceResolver.getInstance().getPrefix(nsURI);
+            if (prefix == null){
+                buf.insert(0,"/"+ln+"[namespace='"+nsURI+"']");
+            }else {
+                buf.insert(0,"/"+prefix+":"+ln+"[namespace='"+nsURI+"']");
+            }
+            if (n.getParentNode()==null){
+                return true;
+            }
+            return recursiveAsPath(buf, n.getParentNode(), false);
+        }
+    }
+ private int getIndex(Node context) {
+        Node sibling = context.getPreviousSibling();
+        if (sibling == null) {
+            return 1;
+        }
+        Node parent = context.getParentNode();
+        if (parent == null) {
+            return 1;
+        }
+        int i = 1;
+        while (sibling != null) {
+            if (sibling.getNodeType() == Node.ELEMENT_NODE) {
+                i++;
+            }
+            sibling = sibling.getNextSibling();
+        }
+        return i;
+    }
+ private String getNamespaceURI(Node node) {
+        if (node instanceof Document) {
+            node = ((Document) node).getDocumentElement();
+        }
+
+        Element element = (Element) node;
+
+        String uri = element.getNamespaceURI();
+        if (uri == null) {
+            String prefix = getPrefix(node);
+            String qname = prefix == null ? "xmlns" : "xmlns:" + prefix;
+
+            Node aNode = node;
+            while (aNode != null) {
+                if (aNode.getNodeType() == Node.ELEMENT_NODE) {
+                    Attr attr = ((Element) aNode).getAttributeNode(qname);
+                    if (attr != null) {
+                        return attr.getValue();
+                    }
+                }
+                aNode = aNode.getParentNode();
+            }
+            return null;
+        }
+        return uri;
+    }
+}
+```
+# Explanation of Changes
+The original code was having a bug where it would cause an endless loop when trying to call `.asPath()` on a node with no namespace. This had nothing to do with the `NamespaceResolver` or any other part of JXPath, but rather how namespaces were being handled in the overall XML structure. When calling `.asPath()`, we needed to handle nodes without a namespace differently from those with namespaces. If a node has no namespace, its local name alone is enough information to uniquely identify it in the entire document. So we need to add a special case for these nodes. Also, in order to avoid null pointers, we need to ensure that all calls to `getPrefix` are made before attempting to append anything to the path. Therefore, I changed the `if (nsURI == null)` clause to also consider cases where `nsURI.length() == 0`, which effectively handles the situation where a node has no namespace. After that, I modified the existing code to suit the newly added conditions.
+

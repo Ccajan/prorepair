@@ -1,0 +1,157 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# bad type inference for != undefined
+What steps will reproduce the problem?
+
+// ==ClosureCompiler==
+// @compilation_level ADVANCED_OPTIMIZATIONS
+// @output_file_name default.js
+// ==/ClosureCompiler==
+
+/** @param {string} x */
+function g(x) {}
+
+/** @param {undefined} x */
+function f(x) {
+  if (x != undefined) { g(x); }
+}
+
+What is the expected output? What do you see instead?
+
+JSC_DETERMINISTIC_TEST: condition always evaluates to false
+left : undefined
+right: undefined at line 6 character 6
+if (x != undefined) { g(x); }
+      ^
+JSC_TYPE_MISMATCH: actual parameter 1 of g does not match formal parameter
+found   : undefined
+required: string at line 6 character 24
+if (x != undefined) { g(x); }
+                        ^
+
+the second warning is bogus.
+This is an incorrect Java code (src/com/google/javascript/rhino/jstype/JSType.java):
+```java
+public TypePair getTypesUnderInequality(JSType that) {
+  // unions types
+  if (that instanceof UnionType) {
+    TypePair p = that.getTypesUnderInequality(this);
+    return new TypePair(p.typeB, p.typeA);
+  }
+
+  // other types
+  switch (this.testForEquality(that)) {
+    case TRUE:
+      return new TypePair(null, null);
+
+    case FALSE:
+    case UNKNOWN:
+      return new TypePair(this, that);
+  }
+
+  // switch case is exhaustive
+  throw new IllegalStateException();
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+public class TypesUtils {
+
+  private static JSType lookupNamedPropertyInParentScopes(ASTNode tree, JSType currentScope) {
+        PropertyTable table = currentScope.getProperties();
+        Identifier nodeId = tree.getFirstChild().getIdentifier();
+         if (table == null || !table.containsKey(nodeId)) {
+             return lookupNamedPropertyInParentScopes((BlockTree)currentScope.getParent(), currentScope.getParent());
+         } else {
+            return (JSType)table.get(nodeId).getBoundFunction();
+        }
+    }
+
+  public static int testForEquality(TypeA typeA, TypeB typeB){
+    
+        /* If either typeA or B is 'unknown', they can't be equal. */
+        if (typeA instanceof UnknownType || typeB instanceof UnknownType) {
+            return TestResult.FALSE;
+        }
+
+        /* If both types are 'null', then they must be equal. */
+        if ((typeA instanceof NullType && typeB instanceof NullType) ||
+                (typeA instanceof UndefinedType && typeB instanceof UndefinedType)) {
+            return TestResult.TRUE;
+        }
+
+        ...
+
+        /* If we got here, there was no reason the types could not be equal... */
+        return TestResult.UNKNOWN;
+  }
+
+  public static TypePair getTypesUnderInequality(JSType typeA, JSType typeB) {
+    // unions types
+    if (typeB instanceof UnionType) {
+      TypePair pair = getTypesUnderInequality(typeA, (UnionType)typeB);
+      return new TypePair(pair.second, pair.first);
+    }
+
+    // other types
+    switch (testForEquality(typeA, typeB)) {
+      case TRUE:
+        return new TypePair(null, null);
+      case FALSE:
+      case UNKNOWN:
+        return new TypePair(typeA, typeB);
+    }
+
+    // This really shouldn't happen unless there's some kind of error in the type checking rules above.
+    throw new IllegalStateException("Unknown result " + testForEquality(typeA, typeB));
+  }
+
+  public static String generateWarningMessage(String message, SourceFile source) {
+    int ln = source.getLineNumber(message);
+    String srcLine = source.getProgram().split("\n")[ln - 1].trim();
+    return ln + ": " + message.replaceAll(" at line [0-9]+ character [0-9]+", "").replace('\n', ' ')  + "\n" + srcLine + "\n";
+  }
+  
+  public static boolean isUndefinedOrNull(AstNode expr) {
+    if (!expr.isName() && !expr.isQualifiedRef()) {
+      return false;
+    }
+    try{
+      if(expr.isName() && Names.shouldRename(Names.findName(expr))) {
+        return false;
+      }
+      if (expr.isQualifiedRef() && expr.getNameCount() > 1) {
+        return false;
+      }
+    } catch(Throwable e) {
+      return false;
+    }
+    if (expr.isQualifiedRef()) {
+      AstNode leftPartOfQualifiedExpr = expr.getLeftHandSide();
+      return isUndefinedOrNull(leftPartOfQualifiedExpr);
+    }
+    String name = expr.getName();
+    if(!SourceFile.isPredefinedName(name)){
+      JSType t = lookupNamedPropertyInParentScopes(expr, (ScriptType)((AbstractCompiler)compiler).scope_);
+      if (t != null) {
+        if ("undefined".equals(name)) {
+          return true;
+        }else if ("null".equals(name)) {
+          return true;
+        }else if(t instanceof DeclaredGlobalVariableType ){
+          return  ((DeclaredGlobalVariableType)t ).getValue()==null||
+                  ((DeclaredGlobalVariableType)t ).getValue() instanceof UndefinedLiteral;
+        }
+      }
+    }
+    return false;
+  }
+
+}
+```
+# Explanation:
+To make Closure Compiler understand `!=` correctly for `undefined` or `null` values, one needs to override the default behavior of the

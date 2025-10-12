@@ -1,0 +1,181 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# DateTimeSerializerBase ignores configured date format when creating contextual
+DateTimeSerializerBase#createContextual creates a new serializer with StdDateFormat.DATE_FORMAT_STR_ISO8601 format instead of re-using the actual format that may have been specified on the configuration. See the following code:
+final String pattern = format.hasPattern()
+                                    ? format.getPattern()
+                                    : StdDateFormat.DATE_FORMAT_STR_ISO8601;
+
+Using the @JsonFormat annotation on a field will therefore reset the format to Jackson's default even if the annotation doesn't specify any custom format.
+DateBasedDeserializer#createContextual behaves differently and tries to re-use the configured format:
+DateFormat df = ctxt.getConfig().getDateFormat();
+// one shortcut: with our custom format, can simplify handling a bit
+if (df.getClass() == StdDateFormat.class) {
+   ...
+   StdDateFormat std = (StdDateFormat) df;
+   std = std.withTimeZone(tz);
+   ...
+} else {
+  // otherwise need to clone, re-set timezone:
+  df = (DateFormat) df.clone();
+  df.setTimeZone(tz);
+}
+
+Shouldn't the serializer follow the same approach ?
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/ser/std/DateTimeSerializerBase.java):
+```java
+    public JsonSerializer<?> createContextual(SerializerProvider serializers,
+            BeanProperty property) throws JsonMappingException
+    {
+        if (property == null) {
+            return this;
+        }
+        JsonFormat.Value format = findFormatOverrides(serializers, property, handledType());
+        if (format == null) {
+            return this;
+        }
+        // Simple case first: serialize as numeric timestamp?
+        JsonFormat.Shape shape = format.getShape();
+        if (shape.isNumeric()) {
+            return withFormat(Boolean.TRUE, null);
+        }
+
+        // 08-Jun-2017, tatu: With [databind#1648], this gets bit tricky..
+        // First: custom pattern will override things
+                if ((shape == JsonFormat.Shape.STRING) || format.hasPattern()
+                                || format.hasLocale() || format.hasTimeZone()) {
+                    TimeZone tz = format.getTimeZone();
+                    final String pattern = format.hasPattern()
+                                    ? format.getPattern()
+                                    : StdDateFormat.DATE_FORMAT_STR_ISO8601;
+            final Locale loc = format.hasLocale()
+                            ? format.getLocale()
+                            : serializers.getLocale();
+                    SimpleDateFormat df = new SimpleDateFormat(pattern, loc);
+                    if (tz == null) {
+                        tz = serializers.getTimeZone();
+                    }
+            df.setTimeZone(tz);
+            return withFormat(Boolean.FALSE, df);
+        }
+
+        // Otherwise, need one of these changes:
+
+
+        // Jackson's own `StdDateFormat` is quite easy to deal with...
+
+        // 08-Jun-2017, tatu: Unfortunately there's no generally usable
+        //    mechanism for changing `DateFormat` instances (or even clone()ing)
+        //    So: require it be `SimpleDateFormat`; can't config other types
+//            serializers.reportBadDefinition(handledType(), String.format(
+            // Ugh. No way to change `Locale`, create copy; must re-crete completely:
+        return this;
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+import com.fasterxml.jackson.annotation.JacksonAnnotation;
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.ObjectCodec;
+import com.fasterxml.jackson.databind.*;
+import com.fasterxml.jackson.databind.deser.std.UntypedObjectDeserializer;
+import com.fasterxml.jackson.databind.module.SimpleModule;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.IntNode;
+import com.fasterxml.jackson.databind.util.StdConverter;
+
+import java.io.IOException;
+import java.text.ParseException;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.Calendar;
+import java.util.GregorianCalendar;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class Main {
+
+    static Pattern pattern = Pattern.compile("\\b(\\d{3})(\\d)([a-z]{3})([a-z]+)(\\d{2})(\\d{3})");
+
+    public static void main(String[] args) {
+        ObjectMapper mapper = new ObjectMapper();
+        mapper.registerModule((new SimpleModule()).addSerializer(CustomData.class, new CustomSer()));
+
+        String jsonstr="{\"aaa\":\"359Bulgaria22061990\",\"bbb\":\"999Indonesia01012009\"}";
+
+        try {
+            System.out.println(mapper.readTree(jsonstr));
+
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+
+    }
+    @JacksonAnnotation
+    @Target({ FIELD, ANNOTATION_TYPE, CONSTRUCTOR, PARAMETER })
+    @Retention(RUNTIME)
+    @Documented
+    @interface CustomData {
+
+    }
+
+    static class CustomSer extends JsonSerializer<CustomData> {
+
+        @Override
+        public JsonNode serialize(CustomData value, JsonGenerator gen, SerializerProvider serializers) throws IOException {
+            Matcher matcher = pattern.matcher(value.toString());
+            ArrayNode arrNode = new ArrayNodeImpl(gen);
+            while (matcher.find()) {
+              IntNode intNode=  new IntNode(Integer.parseInt(matcher.group(1)));
+              arrNode.add(intNode);
+              
+                arrNode.add(matcher.group(2));
+                arrNode.add(matcher.group(3));
+                arrNode.add(matcher.group(4));
+                arrNode.add(matcher.group(5));
+                arrNode.add(matcher.group(6));
+                
+
+            }
+
+            return arrNode;
+
+
+        }
+
+        
+
+        
+    }
+}
+```
+# DateTimeSerializerBase should not ignore configured date format when creating contextual
+The original code seems to indicate that DateTimeSerializerBase ignores the configured date format when creating contextual. Let's repair this. We need to make sure that when creating contextual, the serializer uses the actual format that was specified on the configuration.
+
+Firstly, let's understand how the createContextual method works. This method mainly initializes the serialization process, specifically controlling the output format of the JSON string. The source code is as follows:
+
+```java
+@Override
+public JsonSerializer<?> createContextual(SerializerProvider prov, BeanProperty property)
+    throws JsonMappingException
+{
+    // Incorrect code here
+     if (property == null) {
+        return this;
+    }
+    JsonFormat.Value fmt = _findFormatOverrides(prov, property, Date.class);
+    if (fmt == null) {
+        return this;
+    }
+    // Correct code here
+     if

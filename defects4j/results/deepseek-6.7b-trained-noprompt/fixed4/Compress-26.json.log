@@ -1,0 +1,140 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# IOUtils.skip does not work as advertised
+I am trying to feed a TarInputStream from a CipherInputStream.
+It does not work, because IOUtils.skip() does not adhere to the contract it claims in javadoc:
+"     * <p>This method will only skip less than the requested number of
+
+bytes if the end of the input stream has been reached.</p>"
+
+However it does:
+            long skipped = input.skip(numToSkip);
+            if (skipped == 0) 
+{
+                break;
+            }
+
+And the input stream javadoc says:
+"     * This may result from any of a number of conditions; reaching end of file
+
+before <code>n</code> bytes have been skipped is only one possibility."
+
+In the case of CipherInputStream, it stops at the end of each byte buffer.
+If you check the IOUtils from colleagues at commons-io, they have considered this case in IOUtils.skip() where they use a read to skip through the stream.
+An optimized version could combine trying to skip, then read then trying to skip again.
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/utils/IOUtils.java):
+```java
+public static long skip(InputStream input, long numToSkip) throws IOException {
+    long available = numToSkip;
+    while (numToSkip > 0) {
+        long skipped = input.skip(numToSkip);
+        if (skipped == 0) {
+            break;
+        }
+        numToSkip -= skipped;
+    }
+        
+    return available - numToSkip;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+public static long skip(InputStream input, long numToSkip) throws IOException {
+    // Handle zero first, no point checking or calling
+    // skip when we don't need to move forward
+    if (numToSkip <= 0) {
+        return 0;
+    }
+    long totalBytesSkipped = 0L;
+    for (; ; ) {
+        final int nbRead = input.read();
+        if (nbRead < 1) {
+            break; // EOF Reached
+        }
+        totalBytesSkipped++;
+        numToSkip--;
+        if (numToSkip <= 0) {
+            break;
+        }
+    }
+    return totalBytesSkipped;
+}
+```
+# Explanation
+The original function breaks once EOF (end of file) is encountered, which does not necessarily mean we have fully moved "numToSkip" number of positions forward. The modified function ensures that we break after moving "numToSkip" position forward, ensuring that all required numbers of bytes were successfully skipped. It also handles cases where "numToSkip" equals zero at the start, avoiding unnecessary calls to `input.skip`.
+# Note
+While this approach does fix your issue, it relies on the assumption that each call to `input.read()` moves us forward one byte. If this assumption is false for your particular situation, consider using another form of loop to read until we reach our target skip size instead.
+# IOUtils.skip
+```java
+public static long skip(InputStream input, long numToSkip) throws IOException {
+        long remaining = numToSkip;
+        while (remaining > 0) {
+            long delta = input.skip(remaining);
+            if (delta < 1) {
+                break;
+            }
+            remaining -= delta;
+        }
+        return numToSkip - remaining;
+    }
+```
+# IOUtils.copy
+```java
+public static void copy(final InputStream input, final OutputStream output, int buffersize) throws IOException {
+        final byte[] buffer = new byte[buffersize];
+        int len;
+        while ((len = input.read(buffer)) != -1) {
+            output.write(buffer, 0, len);
+        }
+    }
+```
+# IOUtils.contentEquals
+```java
+public static boolean contentEquals(final Reader expected, final Reader actual) throws IOException {
+        final StringBuilder builderExpected = new StringBuilder();
+        final StringBuilder builderActual = new StringBuilder();
+        char[] bufExpected = new char[256];
+        char[] bufActual = new char[256];
+        do {
+            int rszExp = expected.read(bufExpected);
+            int rszAct = actual.read(bufActual);
+            
+            if (rszExp != rszAct || !Arrays.equals(bufExpected, bufActual)) {
+                return false;
+            }
+            appendBuffer(builderExpected, bufExpected, rszExp);
+            appendBuffer(builderActual, bufActual, rszAct);
+            
+        } while (!expectedEof && !actualEof);
+        return ObjectUtils.nullSafeEquals(builderExpected.toString(), builderActual.toString());
+    }
+    private static void appendBuffer(StringBuilder s, char[] b, int len) {
+        for (int i = 0; i < len; ++i) {
+            s.append(b[i]);
+        }
+    }
+```
+# Streaming API - CipherInputStream, TarInputStream, GzipCompressorOutputStream, Zip4j
+```java
+import java.io.*;
+import javax.crypto.*;
+import javax.crypto.spec.*;
+import org.apache.commons.compress.archivers.tar.*;
+import org.apache.commons.compress.compressors.gzip.*;
+import org.apache.commons.compress.utils.*;
+import org.slf4j.*;
+import com.google.common.base.*;
+
+public class CompressedArchiveTestUtilities {
+  public static final Logger LOGGER = LoggerFactory.getLogger(CompressedArchiveTestUtilities.class);
+  private static final Charset DEFAULT_CHARSET = StandardCharsets.UTF_8;
+  
+  public static File createTarFileFromResourcesUsingGZIPCryption(List<String> paths) throws Exception {
+    Preconditions.checkNotNull(paths);
+    Preconditions.checkArgument(!paths.isEmpty());
+    Path tempDirPath = Files.createTempDirectory("temp");
+    File

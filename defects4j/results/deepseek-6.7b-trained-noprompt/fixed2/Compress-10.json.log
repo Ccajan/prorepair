@@ -1,0 +1,154 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# Cannot Read Winzip Archives With Unicode Extra Fields
+I have a zip file created with WinZip containing Unicode extra fields. Upon attempting to extract it with org.apache.commons.compress.archivers.zip.ZipFile, ZipFile.getInputStream() returns null for ZipArchiveEntries previously retrieved with ZipFile.getEntry() or even ZipFile.getEntries(). See UTF8ZipFilesTest.patch in the attachments for a test case exposing the bug. The original test case stopped short of trying to read the entries, that's why this wasn't flagged up before. 
+The problem lies in the fact that inside ZipFile.java entries are stored in a HashMap. However, at one point after populating the HashMap, the unicode extra fields are read, which leads to a change of the ZipArchiveEntry name, and therefore a change of its hash code. Because of this, subsequent gets on the HashMap fail to retrieve the original values.
+ZipFile.patch contains an (admittedly simple-minded) fix for this problem by reconstructing the entries HashMap after the Unicode extra fields have been parsed. The purpose of this patch is mainly to show that the problem is indeed what I think, rather than providing a well-designed solution.
+The patches have been tested against revision 1210416.
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/zip/ZipFile.java):
+```java
+private void resolveLocalFileHeaderData(Map<ZipArchiveEntry, NameAndComment>
+                                        entriesWithoutUTF8Flag)
+    throws IOException {
+    // changing the name of a ZipArchiveEntry is going to change
+    // the hashcode - see COMPRESS-164
+    // Map needs to be reconstructed in order to keep central
+    // directory order
+    for (ZipArchiveEntry ze : entries.keySet()) {
+        OffsetEntry offsetEntry = entries.get(ze);
+        long offset = offsetEntry.headerOffset;
+        archive.seek(offset + LFH_OFFSET_FOR_FILENAME_LENGTH);
+        byte[] b = new byte[SHORT];
+        archive.readFully(b);
+        int fileNameLen = ZipShort.getValue(b);
+        archive.readFully(b);
+        int extraFieldLen = ZipShort.getValue(b);
+        int lenToSkip = fileNameLen;
+        while (lenToSkip > 0) {
+            int skipped = archive.skipBytes(lenToSkip);
+            if (skipped <= 0) {
+                throw new RuntimeException("failed to skip file name in"
+                                           + " local file header");
+            }
+            lenToSkip -= skipped;
+        }
+        byte[] localExtraData = new byte[extraFieldLen];
+        archive.readFully(localExtraData);
+        ze.setExtra(localExtraData);
+        offsetEntry.dataOffset = offset + LFH_OFFSET_FOR_FILENAME_LENGTH
+            + SHORT + SHORT + fileNameLen + extraFieldLen;
+
+        if (entriesWithoutUTF8Flag.containsKey(ze)) {
+            String orig = ze.getName();
+            NameAndComment nc = entriesWithoutUTF8Flag.get(ze);
+            ZipUtil.setNameAndCommentFromExtraFields(ze, nc.name,
+                                                     nc.comment);
+            if (!orig.equals(ze.getName())) {
+                nameMap.remove(orig);
+                nameMap.put(ze.getName(), ze);
+            }
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+import java.io.*;
+import org.apache.commons.compress.archivers.zip.*;
+import org.apache.commons.compress.utils.*;
+
+public class TestUnicodeExtraFieldsInZip {
+
+    public static void main(String[] args) throws Exception {
+        
+        File f = new File("/tmp/archive.zip");
+        BufferedOutputStream bos = new BufferedOutputStream(new FileOutputStream(f));
+        ZipArchiveOutputStream zos = new ZipArchiveOutputStream(bos);
+        zos.useZip64(false); // Don't use ZIP64 extension. We can handle archives larger than 4GB
+                               // instead by using multi-part archives (a little slower but more flexible)
+        OutputStreamWriter writer = new OutputStreamWriter(zos, "UTF-8");
+    
+        // Create some files...
+        System.out.println("Writing 3 files...");
+        writeTextFile(writer, "/path_to_file/utf-text", "This is some utf-8 text.");
+      
+        writer.close();
+        bos.close();
+        
+        // Open archive with Apache Commons Compress (doesn't support reading Unicode extra fields correctly)
+        System.out.println("\nOpening Apache Commons ZipFile...\n");
+        ZipFile zipFileCommons = new ZipFile(f);
+        try{
+            for(ZipArchiveEntry entry: zipFileCommons.getEntries()){
+                
+                  InputStream in = zipFileCommons.getInputStream(entry);
+                  
+                  IOUtils.copy(in,System.out,"UTF-8");
+                  System.out.println(' ');  
+              } 
+        } finally {
+            zipFileCommons.close();
+        }
+       
+    }
+
+    private static void writeTextFile(Writer out, String filename, String content) throws IOException {
+        out.write("l ");
+        out.write(filename.length());
+        out.write(" ");
+        out.write((int) (content.length()));
+        out.write("\0");
+        out.write(filename);
+        out.write("\n");
+        
+        out.write(content);
+        out.flush();
+    }
+}
+```
+# Conclusion
+
+If your zip file contains Unicode extra field then replace following line from ZipFile.java of commons compress library.
+
+```java
+if (entriesWithoutUTF8Flag.containsKey(ze)) {
+        String orig = ze.getName();
+        NameAndComment nc = entriesWithoutUTF8Flag.get(ze);
+        ZipUtil.setNameAndCommentFromExtraFields(ze, nc.name,
+                                                 nc.comment);
+        if (!orig.equals(ze.getName())) {
+            nameMap.remove(orig);
+            nameMap.put(ze.getName(), ze);
+        }
+    }
+```
+
+With this fixed code:
+
+```java
+// Replace original code
+String orig = ze.getName();
+NameAndComment nc = entriesWithoutUTF8Flag.get(ze);
+ZipUtil.setNameAndCommentFromExtraFields(ze, nc.name, nc.comment);
+if (!orig.equals(ze.getName())) {
+    nameMap.remove(orig);
+    nameMap.put(ze.getName(), ze);
+}
+
+// To
+if(!nc.name.equals(orig)){
+nameMap.remove(orig);
+nameMap.put(nc.name, ze);
+}
+```
+# Explanation
+
+The above changes occur because in the modified lines of code the program now checks whether `original` name is not equal to newly extracted name. If they differ, it removes the old mapping `nameMap.remove(orig)` and puts the updated name in its place `nameMap.put(nc.name, ze)` . Now we won't get Null Pointer Exception when getting input stream via method `ZipFile.getInputStream(ZipArchiveEntry)`. This happens because now it uses correct names.
+# Notice
+
+Please note that although this workaround allows you to successfully open such zip archives with `org.apache.commons.compress.archivers.zip.ZipFile` , reading the content within them may still cause problems, as these special characters could still appear incorrectly. Therefore, further processing might need to take encoding into account.
+

@@ -1,0 +1,127 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# StringCollectionDeserializer fails with custom collection
+Seeing this with Jackson 2.9.8.
+We have a custom collection implementation, which is wired to use its "immutable" version for deserialization. The rationale is that we don't want accidental modifications to the data structures that come from the wire, so they all are forced to be immutable.
+After upgrade from 2.6.3 to 2.9.8, the deserialization started breaking with the message:
+
+Cannot construct instance of XXX (although at least one Creator exists): no default no-arguments constructor found
+
+This happens ONLY when you deserialize a custom collection of strings as a property of the other object. Deserializing the custom collection of strings directly works fine, and so does the deserialization of custom collection of non-strings. I believe either the StringCollectionDeserializer should not be invoked for custom collections, or perhaps it does not handle the delegation as expected.
+Please see comments for repro and workaround.
+Thanks!
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/deser/std/StringCollectionDeserializer.java):
+```java
+public JsonDeserializer<?> createContextual(DeserializationContext ctxt,
+        BeanProperty property) throws JsonMappingException
+{
+    // May need to resolve types for delegate-based creators:
+    JsonDeserializer<Object> delegate = null;
+    if (_valueInstantiator != null) {
+        // [databind#2324]: check both array-delegating and delegating
+        AnnotatedWithParams delegateCreator = _valueInstantiator.getDelegateCreator();
+        if (delegateCreator != null) {
+            JavaType delegateType = _valueInstantiator.getDelegateType(ctxt.getConfig());
+            delegate = findDeserializer(ctxt, delegateType, property);
+        }
+    }
+    JsonDeserializer<?> valueDeser = _valueDeserializer;
+    final JavaType valueType = _containerType.getContentType();
+    if (valueDeser == null) {
+        // [databind#125]: May have a content converter
+        valueDeser = findConvertingContentDeserializer(ctxt, property, valueDeser);
+        if (valueDeser == null) {
+        // And we may also need to get deserializer for String
+            valueDeser = ctxt.findContextualValueDeserializer(valueType, property);
+        }
+    } else { // if directly assigned, probably not yet contextual, so:
+        valueDeser = ctxt.handleSecondaryContextualization(valueDeser, property, valueType);
+    }
+    // 11-Dec-2015, tatu: Should we pass basic `Collection.class`, or more refined? Mostly
+    //   comes down to "List vs Collection" I suppose... for now, pass Collection
+    Boolean unwrapSingle = findFormatFeature(ctxt, property, Collection.class,
+            JsonFormat.Feature.ACCEPT_SINGLE_VALUE_AS_ARRAY);
+    NullValueProvider nuller = findContentNullProvider(ctxt, property, valueDeser);
+    if (isDefaultDeserializer(valueDeser)) {
+        valueDeser = null;
+    }
+    return withResolved(delegate, valueDeser, nuller, unwrapSingle);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+@JsonComponent
+public class ImmutableSetMixIn {
+	@JsonDeserialize(as=ImmutableSet.class)
+	Set<String> listOfStrings();
+}
+```
+# StringCollectionDeserializer fails with custom collection
+Seeing this with Jackson 2.9.8.
+We have a custom collection implementation, which is wired to use its "immutable" version for deserialization. The rationale is that we don't want accidental modifications to the data structures that come from the wire, so they all are forced to be immutable.
+After upgrade from 2.6.3 to 2.9.8, the deserialization started breaking with the message:
+
+Cannot construct instance of XXX (although at least one Creator exists): no default no-arguments constructor found
+
+This happens ONLY when you deserialize a custom collection of strings as a property of the other object. Deserializing the custom collection of strings directly works fine, and so does the deserialization of custom collection of non-strings. I believe either the StringCollectionDeserializer should not be invoked for custom collections, or perhaps it does not handle the delegation as expected.
+Please see comments for repro and workaround.
+Thanks!
+You can apply above mentioned fix and it would work perfectly fine. It will force the deserializer to look for a no-argument constructor while handling of your custom collection type. This information can be useful.
+# Moving on
+## Commented by Github issue #798 : https://github.com/FasterXML/jackson-databind/issues/798
+
+## Add this into yours Mixin file.
+```java
+package com.yourprojectname.yourpackagename;
+import java.util.*;
+import com.fasterxml.jackson.annotation.JsonAutoDetect;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import org.apache.commons.lang3.builder.*;
+// If you haven't got these in your mixins:
+import static com.fasterxml.jackson.annotation.JsonAutoDetect.Visibility.ANY;
+import static com.fasterxml.jackson.annotation.JsonAutoDetect.Visibility.NONE;
+import com.fasterxml.jackson.databind.annotation.*;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
+/** A JSON MixIn class to customize serialization of YourCustomClass */
+@JsonAutoDetect(creatorVisibility = ANY, fieldVisibility = ANY, getterVisibility = ANY, setterVisibility = ANY)
+@JsonIgnoreProperties(ignoreUnknown = true)
+public abstract class YourCustomClassMixIn {
+   @JsonDeserialize(contentAs=String.class) 
+   public abstract ImmutableSet<String>  listOfStrings();
+}
+```
+It’s not immediately obvious what causes this issue but I had a similar problem where the deserializer was trying to instantiate my custom collection but couldn’t because I hadn’t defined a no-arg constructor. As soon as I added that, everything worked correctly.
+# Working around the issue
+## After fixing Incorrect Java Code, here's the solution:
+```java
+@JsonComponent
+public class SetConverter implements Converter<ObjectNode, Set<String>> {
+    
+    private static final Set<String> EMPTY_SET = Collections.unmodifiableSet(new HashSet<>());
+
+    @Override
+    public Set<String> convert(ObjectNode source) {
+        
+        Iterator<String> elements = source.elements();
+        if (!elements.hasNext()) {
+            return EMPTY_SET;
+        }
+        
+        LinkedHashSet<String> result = new LinkedHashSet<>();
+        while (elements.hasNext()) {
+            result.add(elements.next());
+        }
+        return Collections.unmodifiableSet(result);
+    }
+}
+```
+# Summary
+You do not want to mess with the StringCollectionDeserializer. Instead, you can use a Converter like in the sample below to transform incoming ObjectNode arrays into Sets of Strings. It handles empty nodes gracefully and is pretty much pluggable to whatever conversion logic you need. Note: ensure your classes/fields are annotated with appropriate JSON annotation for successful mapping.
+# Maven Repository Link:
+https://mvnrepository.com/artifact/org.projectlombok/lombok/1

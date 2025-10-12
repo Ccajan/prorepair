@@ -1,0 +1,138 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# Problem with Object Id and Type Id as Wrapper Object (regression in 2.5.1)
+(note: originally from FasterXML/jackson-module-jaxb-annotations#51)
+Looks like fix for #669 caused a regression for the special use case of combining type and object ids, with wrapper-object type id inclusion. The problem started with 2.5.1.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/jsontype/impl/AsWrapperTypeDeserializer.java):
+```java
+private final Object _deserialize(JsonParser p, DeserializationContext ctxt) throws IOException
+{
+    // 02-Aug-2013, tatu: May need to use native type ids
+    if (p.canReadTypeId()) {
+        Object typeId = p.getTypeId();
+        if (typeId != null) {
+            return _deserializeWithNativeTypeId(p, ctxt, typeId);
+        }
+    }
+    // first, sanity checks
+    if (p.getCurrentToken() != JsonToken.START_OBJECT) {
+        throw ctxt.wrongTokenException(p, JsonToken.START_OBJECT,
+                "need JSON Object to contain As.WRAPPER_OBJECT type information for class "+baseTypeName());
+    }
+        // should always get field name, but just in case...
+        if (p.nextToken() != JsonToken.FIELD_NAME) {
+            throw ctxt.wrongTokenException(p, JsonToken.FIELD_NAME,
+                    "need JSON String that contains type id (for subtype of "+baseTypeName()+")");
+        }
+    final String typeId = p.getText();
+    JsonDeserializer<Object> deser = _findDeserializer(ctxt, typeId);
+    p.nextToken();
+
+    // Minor complication: we may need to merge type id in?
+    if (_typeIdVisible && p.getCurrentToken() == JsonToken.START_OBJECT) {
+        // but what if there's nowhere to add it in? Error? Or skip? For now, skip.
+        TokenBuffer tb = new TokenBuffer(null, false);
+        tb.writeStartObject(); // recreate START_OBJECT
+        tb.writeFieldName(_typePropertyName);
+        tb.writeString(typeId);
+        p = JsonParserSequence.createFlattened(tb.asParser(p), p);
+        p.nextToken();
+    }
+    
+    Object value = deser.deserialize(p, ctxt);
+    // And then need the closing END_OBJECT
+    if (p.nextToken() != JsonToken.END_OBJECT) {
+        throw ctxt.wrongTokenException(p, JsonToken.END_OBJECT,
+                "expected closing END_OBJECT after type information and deserialized value");
+    }
+    return value;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+protected final Object _deserialize(final JsonParser p, final DeserializationContext ctxt) throws IOException, JsonProcessingException {
+    // 02-Aug-2013, tatu: May need to use native type ids
+    if (p.canReadTypeId()) {
+        Object typeId = p.getTypeId();
+        if (typeId != null) {
+            return this._deserializeWithNativeTypeId(p, ctxt, typeId);
+        }
+    }
+    // First, sanity checks
+    if (p.getCurrentToken() != JsonToken.START_OBJECT) {
+        throw ctxt.wrongTokenException(p, JsonToken.START_OBJECT,
+                "need JSON Object to contain As.WRAPPER_OBJECT type information for class " + baseType().getName());
+    }
+    // Move past initial start object marker
+    p.nextToken();
+
+    if (!this._handleFirstAndLastTokens(p, ctxt)) {
+        // Handle simple types that don't have any properties needing handling
+        if (p.getCurrentToken() == JsonToken.NO_FIELDS || p.getCurrentToken() == JsonToken.END_OBJECT) {
+            if (p.getCurrentToken() == JsonToken.NO_FIELDS) {
+                // handle case where we have no fields (i.e., [])
+                if (p instanceof NumberNode) {
+                    Number n = (Number) p.getNumberValue();
+                    return this._constructValue(n.doubleValue(), ctxt);
+                } else if (p instanceof BooleanNode) {
+                    boolean b = p.getBooleanValue();
+                    return this._constructValue((boolean) b ? Boolean.TRUE : Boolean.FALSE, ctxt);
+                }
+            }
+            return this._constructValue(null, ctxt);
+        }
+        
+        assert (p.getCurrentToken() == JsonToken.FIELD_NAME);
+        String propId = p.getText();
+        if (!propId.equals("\"" + _typePropertyName + "\"")) {
+            // If not dealing with type info, process normally.
+            // 14-Jul-2015: also check if next token is NULL (to support optional values)
+            if ((p.nextToken() != JsonToken.NULL) && (p.getCurrentToken() != JsonToken.END_OBJECT)) {
+                doHandleNonRefProp(p, ctxt, propId);
+            }
+            p.nextToken();
+        } else {
+            /*
+             * Special case: if we find a reference to ourself, make sure it is properly resolved before calling deserializer:
+             */
+            if (_refResolver != null) {
+                final Object id = resolveSelfReference(p, ctxt);
+                return this._constructValue(id, ctxt);
+            }
+            p.nextToken(); // move past property value
+                            
+            if (p.getCurrentToken() == JsonToken.START_ARRAY){
+                 p.nextToken();
+            }else if (p.getCurrentToken() == JsonToken.START_OBJECT){
+                  p.nextToken();
+            }
+              
+            final String typeId = p.getText();
+            JsonDeserializer<Object> deser = _findDeserializer(ctxt, typeId);
+            final Object value = deser.deserialize(p, ctxt);
+                    
+            p.nextToken();
+
+            /*
+             * Note: we MUST still verify whether we've reached end of object here, so that
+             *       callers can simply use `wrappee` constructor directly, avoiding extra object traversal.
+             *       We know we're done when we see END_OBJECT (and NOT when we see END_DOCUMENT).
+             * That said, must ensure we can correctly parse empty objects {} as well (issue #678)
+             */
+            if (p.getCurrentToken() != JsonToken.END_OBJECT && p.getCurrentToken() != JsonToken.END_DOCUMENT) {
+                throw ctxt.wrongTokenException(p, JsonToken.END_OBJECT,
+                        "expected closing END_OBJECT after type information and deserialized value");
+            }
+            return value;
+        }
+    }
+    p.close();
+    return null;
+}
+```
+# Explanation
+The issue appears to be related to trying to

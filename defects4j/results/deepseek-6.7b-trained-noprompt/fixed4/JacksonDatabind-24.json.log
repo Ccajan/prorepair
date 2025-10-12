@@ -1,0 +1,132 @@
+You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.
+### Instruction:
+
+# Configuring an ObjectMapper's DateFormat changes time zone when serialising Joda DateTime
+The serialisation of Joda DateTime instances behaves differently in 2.6.0 vs 2.5.4 when the ObjectMapper's had its DateFormat configured. The behaviour change is illustrated by the following code:
+public static void main(String[] args) throws JsonProcessingException {
+    System.out.println(createObjectMapper()
+            .writeValueAsString(new DateTime(1988, 6, 25, 20, 30, DateTimeZone.UTC)));
+}
+
+private static ObjectMapper createObjectMapper() {
+    ObjectMapper mapper = new ObjectMapper();
+    mapper.registerModule(createJodaModule());
+    mapper.configure(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false);
+    System.out.println(mapper.getSerializationConfig().getTimeZone());
+    mapper.setDateFormat(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss"));
+    System.out.println(mapper.getSerializationConfig().getTimeZone());
+    return mapper;
+}
+
+private static SimpleModule createJodaModule() {
+    SimpleModule module = new SimpleModule();
+    module.addSerializer(DateTime.class, new DateTimeSerializer(
+            new JacksonJodaDateFormat(DateTimeFormat.forPattern("yyyy-MM-dd HH:mm:ss")
+                    .withZoneUTC())));
+        return module;
+    }
+When run with Jackson 2.5.4 the output is:
+sun.util.calendar.ZoneInfo[id="GMT",offset=0,dstSavings=0,useDaylight=false,transitions=0,lastRule=null]
+sun.util.calendar.ZoneInfo[id="GMT",offset=0,dstSavings=0,useDaylight=false,transitions=0,lastRule=null]
+"1988-06-25 20:30:00"
+
+When run with Jackson 2.6.0 the output is:
+sun.util.calendar.ZoneInfo[id="GMT",offset=0,dstSavings=0,useDaylight=false,transitions=0,lastRule=null]
+sun.util.calendar.ZoneInfo[id="Europe/London",offset=0,dstSavings=3600000,useDaylight=true,transitions=242,lastRule=java.util.SimpleTimeZone[id=Europe/London,offset=0,dstSavings=3600000,useDaylight=true,startYear=0,startMode=2,startMonth=2,startDay=-1,startDayOfWeek=1,startTime=3600000,startTimeMode=2,endMode=2,endMonth=9,endDay=-1,endDayOfWeek=1,endTime=3600000,endTimeMode=2]]
+"1988-06-25 21:30:00"
+
+It looks like the fix for #824 is the cause. In 2.6, the call to mapper.setDateFormat causes the ObjectMapper's time zone to be set to the JVM's default time zone. In 2.5.x, calling mapper.setDateFormat has no effect on its time zone.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/cfg/BaseSettings.java):
+```java
+public BaseSettings withDateFormat(DateFormat df) {
+    if (_dateFormat == df) {
+        return this;
+    }
+    TimeZone tz = (df == null) ? _timeZone : df.getTimeZone();
+    return new BaseSettings(_classIntrospector, _annotationIntrospector, _visibilityChecker, _propertyNamingStrategy, _typeFactory,
+            _typeResolverBuilder, df, _handlerInstantiator, _locale,
+            tz, _defaultBase64);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+
+### Response:
+
+```java
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.databind.*;
+import com.fasterxml.jackson.databind.deser.std.StdDeserializer;
+import com.fasterxml.jackson.databind.node.TextNode;
+import com.fasterxml.jackson.datatype.joda.JodaMapper;
+import org.joda.time.DateTime;
+import org.joda.time.format.DateTimeFormat;
+import org.joda.time.format.DateTimeFormatter;
+
+import java.io.IOException;
+import java.text.ParseException;
+import java.util.Locale;
+import java.util.TimeZone;
+
+public class DateTimeWithTzInOutputMixin {
+    public abstract DateTime getDateTime();
+    public abstract void setDateTime(DateTime dateTime);
+
+    public static class Serializer extends StdSerializer<DateTime> {
+        private final transient DateTimeFormatter fmt;
+
+        public Serializer() {
+            super(DateTime.class);
+            fmt = DateTimeFormat.fullDateTime();
+        }
+
+        @Override
+        public void serialize(final DateTime value, final JsonGenerator jgen, final SerializerProvider provider) throws IOException {
+            // don't use local time
+            jgen.writeString(fmt.withZone(provider.getConfig().getTimeZone()).print(value));
+        }
+    }
+
+    public static class Deserializer extends StdDeserializer<DateTime> {
+        private final transient DateTimeFormatter fmt;
+
+        public Deserializer() {
+            super(DateTime.class);
+            fmt = DateTimeFormat.fullDateTime();
+        }
+
+        @Override
+        public DateTime deserialize(final JsonParser jp, final DeserializationContext ctxt) throws IOException {
+            String str = ((TextNode) jp.getCodec().readTree(jp)).asText();
+            try {
+                // don't use local time
+                return fmt.withZone(ctxt.getConfig().getTimeZone()).parseDateTime(str);
+            } catch (ParseException e) {
+                throw new RuntimeException(e);
+            }
+        }
+    }
+
+    public static void mixIn(JodaMapper mapper) {
+        mapper.getSerializationConfig().getMixInAnnotations().add(DateTime.class, DateTimeWithTzInOutputMixin.class);
+        mapper.getDeserializationConfig().getMixInAnnotations().add(DateTime.class, DateTimeWithTzInOutputMixin.class);
+        mapper.addMixIn(DateTime.class, DateTimeWithTzInOutputMixin.class);
+    }
+}
+```
+# Configuring an ObjectMapper's DateFormat changes time zone when serializing Joda DateTime
+
+If you want your `ObjectMapper` to use a specific `DateFormat` when serializing `Joda DateTime` objects, but you do not want that formatting to affect the timezone used during serialization, you can register a mixin with your `ObjectMapper`. This mixin can define custom serializers and deserializers for `DateTime` that utilize the specified format, while preserving the current system or `ObjectMapper` timezone for all other serializations.
+
+Here's how you might apply it:
+
+```java
+ObjectMapper mapper = new ObjectMapper();
+mapper.registerModule(new JodaModule());
+DateTimeWithTzInOutputMixin.mixIn((JodaMapper) mapper);
+mapper.setDateFormat(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss"));
+System.out.println(mapper.writeValueAsString(new DateTime()));
+```
+
+Note that we have to cast `mapper` to `JodaMapper` because there isn't any standard way to get access to Joda-specific settings from a regular `ObjectMapper` instance. Also, as mentioned before, please make sure to specify UTC in your formatter pattern. Otherwise, the result would vary depending on the client’s locale setting which could lead to unexpected behavior. You should also take care about deserialization process since it can also behave unintuitively due to lack of awareness of user's `ObjectMapper`'s date format configuration.
+
