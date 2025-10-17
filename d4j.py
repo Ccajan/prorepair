@@ -288,7 +288,7 @@ def set_file_limits():
 
 # 设置模型别名前缀对应的开头与结尾提示
 MODEL_PROMPT_FORMATS = {
-    'qwen': ('<|im_start|>user\n', '<|im_end|>'),
+    'qwen': ('<|im_start|>user\n', '<|im_end|>\n<|im_start|>assistant\n'),
     'codellama': ('[INST]', '[/INST]'),
     'llama': ('[INST]', '[/INST]'),
     'mistral': ('[INST]', '[/INST]'),
@@ -352,6 +352,14 @@ MODEL_CONFIGS = {
     },
     'deepseek-6.7b-trained-prorepair': {
         'base_model': 'merged_models/sft_deepseek7b_prorepair',
+        'adapter_path': None
+    },
+    'qwen-4b-trained-prorepair': {
+        'base_model': 'merged_models/sft_qwen4b_parepair',
+        'adapter_path': None
+    },
+    'qwen-8b-trained-prorepair': {
+        'base_model': 'merged_models/sft_qwen8b_parepair',
         'adapter_path': None
     },
     'trained_model_codellama-v1': {
