@@ -54,7 +54,7 @@ os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512,expandable_segmen
 def setup_gpu_environment():
     """设置GPU环境，包括冲突检测和预防"""
     if len(sys.argv) < 5:
-        print("Usage: python inference_cpp.py <model_key> <num_processes> <process_id> <gpu_id> [num_generations]")
+        print("Usage: python inference_java.py <model_key> <num_processes> <process_id> <gpu_id> [num_generations]")
         print("参数说明:")
         print("  model_key: 模型名称")
         print("  num_processes: 总进程数")
@@ -91,11 +91,11 @@ def setup_gpu_environment():
         print("错误：CUDA不可用")
         sys.exit(1)
     
-    # GPU冲突检测和预防
+    # GPU冲突检测和预防（每个进程有独立的锁）
     # 使用项目目录下的锁文件，避免 /tmp 空间不足
     lock_dir = os.path.join(os.getcwd(), '.gpu_locks')
     os.makedirs(lock_dir, exist_ok=True)
-    lock_file = os.path.join(lock_dir, f"gpu_{gpu_id}_cpp.lock")
+    lock_file = os.path.join(lock_dir, f"gpu_{gpu_id}_proc_{sys.argv[3]}_java.lock")
     
     try:
         # 尝试获取GPU锁
@@ -237,28 +237,30 @@ def set_file_limits():
         print(f"设置文件句柄限制时出错: {e}")
 
 
-def extract_cpp_code(text: str) -> str:
-    """从生成的文本中提取第一个代码块"""
-    # 匹配第一个代码块：优先 c++，否则通用代码块
-    match = re.search(r'```(?:c\+\+)?\s*(.*?)(?:```|$)', text, re.DOTALL)
-    return match.group(1).strip() if match else ""
+def extract_java_code(text: str) -> str:
+    """从生成的文本中提取Java代码（与 d4j1.py 逻辑一致）"""
+    # 首先尝试匹配完整的代码块（有闭合标记）
+    matches = re.findall(r'```java(.*?)```', text, re.DOTALL)
+    if matches:
+        return matches[0].strip()
+    
+    # 如果没有闭合标记，尝试匹配从 ```java 开始到字符串结尾或到下一个 ``` 的内容
+    match = re.search(r'```java\s*(.*?)(?:```|$)', text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    
+    return ""
 
 # 模型提示格式（必须与训练时格式一致！）
 MODEL_PROMPT_FORMATS = {
     'qwen': ('<|im_start|>user\n', '<|im_end|>\n<|im_start|>assistant\n'),
     'llama3': ('<|start_header_id|>user<|end_header_id|>\n\n', '<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n'),
-    'deepseek': ('###Instruction\n', '###response\n\n'),  # DeepSeek 格式
+    'deepseek': ('<|begin▁of▁sentence|>', '\n\n'),  # DeepSeek 格式（与训练一致）
+    'codellama': ('[INST]', '[/INST]'),
+    'llama': ('[INST]', '[/INST]'),  # Llama 2
+    'mistral': ('[INST]', '[/INST]'),
+    'starchat': ('<|system|>\n<|end|>\n<|user|>', '<|end|>\n<|assistant|>'),
 }
-
-# 补全模型列表（使用代码补全格式，而非指令格式）
-COMPLETION_MODELS = [
-    'starcoder',
-]
-
-def is_completion_model(model_key: str) -> bool:
-    """判断是否为代码补全模型"""
-    model_key_lower = model_key.lower()
-    return any(comp_model in model_key_lower for comp_model in COMPLETION_MODELS)
 
 # 模型配置
 MODEL_CONFIGS = {
@@ -268,38 +270,23 @@ MODEL_CONFIGS = {
     'qwen3-4b': {
         'model_path': 'model/qwen3-4b',
     },
-    'qwen3-8b-trained-noprompt': {
-        'model_path': 'merged_models/qwen3-8b-trained-noprompt',
+    'qwen3-8b-trained': {
+        'model_path': 'merged_models/qwen3-8b_merged_sft',
     },
-    'qwen3-4b-trained-noprompt': {
-        'model_path': 'merged_models/qwen3-4b-trained-noprompt',
+    'qwen3-4b-trained': {
+        'model_path': 'merged_models/qwen3-4b_merged_sft',
     },
-    'qwen3-4b-trained-parepair': {
-        'model_path': 'merged_models/qwen3-4b-parepair',
+    'codellama-7b': {
+        'model_path': 'codellama/CodeLlama-7b-Instruct-hf',
+    },
+    'codellama-7b-trained': {
+        'model_path': '/data1/czj/model/CodeLlama-7b-Instruct',
+    },
+    'codellama-13b': {
+        'model_path': '/data1/czj/model/codeLlama-13b-instruct',
     },
     'llama3.1-8b': {
-        'model_path': 'model/Llama-3-8B-Instruct',
-    },
-    'llama3.1-8b-trained-parepair': {
-        'model_path': 'merged_models/llama3.1-8b-prarepair',
-    },
-    'deepseek-6.7b': {
-        'model_path': 'model/deepseek-coder-6.7b',
-    },
-    'deepseek-6.7b': {
-        'model_path': 'merged_models/deepseek-6,7b-nopro',
-    },
-    'deepseek-6.7b-trained-parepair': {
-        'model_path': 'merged_models/deepseek-6.7-prarepair',
-    },
-    'starcoder-7b': {
-        'model_path': 'model/starcoder-7b',
-    },
-    'starcoder-7b-nopro': {
-        'model_path': 'merged_models/starcoder-7b-nopro/starcoder-7b-nopro',
-    },
-    'starcoder-7b-par': {
-        'model_path': 'merged_models/starcoder-7b-par',
+        'model_path': '/data1/czj/model/Llama-3-8B-Instruct',
     },
 }
 
@@ -312,181 +299,109 @@ def get_prompt_format(model_key: str) -> tuple:
 
 
 def load_vllm_model(model_config):
-    from vllm import LLM
-    from transformers import AutoTokenizer
     """使用 vLLM 加载模型"""
+    from transformers import AutoTokenizer
+    
     model_path = model_config['model_path']
     
-    # vLLM 配置
-    vllm_config = {
-        "model": model_path,
-        "gpu_memory_utilization": 0.9,
-        "trust_remote_code": True,
-        "max_model_len": 4096,
-        "enforce_eager": True,
-        "disable_custom_all_reduce": True,
-        "disable_log_stats": True,
-        "download_dir": None,
-        "tensor_parallel_size": 1,
-    }
-    
-    print(f"加载vLLM模型: {model_path}")
-    llm = LLM(**vllm_config)
-    
-    # 加载对应的 tokenizer
+    # 加载 tokenizer
+    print("📝 加载 tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(
-        model_path, 
+        model_path,
         trust_remote_code=True,
         local_files_only=True
     )
+    
     if tokenizer.pad_token is None:
-        if tokenizer.eos_token is not None:
-            tokenizer.pad_token = tokenizer.eos_token
-        else:
-            tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+        tokenizer.pad_token = tokenizer.eos_token or '[PAD]'
     
-    return llm, tokenizer
+    llm_kwargs = {
+        'model': model_path,
+        'tokenizer': model_path,
+        'tensor_parallel_size': 1,
+        'dtype': 'bfloat16',
+        'max_model_len': 4096,
+        'gpu_memory_utilization': 0.9,
+        'trust_remote_code': True,
+        'enforce_eager': False,
+    }
+    
+    print("🚀 使用 vLLM 加载模型...")
+    try:
+        llm = LLM(**llm_kwargs)
+        print("✅ vLLM 模型加载成功")
+    except Exception as e:
+        print(f"❌ vLLM 模型加载失败: {e}")
+        raise
+    
+    return llm, tokenizer, None
 
-def generate_with_vllm(llm, prompt: str, model_key: str):
+def generate_with_vllm(llm, prompt: str) -> Tuple[str, str]:
     """使用 vLLM 生成代码"""
-    global tokenizer, EOF, BOF
-    from vllm import SamplingParams
+    global tokenizer, EOF
     
-    # vLLM 采样参数 - 保守配置
     sampling_params = SamplingParams(
         temperature=1.0,
         top_p=0.9,
         top_k=50,
-        max_tokens=512,
+        max_tokens=1536,  # 确保生成完整代码（max_new_tokens，不包括输入）
         repetition_penalty=1.1,
         stop=[tokenizer.eos_token] if tokenizer.eos_token else None,
     )
     
-    # 循环生成，直到获取到合法的 C++ 代码
-    max_retries = 5
-    retry_count = 0
-    ret = ""
-    complete_text = None
-    
-    while not ret and retry_count < max_retries:
-        retry_count += 1
-        print(f"尝试生成 C++ 代码 (第 {retry_count}/{max_retries} 次)...", flush=True)
+    try:
+        outputs = llm.generate([prompt], sampling_params)
+        output = outputs[0]
+        full_text = output.outputs[0].text
         
-        # vLLM 生成 - 添加错误处理
-        try:
-            outputs = llm.generate([prompt], sampling_params)
-            output = outputs[0]
-            full_text = output.outputs[0].text
-        except RuntimeError as e:
-            if "CUDA" in str(e) or "unknown error" in str(e):
-                print(f"vLLM CUDA错误，尝试清理缓存后重试: {e}")
-                # 清理CUDA缓存
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
-                # 重试一次
-                try:
-                    outputs = llm.generate([prompt], sampling_params)
-                    output = outputs[0]
-                    full_text = output.outputs[0].text
-                except Exception as e2:
-                    print(f"vLLM重试失败: {e2}")
-                    continue
-            else:
-                print(f"vLLM生成错误: {e}")
-                continue
-        except Exception as e:
-            print(f"vLLM生成异常: {e}")
-            continue
-        
-        # 组合完整文本
+        # 完整文本包含prompt
         complete_text = prompt + full_text
+        print(complete_text)
         
-        # 根据模型类型提取代码
-        ret = None
+        # 根据模型格式提取生成的 Java 代码部分
+        try:
+            ret = extract_java_code(full_text.split(EOF)[-1])
+        except (IndexError, AttributeError):
+            ret = extract_java_code(full_text)
         
-        if is_completion_model(model_key) or BOF is None or EOF is None:
-            # 代码补全模型：从 "output the fixed code" 标记之后提取C++代码块
-            marker = "only output the fixed code."  # 小写，配合 lower() 查找
-            marker_pos = complete_text.lower().find(marker)
-            
-            if marker_pos != -1:
-                # 找到标记，从标记之后提取
-                after_marker = complete_text[marker_pos + len(marker):]
-                ret = extract_cpp_code(after_marker)
-            else:
-                # 没找到标记，返回空，依靠重试机制
-                ret = None
-            
-            if not ret:
-                continue
-        else:
-            # 指令模型：从 EOF 标记之后提取
-            if EOF in complete_text:
-                try:
-                    after_eof = complete_text.split(EOF)[1]
-                    ret = extract_cpp_code(after_eof)
-                except (IndexError, AttributeError):
-                    ret = None
-            else:
-                ret = None
+        print('code:', ret, flush=True)
+        return complete_text, ret
         
-        if ret:
-            print('code:', ret, flush=True)
-        else:
-            ret = ""  # 重置为空字符串，继续循环
-    
-    # 检查最终结果
-    if not ret or not ret.strip():
-        print(f"❌ 经过 {max_retries} 次尝试仍未获取到有效的 C++ 代码", flush=True)
-        return [None, None]
-    
-    return [complete_text, ret]
+    except Exception as e:
+        print(f"生成出错: {e}")
+        return "", ""
 
 # 添加 reextract 功能
-def reextract_code_from_log(log_file_path, eof_marker, model_key):
-    """从log文件中提取C++代码块"""
+def reextract_code_from_log(log_file_path):
+    """从log文件中提取第二个Java代码块（第一个是prompt，第二个是模型输出）"""
     try:
         with open(log_file_path, 'r', encoding='utf-8') as f:
             log_content = f.read()
         
-        # 根据模型类型提取代码
-        if is_completion_model(model_key):
-            # 补全模型：直接查找代码块标记
-            if "Only output the fixed code." in log_content:
-                after_marker = log_content.split("Only output the fixed code.", 1)[1]
-                extracted_code = extract_cpp_code(after_marker)
-            else:
-                extracted_code = extract_cpp_code(log_content)
-            
-            if extracted_code:
-                print(f"成功从 {log_file_path} 提取代码块 (长度: {len(extracted_code)} 字符)")
-                return extracted_code
-        else:
-            # 指令模型：使用 EOF 标记分割
-            if eof_marker and eof_marker in log_content:
-                parts = log_content.split(eof_marker, 1)
-                if len(parts) > 1:
-                    output_part = parts[1]
-                    if output_part:
-                        extracted_code = extract_cpp_code(output_part)
-                        if extracted_code:
-                            print(f"成功从 {log_file_path} 提取代码块 (长度: {len(extracted_code)} 字符)")
-                            return extracted_code
-            else:
-                extracted_code = extract_cpp_code(log_content)
-                if extracted_code:
-                    print(f"成功从 {log_file_path} 提取代码块 (长度: {len(extracted_code)} 字符)")
-                    return extracted_code
+        # 查找所有Java代码块
+        java_blocks = re.findall(r'```java(.*?)```', log_content, re.DOTALL)
         
-        print(f"警告: {log_file_path} 中找不到有效的C++代码块")
+        if len(java_blocks) >= 2:
+            # 第二个代码块是模型输出的修复代码
+            code = java_blocks[1].strip()
+            if code:
+                print(f"成功从 {log_file_path} 提取第二个代码块 (长度: {len(code)} 字符)")
+                return code
+        
+        # 如果没有找到两个```java块，尝试查找通用代码块
+        all_blocks = re.findall(r'```(.*?)```', log_content, re.DOTALL)
+        if len(all_blocks) >= 2:
+            code = all_blocks[1].strip()
+            if code:
+                print(f"成功从 {log_file_path} 提取第二个通用代码块 (长度: {len(code)} 字符)")
+                return code
+        
+        print(f"警告: {log_file_path} 中找不到第二个代码块")
         return None
         
     except Exception as e:
-        print(f"❌ 读取log文件 {log_file_path} 时出错: {e}")
+        print(f"读取log文件 {log_file_path} 时出错: {e}")
         return None
-
-
 
 # 在导入其他模块前先设置GPU环境
 if __name__ == '__main__':
@@ -497,23 +412,22 @@ if __name__ == '__main__':
         # Reextract 模式：只需要结果标签
         if len(sys.argv) < 3:
             print(f"使用方法: python {sys.argv[0]} --reextract <result_tag>")
-            print("示例: python inference_cpp.py --reextract qwen3-8b")
-            print("将重新提取 evalrepair-c++/result/<result_tag>/ 下所有的代码")
+            print("示例: python inference_java.py --reextract qwen3-8b")
+            print("将重新提取 evalrepair-java-res/<result_tag>/ 下所有的代码")
             sys.exit(1)
         
         result_tag = sys.argv[2]
-        result_base_dir = f'evalrepair-c++/result/{result_tag}'
+        result_base_dir = f'evalrepair-java-res/{result_tag}'
         
         if not os.path.exists(result_base_dir):
             print(f"错误: 结果目录不存在: {result_base_dir}")
             sys.exit(1)
         
-        # 根据result_tag获取对应的EOF标记
-        BOF, EOF = get_prompt_format(result_tag)
-        is_completion = is_completion_model(result_tag)
-        
-        print(f"重新提取模式: {result_tag} ({'补全模型' if is_completion else '指令模型'})")
+        print("=" * 60)
+        print("运行模式: 重新提取代码模式")
         print(f"目标目录: {result_base_dir}")
+        print("将从已有的log文件中重新提取Java代码")
+        print("=" * 60)
         
         # 遍历所有 fixed* 目录
         total_processed = 0
@@ -523,15 +437,15 @@ if __name__ == '__main__':
             print(f"\n处理目录: {fixed_dir}")
             for log_file in sorted(fixed_dir.glob('*.log')):
                 total_processed += 1
-                cpp_file = str(log_file)[:-4]  # 移除 .log 扩展名
+                java_file = str(log_file)[:-4]  # 移除 .log 扩展名
                 
                 print(f"  处理: {log_file.name}")
-                extracted_code = reextract_code_from_log(str(log_file), EOF, result_tag)
+                extracted_code = reextract_code_from_log(str(log_file))
                 
                 if extracted_code:
-                    with open(cpp_file, 'w', encoding='utf-8') as f:
+                    with open(java_file, 'w', encoding='utf-8') as f:
                         f.write(extracted_code)
-                    print(f"  ✓ 已更新: {os.path.basename(cpp_file)}")
+                    print(f"  ✓ 已更新: {os.path.basename(java_file)}")
                     total_success += 1
                 else:
                     print(f"  ✗ 提取失败: {log_file.name}")
@@ -566,46 +480,23 @@ model_config = MODEL_CONFIGS[model_key]
 BOF, EOF = get_prompt_format(model_key)
 
 # 加载 vLLM 模型
-llm, tokenizer = load_vllm_model(model_config)
-print('模型加载成功', flush=True)
+llm, tokenizer, _ = load_vllm_model(model_config)
+print(f"Tokenizer vocab size: {len(tokenizer)}")
 print(f"GPU状态: {monitor_gpu_status()}")
 
-def get_prompt_suffix(filename: str, prompt_dir: str) -> str:
-    """获取提示后缀（移除注释后的代码）"""
-    try:
-        with open(os.path.join(prompt_dir, filename), 'r', encoding='utf-8') as f:
-            content = f.read()
-        # 移除注释，保留代码结构
-        return re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
-    except:
-        return ""
-
-def generate_fix(code: str, filename: str, prompt_dir: str, model_key: str):
+def generate_fix(code: str, filename: str) -> Tuple[str, str]:
     """生成代码修复"""
-    prompt_suffix = get_prompt_suffix(filename, prompt_dir)
-    
-    # 根据模型类型构建不同的 prompt
-    if is_completion_model(model_key):
-        # 代码补全模型：使用代码块标记，便于提取代码
-        prompt = f"// This is an incorrect code ({filename}):\n```c++\n{code}\n```\nYou are a software engineer. Can you repair the incorrect cpp code? Only output the fixed code.\n```c++\n{prompt_suffix}"
-    else:
-        # 指令模型：使用 BOF/EOF 包装
-        if BOF is None or EOF is None:
-            # 如果没有设置 BOF/EOF，回退到代码补全格式
-            prompt = f"// This is an incorrect code ({filename}):\n```c++\n{code}\n```\n\n// Fixed code:\n```c++\n{prompt_suffix}"
-        else:
-            prompt = f"{BOF}This is an incorrect code ({filename}):\n```c++\n{code}\n```\nYou are a software engineer. Can you repair the incorrect cpp code?\n{EOF}\n```c++\n{prompt_suffix}"
-    
+    prompt = f"{BOF} This is an incorrect code ({filename}):\n```java\n{code}\n```\nYou are a software engineer. Can you repair the incorrect code?\n{EOF}\n```java\n"
     print(prompt, flush=True)
     
-    return generate_with_vllm(llm, prompt, model_key)
+    full_text, code_result = generate_with_vllm(llm, prompt)
+    print(full_text)
+    print('code:', code_result, flush=True)
+    return full_text, code_result
 
-
-
-# 配置路径（使用相对路径）
-base_dir = 'evalrepair-c++/buggy/'
-result_base_dir = f'evalrepair-c++/result/{model_key}/'
-prompt_dir = 'evalrepair-c++/prompt/'
+# 配置路径
+base_dir = 'evalrepair-java/origin/'
+result_base_dir = f'evalrepair-java-res/{model_key}/'
 
 # 参数解析 (注意：现在参数顺序变了，gpu_id是第4个参数)
 total_processes = int(sys.argv[2]) if len(sys.argv) >= 3 else 1
@@ -617,7 +508,7 @@ print(f"处理配置: 进程 {process_id + 1}/{total_processes}, 生成 {num_gen
 
 # 处理文件
 cnt = 0
-for file_path in sorted(Path(base_dir).rglob('*.cpp'), reverse=True):
+for file_path in sorted(Path(base_dir).rglob('*.java'), reverse=True):
     cnt += 1
     if total_processes > 1 and cnt % total_processes != process_id:
         continue
@@ -645,8 +536,7 @@ for file_path in sorted(Path(base_dir).rglob('*.cpp'), reverse=True):
             continue
         
         # 生成修复代码
-        result = generate_fix(content, file_name, prompt_dir, model_key)
-        full_text, code_result = result[0], result[1]
+        full_text, code_result = generate_fix(content, file_name)
         if not full_text:
             continue
         
@@ -656,9 +546,7 @@ for file_path in sorted(Path(base_dir).rglob('*.cpp'), reverse=True):
         with open(log_name, 'w', encoding='utf-8') as f:
             f.write(full_text)
 
-print("✅ C++ 代码修复完成！")
+print("✅ Java 代码修复完成！")
 
 # 清理资源
-cleanup_resources()
-cleanup_resources()
 cleanup_resources()
