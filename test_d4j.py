@@ -633,17 +633,22 @@ def validate_patches_per_bug(candidate_patch, model_id):
                                      val_info.patch_id, val_info.encoding_mode, val_info.proj_dir)
 
         curr_patch_summary = patch_val.summarize_patch_info(val_info.curr_bug)
-        # 只在patch通过测试时计算diff统计
+        # 只对 PLAUSIBLE 补丁计算详细的 diff 统计（节省计算资源）
         if curr_patch_summary['patch_status'] == 'PLAUSIBLE':
             curr_patch_summary['diff_stats'] = calc_diff_stats(
-                val_info.patch_info['buggy'], 
+                val_info.patch_info['buggy'],
                 curr_patch_summary['patch_code']
             )
-            print_diff_stats(curr_patch_summary['diff_stats'])  # 打印差异统计
-        print(f"[DEBUG] Patch validation result: {curr_patch_summary['patch_status']}")  # 调试信息
+            print_diff_stats(curr_patch_summary['diff_stats'])
+        else:
+            # 非 PLAUSIBLE 补丁不计算详细统计
+            curr_patch_summary['diff_stats'] = None
         patch_results.append(curr_patch_summary)
         val_info.update_patch_val_result(curr_patch_summary)
         val_info.save_validation_results()
+    
+    # 确保所有结果都被保存到 validated.jsonl
+    val_info.save_validation_results(done=True)
     
     # 保存验证结果和日志
     save_validation_result(log_path, result_path, patch_results, '\n'.join(validation_log))
@@ -654,11 +659,20 @@ class ValidationStats:
     def __init__(self):
         self.total_bugs = 0
         self.bug_results = {}
+        # PLAUSIBLE 补丁的详细统计（只统计可行补丁）
         self.diff_stats = {
+            'patch_count': 0,
+            'total_hunks': 0,
             'total_added': 0,
             'total_deleted': 0,
+            'total_changed_lines': 0,
+            'total_added_tokens': 0,
+            'total_deleted_tokens': 0,
+            'total_changed_tokens': 0,
+            'total_edit_distance': 0,
+            'total_edit_similarity': 0,
+            'total_norm_edit_distance': 0,
             'total_preserved': 0,
-            'patch_count': 0,
             'preservation_distribution': {
                 'high': 0,    # >95%
                 'medium': 0,  # 80-95%
@@ -673,96 +687,131 @@ class ValidationStats:
         if patch_results:
             self.update_diff_stats(patch_results)
 
+    def _update_single_diff_stats(self, stats_dict, diff_stats):
+        """更新单个统计字典
+        
+        Args:
+            stats_dict: 要更新的统计字典
+            diff_stats: 补丁的diff统计信息
+        """
+        stats_dict['total_hunks'] += diff_stats.get('hunks', 0)
+        stats_dict['total_added'] += diff_stats.get('added_lines', 0)
+        stats_dict['total_deleted'] += diff_stats.get('deleted_lines', 0)
+        stats_dict['total_changed_lines'] += diff_stats.get('total_changed_lines', 0)
+        stats_dict['total_added_tokens'] += diff_stats.get('added_tokens', 0)
+        stats_dict['total_deleted_tokens'] += diff_stats.get('deleted_tokens', 0)
+        stats_dict['total_changed_tokens'] += diff_stats.get('total_changed_tokens', 0)
+        stats_dict['total_edit_distance'] += diff_stats.get('edit_distance', 0)
+        stats_dict['total_edit_similarity'] += diff_stats.get('edit_similarity', 0)
+        stats_dict['total_norm_edit_distance'] += diff_stats.get('norm_edit_distance', 0)
+        stats_dict['total_preserved'] += diff_stats.get('preserved_ratio', 0)
+        stats_dict['patch_count'] += 1
+        
+        ratio = diff_stats.get('preserved_ratio', 0)
+        if ratio > 95:
+            stats_dict['preservation_distribution']['high'] += 1
+        elif ratio > 80:
+            stats_dict['preservation_distribution']['medium'] += 1
+        else:
+            stats_dict['preservation_distribution']['low'] += 1
+    
     def update_diff_stats(self, patch_results):
-        """更新diff统计信息，只统计通过测试的patch（状态为PLAUSIBLE）"""
+        """更新diff统计信息，只统计PLAUSIBLE补丁"""
         for patch in patch_results:
+            # 只统计 PLAUSIBLE 补丁
             if patch.get('patch_status') == 'PLAUSIBLE':
-                print(f"[DEBUG] Found PLAUSIBLE patch")
-                if 'diff_stats' in patch:
-                    stats = patch['diff_stats']
-                    print(f"[DEBUG] Diff stats found: added={stats.get('added_lines', 0)}, deleted={stats.get('deleted_lines', 0)}, preserved={stats.get('preserved_ratio', 0)}%")
-                    self.diff_stats['total_added'] += stats.get('added_lines', 0)
-                    self.diff_stats['total_deleted'] += stats.get('deleted_lines', 0)
-                    self.diff_stats['total_preserved'] += stats.get('preserved_ratio', 0)
-                    self.diff_stats['patch_count'] += 1
+                if 'diff_stats' in patch and patch['diff_stats']:
+                    self._update_single_diff_stats(self.diff_stats, patch['diff_stats'])
                 else:
-                    print(f"[DEBUG] PLAUSIBLE patch found but no diff_stats available")
-                # 即使没有 diff_stats，也进行分布统计（按0处理）
-                ratio = patch.get('diff_stats', {}).get('preserved_ratio', 0)
-                if ratio > 95:
-                    self.diff_stats['preservation_distribution']['high'] += 1
-                elif ratio > 80:
-                    self.diff_stats['preservation_distribution']['medium'] += 1
-                else:
-                    self.diff_stats['preservation_distribution']['low'] += 1
+                    print(f"[WARNING] PLAUSIBLE patch missing diff_stats")
 
     def get_success_rate(self):
-        """计算Top-1、Top-5和Top-10的成功率"""
+        """计算pass@1、pass@5和pass@10的成功率（只计算有完整10个候选补丁的bug）
+        
+        使用无偏估计公式：pass@k = 1 - C(n-c, k) / C(n, k)
+        其中 n=总补丁数, c=正确补丁数, k=采样数
+        """
         if self.total_bugs == 0:
-            return 0.0, 0.0, 0.0  # 确保返回三个值
+            return 0.0, 0.0, 0.0
         
-        top1_success = 0
-        top5_success = 0
-        top10_success = 0
-        
-        print(f"\n[DEBUG] 计算成功率详情:")
-        print(f"[DEBUG] 总bug数量: {self.total_bugs}")
+        pass1_sum = 0.0
+        pass5_sum = 0.0
+        pass10_sum = 0.0
+        valid_bugs = 0
         
         for bug_id, patches in self.bug_results.items():
             if patches is None:
                 continue
             
-            success_position = None
-            for i, p in enumerate(patches, 1):
-                if p is not None and p['patch_status'] == 'PLAUSIBLE':
-                    success_position = i
-                    break
-                
-            if success_position is not None:
-                if success_position == 1:
-                    top1_success += 1
-                if success_position <= 5:
-                    top5_success += 1
-                if success_position <= 10:
-                    top10_success += 1
-        
-        print(f"[DEBUG] Top-1成功数: {top1_success}")
-        print(f"[DEBUG] Top-5成功数: {top5_success}")
-        print(f"[DEBUG] Top-10成功数: {top10_success}")
-        
-        top1_rate = (top1_success / self.total_bugs) * 100
-        top5_rate = (top5_success / self.total_bugs) * 100
-        top10_rate = (top10_success / self.total_bugs) * 100
-        
-        return top1_rate, top5_rate, top10_rate  # 确保这行一定会执行
-
-    def _pass_at_k(self, n, c, k):
-        """计算单个bug的 pass@k（返回[0,1]）。n为候选数，c为正确数。"""
-        if n <= 0 or c <= 0:
-            return 0.0
-        if k >= n:
-            return 1.0
-        # 1 - C(n-c, k) / C(n, k)
-        try:
-            return 1.0 - (math.comb(n - c, k) / math.comb(n, k))
-        except ValueError:
-            # 防御性：组合异常时按最优处理
-            return 1.0
-
-    def get_pass_at_k(self):
-        """计算平均 pass@1/5/10（百分比）。"""
-        if self.total_bugs == 0:
-            return 0.0, 0.0, 0.0
-        k_values = [1, 5, 10]
-        totals = [0.0, 0.0, 0.0]
-        for bug_id, patches in self.bug_results.items():
-            if patches is None:
-                continue
+            # 统计总补丁数和正确补丁数
             n = len(patches)
+            
+            # 只计算有完整10个候选补丁的bug
+            if n != 10:
+                continue
+            
             c = sum(1 for p in patches if p is not None and p.get('patch_status') == 'PLAUSIBLE')
-            for idx, k in enumerate(k_values):
-                totals[idx] += self._pass_at_k(n, c, k)
-        return tuple((t / self.total_bugs) * 100 for t in totals)
+            valid_bugs += 1
+            
+            # 计算 pass@k
+            pass1_sum += self._calc_pass_at_k(n, c, 1)
+            pass5_sum += self._calc_pass_at_k(n, c, 5)
+            pass10_sum += self._calc_pass_at_k(n, c, 10)
+        
+        pass1_rate = (pass1_sum / valid_bugs) * 100 if valid_bugs > 0 else 0
+        pass5_rate = (pass5_sum / valid_bugs) * 100 if valid_bugs > 0 else 0
+        pass10_rate = (pass10_sum / valid_bugs) * 100 if valid_bugs > 0 else 0
+        
+        return pass1_rate, pass5_rate, pass10_rate
+    
+    def _calc_pass_at_k(self, n, c, k):
+        """计算单个bug的pass@k
+        
+        Args:
+            n: 总补丁数（固定为10）
+            c: 正确补丁数（PLAUSIBLE的数量）
+            k: 采样数量
+        
+        Returns:
+            pass@k 的值 (0.0 到 1.0)
+        """
+        # n 现在固定为 10，k 最大为 10
+        assert n == 10, f"Expected n=10, got n={n}"
+        assert k <= 10, f"k should not exceed 10, got k={k}"
+        
+        if c == 0:
+            # 没有正确补丁
+            return 0.0
+        
+        if n - c < k:
+            # 错误补丁数少于k，必然能抽到正确的
+            return 1.0
+        
+        # pass@k = 1 - C(n-c, k) / C(n, k)
+        return 1.0 - (self._comb(n - c, k) / self._comb(n, k))
+    
+    def _comb(self, n, k):
+        """计算组合数 C(n, k) = n! / (k! * (n-k)!)
+        
+        使用优化算法避免大数阶乘溢出
+        """
+        if k > n or k < 0:
+            return 0
+        if k == 0 or k == n:
+            return 1
+        
+        # 优化：C(n, k) = C(n, n-k)，选择较小的k
+        k = min(k, n - k)
+        
+        result = 1
+        for i in range(k):
+            result = result * (n - i) // (i + 1)
+        
+        return result
+    
+    def get_pass_at_k(self):
+        """别名方法，调用 get_success_rate() 以保持兼容性"""
+        return self.get_success_rate()
 
 def load_previous_results(model_id):
     results_dir = f'defects4j/results/{model_id}'
@@ -780,61 +829,30 @@ def load_previous_results(model_id):
     
     status_summary = []
     
-    # 首先尝试从 *-validated.jsonl 文件加载（旧格式）
-    for json_file in glob.glob(os.path.join(results_dir, '*-validated.jsonl')):
-        try:
-            bug_id = os.path.basename(json_file).replace('-validated.jsonl', '')
-            with open(json_file, 'r') as f:
-                results = json.load(f)
-                if results:
-                    previous_results[bug_id] = results
-                    
-                    plausible_found = False
-                    for idx, patch in enumerate(results, 1):
-                        if patch['patch_status'] == 'PLAUSIBLE':
-                            plausible_found = True
-                            status_summary.append({
-                                'bug_id': bug_id,
-                                'date': bug_dates.get(bug_id, 'N/A'),
-                                'status': 'PLAUSIBLE',
-                                'position': idx,
-                                'total_patches': len(results)
-                            })
-                            break
-                    
-                    if not plausible_found:
-                        status_summary.append({
-                            'bug_id': bug_id,
-                            'date': bug_dates.get(bug_id, 'N/A'),
-                            'status': 'FAILED',
-                            'position': None,
-                            'total_patches': len(results)
-                        })
-        except Exception as e:
-            print(f"[WARNING] Failed to load previous results from {json_file}: {e}")
+    # 从 fixed0 目录的 .result 文件加载结果
+    fixed0_dir = os.path.join(results_dir, 'fixed0')
     
-    # 如果没有找到 -validated.jsonl 文件，尝试从 fixed*/*.result 文件加载（新格式）
-    if not previous_results:
-        print(f"[INFO] No *-validated.jsonl files found, trying fixed*/*.result files...")
-        for fixed_dir in sorted(glob.glob(os.path.join(results_dir, 'fixed*'))):
-            if not os.path.isdir(fixed_dir):
-                continue
-            for result_file in glob.glob(os.path.join(fixed_dir, '*.json.result')):
-                try:
-                    bug_id = os.path.basename(result_file).replace('.json.result', '')
-                    with open(result_file, 'r') as f:
-                        results = json.load(f)
-                        if results and bug_id not in previous_results:
-                            # 第一次遇到这个bug，初始化结果列表
-                            previous_results[bug_id] = results
-                        elif results and bug_id in previous_results:
-                            # 已经有这个bug的结果，需要扩展列表
-                            previous_results[bug_id].extend(results)
-                except Exception as e:
-                    print(f"[WARNING] Failed to load result from {result_file}: {e}")
+    if not os.path.exists(fixed0_dir):
+        print(f"[WARNING] fixed0 directory does not exist: {fixed0_dir}")
+        return previous_results
+    
+    result_files = glob.glob(os.path.join(fixed0_dir, '*.json.result'))
+    
+    for result_file in result_files:
+        try:
+            filename = os.path.basename(result_file)
+            bug_id = filename.replace('.json.result', '')
+            
+            with open(result_file, 'r') as f:
+                results = json.load(f)
+        except Exception as e:
+            print(f"[WARNING] Failed to load previous results from {result_file}: {e}")
+            continue
         
-        # 为从.result文件加载的结果生成状态摘要
-        for bug_id, results in previous_results.items():
+        # 处理结果（只包含恰好10个补丁的bug）
+        if results and len(results) == 10:
+            previous_results[bug_id] = results
+            
             plausible_found = False
             for idx, patch in enumerate(results, 1):
                 if patch['patch_status'] == 'PLAUSIBLE':
@@ -856,6 +874,8 @@ def load_previous_results(model_id):
                     'position': None,
                     'total_patches': len(results)
                 })
+        elif results:
+            print(f"[WARNING] Skipping {bug_id} - has {len(results)} patches (expected 10)")
     
     print("\n[PREVIOUS VALIDATION SUMMARY]")
     print("=" * 100)
@@ -883,33 +903,14 @@ def validate_defects4j(model_id, n_generations):
     
     for bug_id, results in previous_results.items():
         stats.update(bug_id, results)
-    top1, top5, top10 = stats.get_success_rate()
-    print("\n[FINAL SUCCESS RATE]")
-    print(f"Top-1:  {top1:.2f}%")
-    print(f"Top-5:  {top5:.2f}%")
-    print(f"Top-10: {top10:.2f}%")
     pass1, pass5, pass10 = stats.get_pass_at_k()
+    print("\n[FINAL SUCCESS RATE]")
     print(f"pass@1:  {pass1:.2f}%")
     print(f"pass@5:  {pass5:.2f}%")
     print(f"pass@10: {pass10:.2f}%")
     
-    print(f"\n[DEBUG] Total patch count for diff stats: {stats.diff_stats['patch_count']}")  # 添加调试信息
-    
-    if stats.diff_stats['patch_count'] > 0:
-        patch_count = stats.diff_stats['patch_count']
-        dist = stats.diff_stats['preservation_distribution']
-        
-        print("\n[PATCH MODIFICATION STATISTICS]")
-        print(f"- Average lines added per patch:    {stats.diff_stats['total_added']/patch_count:.1f}")
-        print(f"- Average lines deleted per patch:  {stats.diff_stats['total_deleted']/patch_count:.1f}")
-        print(f"- Average code preserved:           {stats.diff_stats['total_preserved']/patch_count:.1f}%")
-        
-        print("\nDistribution of code preservation ratio:")
-        total = sum(dist.values())
-        if total > 0:
-            print(f"- Minimal change   (>95% preserved):   {dist['high']:3d} patches ({dist['high']/total*100:5.1f}%)")
-            print(f"- Moderate change (80-95% preserved):  {dist['medium']:3d} patches ({dist['medium']/total*100:5.1f}%)")
-            print(f"- Major change     (<80% preserved):   {dist['low']:3d} patches ({dist['low']/total*100:5.1f}%)")
+    # 打印 PLAUSIBLE 补丁的详细统计信息
+    print_diff_statistics_summary(stats.diff_stats, "PLAUSIBLE Patches")
     
     for i in range(n_generations):
         fix_dir = os.path.join('defects4j/results', str(model_id), f'fixed{i}')
@@ -953,13 +954,13 @@ def validate_defects4j(model_id, n_generations):
     filtered_candidates = {}
     skipped_bugs = []
     for bug_id, patch_info in candidate_patches.items():
-        if len(patch_info['patches']) >= 10:
+        if len(patch_info['patches']) == 10:  # 严格要求10个补丁
             filtered_candidates[bug_id] = patch_info
         else:
             skipped_bugs.append((bug_id, len(patch_info['patches'])))
     
     if skipped_bugs:
-        print("\n[SKIPPED BUGS] (insufficient patches)")
+        print("\n[SKIPPED BUGS] (not exactly 10 patches)")
         print(f"{'Bug ID':20} | {'Patch Count':12}")
         print("-" * 35)
         for bug_id, count in sorted(skipped_bugs):
@@ -967,7 +968,7 @@ def validate_defects4j(model_id, n_generations):
         print(f"\nTotal skipped: {len(skipped_bugs)} bugs")
     
     remaining_bugs = len(filtered_candidates)
-    print(f"\n[INFO] Found {remaining_bugs} new bugs with 10+ patches to validate")
+    print(f"\n[INFO] Found {remaining_bugs} new bugs with exactly 10 patches to validate")
     print(f"[INFO] Total bugs (including previous): {len(previous_results) + remaining_bugs}")
     
     if remaining_bugs == 0:
@@ -1007,33 +1008,17 @@ def validate_defects4j(model_id, n_generations):
                 print(f"Exception when validating {bug_name}: {str(e)}")
                 traceback.print_exc()
     
-    top1, top5, top10 = stats.get_success_rate()
-    print("\n[FINAL SUCCESS RATE]")
-    print(f"Top-1:  {top1:.2f}%")
-    print(f"Top-5:  {top5:.2f}%")
-    print(f"Top-10: {top10:.2f}%")
     pass1, pass5, pass10 = stats.get_pass_at_k()
-    print(f"pass@1:  {pass1:.2f}%")
-    print(f"pass@5:  {pass5:.2f}%")
-    print(f"pass@10: {pass10:.2f}%")
-    print("=" * 100)
+    print("\n[FINAL SUCCESS RATE - Pass@k]")
+    print("=" * 80)
+    print(f"pass@1:  {pass1:6.2f}%")
+    print(f"pass@5:  {pass5:6.2f}%")
+    print(f"pass@10: {pass10:6.2f}%")
+    print("=" * 80)
     
-    # 添加diff统计输出
-    if stats.diff_stats['patch_count'] > 0:
-        patch_count = stats.diff_stats['patch_count']
-        dist = stats.diff_stats['preservation_distribution']
-        
-        print("\n[PATCH MODIFICATION STATISTICS]")
-        print(f"- Average lines added per patch:    {stats.diff_stats['total_added']/patch_count:.1f}")
-        print(f"- Average lines deleted per patch:  {stats.diff_stats['total_deleted']/patch_count:.1f}")
-        print(f"- Average code preserved:           {stats.diff_stats['total_preserved']/patch_count:.1f}%")
-        
-        print("\nDistribution of code preservation ratio:")
-        total = sum(dist.values())
-        if total > 0:
-            print(f"- Minimal change   (>95% preserved):   {dist['high']:3d} patches ({dist['high']/total*100:5.1f}%)")
-            print(f"- Moderate change (80-95% preserved):  {dist['medium']:3d} patches ({dist['medium']/total*100:5.1f}%)")
-            print(f"- Major change     (<80% preserved):   {dist['low']:3d} patches ({dist['low']/total*100:5.1f}%)")
+    # 打印 PLAUSIBLE 补丁的详细统计信息
+    print_diff_statistics_summary(stats.diff_stats, "PLAUSIBLE Patches")
+    
     print("=" * 100)
     
     print('[END VALIDATION]')
@@ -1179,132 +1164,377 @@ def load_and_compare_results(model_id1, model_id2, min_patches=1):
     
     return filtered_stats1, filtered_stats2
 
+def print_detailed_diff_comparison(stats1, stats2, model_id1, model_id2):
+    """打印两个模型的详细diff统计对比"""
+    
+    # 对比 PLAUSIBLE 补丁的统计
+    print(f"\n[DETAILED DIFF COMPARISON - PLAUSIBLE Patches]")
+    print("=" * 120)
+    
+    diff_stats1 = stats1.diff_stats
+    diff_stats2 = stats2.diff_stats
+    
+    if diff_stats1['patch_count'] == 0 or diff_stats2['patch_count'] == 0:
+        print("[WARNING] One or both models have no PLAUSIBLE patches to compare")
+        return
+    
+    print(f"{'Metric':<40} | {model_id1:>15} | {model_id2:>15} | {'Diff':>15} | {'Δ%':>10}")
+    print("-" * 120)
+    
+    # 定义指标：(显示名称, 字段名, 是否显示差异)
+    metrics = [
+        ('Patch count', 'patch_count', False),
+        ('Avg hunks', 'total_hunks', True),
+        ('Avg added lines', 'total_added', True),
+        ('Avg deleted lines', 'total_deleted', True),
+        ('Avg total changed lines', 'total_changed_lines', True),
+        ('Avg added tokens', 'total_added_tokens', True),
+        ('Avg deleted tokens', 'total_deleted_tokens', True),
+        ('Avg total changed tokens', 'total_changed_tokens', True),
+        ('Avg edit distance', 'total_edit_distance', True),
+        ('Avg edit similarity (%)', 'total_edit_similarity', True),
+        ('Avg normalized edit distance', 'total_norm_edit_distance', True),
+        ('Avg preserved ratio (%)', 'total_preserved', True)
+    ]
+    
+    for metric_name, key, show_diff in metrics:
+        if key == 'patch_count':
+            val1 = diff_stats1[key]
+            val2 = diff_stats2[key]
+            print(f"{metric_name:<40} | {val1:>15.0f} | {val2:>15.0f} | {'-':>15} | {'-':>10}")
+        else:
+            # 计算平均值
+            val1 = diff_stats1[key] / diff_stats1['patch_count']
+            val2 = diff_stats2[key] / diff_stats2['patch_count']
+            
+            if show_diff:
+                diff = val2 - val1
+                pct_change = (diff / val1 * 100) if val1 != 0 else 0
+                
+                # 简化颜色逻辑：增加用绿色，减少用红色
+                if diff > 0:
+                    color = '\033[92m'  # 绿色
+                elif diff < 0:
+                    color = '\033[91m'  # 红色
+                else:
+                    color = '\033[0m'   # 无颜色
+                
+                print(f"{metric_name:<40} | {val1:>15.2f} | {val2:>15.2f} | {color}{diff:>+15.2f}\033[0m | {color}{pct_change:>+9.2f}%\033[0m")
+            else:
+                print(f"{metric_name:<40} | {val1:>15.2f} | {val2:>15.2f} | {'-':>15} | {'-':>10}")
+    
+    print("=" * 120)
+
 def print_comparison_results(stats1, stats2, model_id1, model_id2):
-    print("\n[COMPARISON RESULTS]")
+    # 先打印详细的diff统计对比
+    print_detailed_diff_comparison(stats1, stats2, model_id1, model_id2)
+    
+    # 再打印 Pass@k 对比
+    print("\n[COMPARISON RESULTS - Pass@k]")
     print("=" * 80)
-    print(f"{'Metric':15} | {model_id1:>10} | {model_id2:>10} | {'Diff':>10}")
+    print(f"{'Metric':15} | {model_id1:>15} | {model_id2:>15} | {'Diff':>10}")
     print("-" * 80)
     
-    top1_1, top5_1, top10_1 = stats1.get_success_rate()
-    top1_2, top5_2, top10_2 = stats2.get_success_rate()
     pass1_1, pass5_1, pass10_1 = stats1.get_pass_at_k()
     pass1_2, pass5_2, pass10_2 = stats2.get_pass_at_k()
     
     metrics = [
-        ("Top-1", top1_1, top1_2),
-        ("Top-5", top5_1, top5_2),
-        ("Top-10", top10_1, top10_2)
+        ("pass@1", pass1_1, pass1_2),
+        ("pass@5", pass5_1, pass5_2),
+        ("pass@10", pass10_1, pass10_2)
     ]
     
     for metric_name, val1, val2 in metrics:
         diff = val2 - val1
         diff_str = f"{diff:+.2f}%" if diff != 0 else "0.00%"
         color = '\033[92m' if diff > 0 else '\033[91m' if diff < 0 else '\033[0m'
-        print(f"{metric_name:15} | {val1:>9.2f}% | {val2:>9.2f}% | {color}{diff_str:>10}\033[0m")
-
-    print("-" * 80)
-    pass_metrics = [
-        ("pass@1", pass1_1, pass1_2),
-        ("pass@5", pass5_1, pass5_2),
-        ("pass@10", pass10_1, pass10_2)
-    ]
-    for metric_name, val1, val2 in pass_metrics:
-        diff = val2 - val1
-        diff_str = f"{diff:+.2f}%" if diff != 0 else "0.00%"
-        color = '\033[92m' if diff > 0 else '\033[91m' if diff < 0 else '\033[0m'
-        print(f"{metric_name:15} | {val1:>9.2f}% | {val2:>9.2f}% | {color}{diff_str:>10}\033[0m")
+        print(f"{metric_name:15} | {val1:>14.2f}% | {val2:>14.2f}% | {color}{diff_str:>10}\033[0m")
     
     print("=" * 80)
     print(f"Total bugs compared: {stats1.total_bugs}")
 
+def count_tokens(text):
+    """简单的token计数，使用空格和常见分隔符分割"""
+    if not text:
+        return 0
+    # 按空格、标点等分割来近似统计token
+    import re
+    tokens = re.findall(r'\b\w+\b|[^\w\s]', text)
+    return len(tokens)
+
+
+def levenshtein_distance(s1, s2):
+    """计算两个字符串之间的Levenshtein编辑距离"""
+    if len(s1) < len(s2):
+        return levenshtein_distance(s2, s1)
+    
+    if len(s2) == 0:
+        return len(s1)
+    
+    previous_row = range(len(s2) + 1)
+    for i, c1 in enumerate(s1):
+        current_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            # 插入、删除、替换的代价
+            insertions = previous_row[j + 1] + 1
+            deletions = current_row[j] + 1
+            substitutions = previous_row[j] + (c1 != c2)
+            current_row.append(min(insertions, deletions, substitutions))
+        previous_row = current_row
+    
+    return previous_row[-1]
+
+
 def calc_diff_stats(buggy, fix):
-    """计算补丁的diff统计信息，比较错误代码和修复后的代码"""
-    if not buggy or not fix:  # 处理空输入
-        return {'added_lines': 0, 'deleted_lines': 0, 'preserved_ratio': 0.0}
+    """
+    计算详细的diff统计信息
+    返回：
+    - hunks: diff块的数量
+    - added_lines: 新增行数
+    - deleted_lines: 删除行数
+    - total_changed_lines: 总变化行数 (added + deleted)
+    - added_tokens: 新增的token数量
+    - deleted_tokens: 删除的token数量
+    - total_changed_tokens: 总变化token数量
+    - edit_distance: Levenshtein编辑距离
+    - edit_similarity: 编辑相似度 (%) - 基于编辑距离
+    - norm_edit_distance: 归一化编辑距离 (0-1)
+    - norm_edit_distance_pct: 归一化编辑距离百分比
+    - buggy_length: buggy代码字符数
+    - fix_length: fix代码字符数
+    - preserved_ratio: 代码保留比例 (%)
+    """
+    if not buggy or not fix:
+        return {
+            'hunks': 0,
+            'added_lines': 0,
+            'deleted_lines': 0,
+            'total_changed_lines': 0,
+            'added_tokens': 0,
+            'deleted_tokens': 0,
+            'total_changed_tokens': 0,
+            'edit_distance': 0,
+            'edit_similarity': 100.0,
+            'norm_edit_distance': 0.0,
+            'norm_edit_distance_pct': 0.0,
+            'buggy_length': 0,
+            'fix_length': 0,
+            'preserved_ratio': 0.0
+        }
     
     buggy_lines = buggy.strip().splitlines()
     fix_lines = fix.strip().splitlines()
     
-    # 计算增删行数
-    diff = list(difflib.ndiff(buggy_lines, fix_lines))
-    added = sum(1 for line in diff if line.startswith('+ '))
-    deleted = sum(1 for line in diff if line.startswith('- '))
+    # 生成unified diff来统计hunks
+    diff_lines = list(difflib.unified_diff(buggy_lines, fix_lines, lineterm=''))
+    hunks = sum(1 for line in diff_lines if line.startswith('@@'))
     
-    # 计算保留比例
+    # 使用ndiff统计增删行数和token数
+    diff = list(difflib.ndiff(buggy_lines, fix_lines))
+    added_lines = [line[2:] for line in diff if line.startswith('+ ')]
+    deleted_lines = [line[2:] for line in diff if line.startswith('- ')]
+    
+    added_line_count = len(added_lines)
+    deleted_line_count = len(deleted_lines)
+    
+    # 统计token
+    added_tokens = sum(count_tokens(line) for line in added_lines)
+    deleted_tokens = sum(count_tokens(line) for line in deleted_lines)
+    
+    # 计算编辑距离和相似度
+    buggy_str = buggy.strip()
+    fix_str = fix.strip()
+    edit_dist = levenshtein_distance(buggy_str, fix_str)
+    max_len = max(len(buggy_str), len(fix_str))
+    edit_similarity = (1 - edit_dist / max_len) * 100 if max_len > 0 else 100.0
+    norm_edit = (edit_dist / max_len) if max_len > 0 else 0.0
+    norm_edit_pct = norm_edit * 100
+    buggy_len_chars = len(buggy_str)
+    fix_len_chars = len(fix_str)
+    
+    # 计算保留比例 (Code Consistency Rate)
+    # CCR = r / k, 其中 k 是修复后代码的总行数，r 是保留的代码行数
     matcher = difflib.SequenceMatcher(None, buggy_lines, fix_lines)
-    preserved = sum(block.size for block in matcher.get_matching_blocks())
-    preserved_ratio = preserved / len(buggy_lines) if buggy_lines else 0.0
+    matching_blocks = matcher.get_matching_blocks()
+    # 排除最后一个虚拟块 (len(a), len(b), 0)
+    preserved = sum(block.size for block in matching_blocks[:-1])
+    preserved_ratio = (preserved / len(fix_lines) * 100) if fix_lines else 0.0
     
     return {
-        'added_lines': added,
-        'deleted_lines': deleted,
-        'preserved_ratio': round(preserved_ratio * 100, 2)
+        'hunks': hunks,
+        'added_lines': added_line_count,
+        'deleted_lines': deleted_line_count,
+        'total_changed_lines': added_line_count + deleted_line_count,
+        'added_tokens': added_tokens,
+        'deleted_tokens': deleted_tokens,
+        'total_changed_tokens': added_tokens + deleted_tokens,
+        'edit_distance': edit_dist,
+        'edit_similarity': round(edit_similarity, 2),
+        'norm_edit_distance': round(norm_edit, 4),
+        'norm_edit_distance_pct': round(norm_edit_pct, 2),
+        'buggy_length': buggy_len_chars,
+        'fix_length': fix_len_chars,
+        'preserved_ratio': round(preserved_ratio, 2)
     }
 
 def print_diff_stats(diff_stats):
     """打印补丁的差异统计信息"""
     print(f"[DIFF STATS]   | Added: {diff_stats['added_lines']}, Deleted: {diff_stats['deleted_lines']}, Preserved: {diff_stats['preserved_ratio']}%")
 
-def recalculate_diff_stats(model_id):
-    """重新计算所有已验证patch的diff统计"""
-    print(f"[INFO] 重新计算 {model_id} 的diff统计")
-    results_dir = os.path.join('defects4j/results', model_id)
+def print_diff_statistics_summary(stats_dict, title):
+    """打印diff统计汇总信息（只针对PLAUSIBLE补丁）
     
-    for validated_file in glob.glob(os.path.join(results_dir, '*-validated.jsonl')):
-        bug_id = os.path.basename(validated_file).replace('-validated.jsonl', '')
-        print(f"\n[处理] {bug_id}")
+    Args:
+        stats_dict: 包含统计信息的字典
+        title: 统计标题（如 "PLAUSIBLE Patches"）
+    """
+    patch_count = stats_dict['patch_count']
+    if patch_count == 0:
+        return
+    
+    dist = stats_dict['preservation_distribution']
+    
+    print(f"\n[PATCH MODIFICATION STATISTICS - {title}]")
+    print(f"{'='*80}")
+    print(f"Total patches analyzed: {patch_count}")
+    print(f"\n{'Metric':<40} | {'Average':>15}")
+    print(f"{'-'*80}")
+    print(f"{'Hunks per patch':<40} | {stats_dict['total_hunks']/patch_count:>15.2f}")
+    print(f"{'Lines added per patch':<40} | {stats_dict['total_added']/patch_count:>15.2f}")
+    print(f"{'Lines deleted per patch':<40} | {stats_dict['total_deleted']/patch_count:>15.2f}")
+    print(f"{'Total changed lines per patch':<40} | {stats_dict['total_changed_lines']/patch_count:>15.2f}")
+    print(f"{'Tokens added per patch':<40} | {stats_dict['total_added_tokens']/patch_count:>15.2f}")
+    print(f"{'Tokens deleted per patch':<40} | {stats_dict['total_deleted_tokens']/patch_count:>15.2f}")
+    print(f"{'Total changed tokens per patch':<40} | {stats_dict['total_changed_tokens']/patch_count:>15.2f}")
+    print(f"{'Edit distance per patch':<40} | {stats_dict['total_edit_distance']/patch_count:>15.2f}")
+    print(f"{'Edit similarity (%)':<40} | {stats_dict['total_edit_similarity']/patch_count:>15.2f}")
+    print(f"{'Normalized edit distance':<40} | {stats_dict['total_norm_edit_distance']/patch_count:>15.4f}")
+    print(f"{'Code preserved ratio (%)':<40} | {stats_dict['total_preserved']/patch_count:>15.2f}")
+    
+    print(f"\n{'Distribution of code preservation ratio:':}")
+    total = sum(dist.values())
+    if total > 0:
+        print(f"  Minimal change   (>95% preserved):   {dist['high']:3d} patches ({dist['high']/total*100:5.1f}%)")
+        print(f"  Moderate change (80-95% preserved):  {dist['medium']:3d} patches ({dist['medium']/total*100:5.1f}%)")
+        print(f"  Major change     (<80% preserved):   {dist['low']:3d} patches ({dist['low']/total*100:5.1f}%)")
+    print(f"{'='*80}")
+
+def recalculate_diff_stats(model_id):
+    """重新计算所有已验证patch的diff统计，保存到.result文件"""
+    print(f"[INFO] 重新计算 {model_id} 的统计信息")
+    results_dir = os.path.join('defects4j/results', model_id)
+    fixed0_dir = os.path.join(results_dir, 'fixed0')
+    
+    if not os.path.exists(fixed0_dir):
+        print(f"[ERROR] fixed0目录不存在: {fixed0_dir}")
+        return
+    
+    # 统计信息
+    total_files = 0
+    updated_files = 0
+    skipped_files = 0
+    
+    # 扫描 fixed0 目录下的所有 .result 文件
+    result_files = glob.glob(os.path.join(fixed0_dir, '*.json.result'))
+    
+    for result_file in result_files:
+        total_files += 1
+        # 提取 bug_id (例如: Chart-1.json.result -> Chart-1)
+        filename = os.path.basename(result_file)
+        bug_id = filename.replace('.json.result', '')
         
         try:
             # 读取dataset中的buggy代码
             dataset_file = os.path.join('defects4j/dataset', f'{bug_id}.json')
+            if not os.path.exists(dataset_file):
+                print(f"[警告] Dataset文件不存在: {dataset_file}")
+                skipped_files += 1
+                continue
+            
             with open(dataset_file) as df:
                 dataset_info = json.load(df)
                 buggy_code = dataset_info['buggy']
             
             # 读取验证结果
-            with open(validated_file, 'r') as f:
+            with open(result_file, 'r') as f:
                 results = json.load(f)
             
-            # 重新计算每个PLAUSIBLE patch的diff
-            modified = False
-            for patch in results:
+            # 只对 PLAUSIBLE 补丁重新计算统计信息
+            plausible_count = 0
+            total_patches = len(results)
+            
+            for idx, patch in enumerate(results, 1):
+                # 只对 PLAUSIBLE 补丁计算详细的 diff 统计
                 if patch['patch_status'] == 'PLAUSIBLE':
                     patch['diff_stats'] = calc_diff_stats(buggy_code, patch['patch_code'])
-                    print_diff_stats(patch['diff_stats'])
-                    modified = True
+                    plausible_count += 1
+                else:
+                    # 非 PLAUSIBLE 补丁不计算详细统计
+                    patch['diff_stats'] = None
             
-            # 如果有修改，保存更新后的结果
-            if modified:
-                with open(validated_file, 'w') as f:
+            # 保存更新后的结果
+            with open(result_file, 'w') as f:
                     json.dump(results, f, indent=2)
-                print(f"[已更新] {bug_id}")
-            else:
-                print(f"[跳过] {bug_id} - 没有PLAUSIBLE的patch")
+            
+            status_msg = f"[更新] {bug_id} - {total_patches} 个补丁"
+            if plausible_count > 0:
+                status_msg += f" (其中 {plausible_count} 个PLAUSIBLE)"
+            print(status_msg)
+            updated_files += 1
                 
         except Exception as e:
-            print(f"[错误] 处理 {bug_id} 时出错: {e}")
+            print(f"[错误] 处理 {result_file} 时出错: {e}")
             traceback.print_exc()
+            skipped_files += 1
     
-    print("\n[完成] diff统计重新计算完成")
+    print(f"\n[完成] 统计信息重新计算完成")
+    print(f"- 总文件数: {total_files}")
+    print(f"- 已更新: {updated_files}")
+    print(f"- 已跳过: {skipped_files}")
 
 if __name__ == '__main__':
     start_val_time = time.time()
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('-m', '--model_id', type=str, required=True, help='主模型ID')
-    parser.add_argument('-n', '--n_generations', type=int, default=1, help='生成次数')
-    parser.add_argument('--recalc_diff', action='store_true', help='只重新计算diff统计，不重新运行测试')
-    parser.add_argument('--compare_with', type=str, default=None, help='对比另一个模型的结果')
+    parser.add_argument('-m', '--model_id', type=str, required=True)
+    parser.add_argument('-n', '--n_generations', type=int, default=1)
+    parser.add_argument('--recalc', action='store_true', help='重新计算diff统计和Pass@k，不重新运行测试')
+    parser.add_argument('--compare', type=str, default=None, help='对比另一个模型的结果')
     parser.add_argument('--min_patches', type=int, default=10, help='对比时最小patch数量要求（默认10）')
     args = parser.parse_args()
     
-    if args.recalc_diff:
-        recalculate_diff_stats(args.model_id)
-    elif args.compare_with:
+    if args.compare:
         # 对比模式
-        print(f"\n[对比模式] 对比 {args.model_id} 和 {args.compare_with}")
-        stats1, stats2 = load_and_compare_results(args.model_id, args.compare_with, args.min_patches)
-        print_comparison_results(stats1, stats2, args.model_id, args.compare_with)
+        print(f"\n[COMPARE MODE] Comparing {args.model_id} vs {args.compare}")
+        print(f"[FILTER] Only comparing bugs with >={args.min_patches} patches\n")
+        
+        stats1, stats2 = load_and_compare_results(args.model_id, args.compare, args.min_patches)
+        print_comparison_results(stats1, stats2, args.model_id, args.compare)
+        
+    elif args.recalc:
+        # 重新计算diff统计和Pass@k
+        print(f"[INFO] 重新计算 {args.model_id} 的diff统计和Pass@k")
+        
+        # 1. 重新计算diff统计
+        recalculate_diff_stats(args.model_id)
+        
+        # 2. 重新计算Pass@k
+        stats = ValidationStats()
+        previous_results = load_previous_results(args.model_id)
+        print(f"\n[INFO] Loaded {len(previous_results)} bugs with exactly 10 patches")
+        
+        for bug_id, results in previous_results.items():
+            stats.update(bug_id, results)
+        
+        pass1, pass5, pass10 = stats.get_pass_at_k()
+        print("\n[RECALCULATED SUCCESS RATE - Pass@k]")
+        print("=" * 80)
+        print(f"pass@1:  {pass1:6.2f}%")
+        print(f"pass@5:  {pass5:6.2f}%")
+        print(f"pass@10: {pass10:6.2f}%")
+        print("=" * 80)
+        
+        # 打印 PLAUSIBLE 补丁的详细统计信息
+        print_diff_statistics_summary(stats.diff_stats, "PLAUSIBLE Patches")
     else:
-        # 验证模式
         validate_defects4j(args.model_id, args.n_generations)
