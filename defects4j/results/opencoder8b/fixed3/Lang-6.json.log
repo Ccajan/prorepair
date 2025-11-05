@@ -1,0 +1,150 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# StringIndexOutOfBoundsException in CharSequenceTranslator
+I found that there is bad surrogate pair handling in the CharSequenceTranslator
+This is a simple test case for this problem.
+\uD83D\uDE30 is a surrogate pair.
+
+@Test
+public void testEscapeSurrogatePairs() throws Exception {
+    assertEquals("\uD83D\uDE30", StringEscapeUtils.escapeCsv("\uD83D\uDE30"));
+}
+
+You'll get the exception as shown below.
+
+java.lang.StringIndexOutOfBoundsException: String index out of range: 2
+	at java.lang.String.charAt(String.java:658)
+	at java.lang.Character.codePointAt(Character.java:4668)
+	at org.apache.commons.lang3.text.translate.CharSequenceTranslator.translate(CharSequenceTranslator.java:95)
+	at org.apache.commons.lang3.text.translate.CharSequenceTranslator.translate(CharSequenceTranslator.java:59)
+	at org.apache.commons.lang3.StringEscapeUtils.escapeCsv(StringEscapeUtils.java:556)
+
+Patch attached, the method affected:
+
+public final void translate(CharSequence input, Writer out) throws IOException
+This is an incorrect Java code (src/main/java/org/apache/commons/lang3/text/translate/CharSequenceTranslator.java):
+```java
+public final void translate(CharSequence input, Writer out) throws IOException {
+    if (out == null) {
+        throw new IllegalArgumentException("The Writer must not be null");
+    }
+    if (input == null) {
+        return;
+    }
+    int pos = 0;
+    int len = input.length();
+    while (pos < len) {
+        int consumed = translate(input, pos, out);
+        if (consumed == 0) {
+            char[] c = Character.toChars(Character.codePointAt(input, pos));
+            out.write(c);
+            pos+= c.length;
+            continue;
+        }
+        // contract with translators is that they have to understand codepoints 
+        // and they just took care of a surrogate pair
+        for (int pt = 0; pt < consumed; pt++) {
+            pos += Character.charCount(Character.codePointAt(input, pos));
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public final void translate(CharSequence input, Writer out) throws IOException {
+    if (out == null) {
+        throw new IllegalArgumentException("The Writer must not be null");
+    }
+    if (input == null) {
+        return;
+    }
+    int pos = 0;
+    int len = input.length();
+    while (pos < len) {
+        int codePoint = Character.codePointAt(input, pos);
+        if (!isHighSurrogate(codePoint)) { // check if it's not part of a surrogate pair
+            if (codePoint == DOUBLE_QUOTE || codePoint == BACKSLASH) {
+                out.write(BACKSLASH);
+            }
+            writeCodePoint(out, codePoint);
+            pos++;
+            continue;
+        }
+        if ((pos + 1) >= len) {
+            break; // insufficient characters remaining in sequence
+        }
+        int next = input.charAt(pos + 1);
+        if (!isLowSurrogate(next)) {
+            break; // character is high surrogate but next one isn't low surrogate
+        }
+        writeSurrogatePair(out, codePoint, next);
+        pos += 2;
+    }
+}
+
+private static boolean isHighSurrogate(int cp) {
+    return cp >= MIN_HIGH_SURROGATE && cp <= MAX_HIGH_SURROGATE;
+}
+
+private static boolean isLowSurrogate(int cp) {
+    return cp >= MIN_LOW_SURROGATE && cp <= MAX_LOW_SURROGATE;
+}
+
+private static void writeCodePoint(Writer writer, int codePoint) throws IOException {
+    if (codePoint > MAX_CSV_CHAR) {
+        writer.write(REPLACEMENT_CHARACTER);
+    } else {
+        writer.write((char) codePoint);
+    }
+}
+
+private static void writeSurrogatePair(Writer writer, int first, int second) throws IOException {
+    if (first < MIN_HIGH_SURROGATE || first > MAX_HIGH_SURROGATE ||
+        second < MIN_LOW_SURROGATE || second > MAX_LOW_SURROGATE) {
+        throw new AssertionError("Invalid surrogate pair detected");
+    }
+    int supplementaryCodePoint = SURROGATE_OFFSET + ((first - MIN_HIGH_SURROGATE) << HALF_SHIFT_COUNT) + (second - MIN_LOW_SURROGATE);
+    writeCodePoint(writer, supplementaryCodePoint);
+}
+
+private static final int MAX_CSV_CHAR = Character.MAX_VALUE;
+private static final int MIN_HIGH_SURROGATE = '\ud800';
+private static final int MAX_HIGH_SURROGATE = '\udbff';
+private static final int MIN_LOW_SURROGATE = '\udc00';
+private static final int MAX_LOW_SURROGATE = '\udfff';
+private static final int SURROGATE_OFFSET = 0x10000;
+private static final int HALF_SHIFT_COUNT = 10;
+
+// Constants used in CSV escaping logic
+private static final char DOUBLE_QUOTE = '"';
+private static final char BACKSLASH = '\\';
+private static final char REPLACEMENT_CHARACTER = '\ufffd';
+
+// Test cases to verify the solution correctness
+public static void main(String[] args) {
+    try {
+        System.out.println(escape("\"Hello, World!\"")); // Should output "\"Hello,\"\\\"World!\\\""
+        System.out.println(escape("\ud83d\ude30")); // Should correctly escape the surrogate pair
+    } catch (IOException e) {
+        e.printStackTrace();
+    }
+}
+
+public static String escape(String input) throws IOException {
+    StringBuilder builder = new StringBuilder();
+    CharBuffer buffer = CharBuffer.wrap(input);
+    Writer writer = new BufferedWriter(new OutputStreamWriter(new ByteArrayOutputStream(), "UTF-8"));
+    for (CharSequenceTranslator translator : TRANSLATORS) {
+        translator.translate(buffer, writer);
+    }
+    return writer.toString();
+}
+```
+
+Note: The `escape()` method in the example is intended to demonstrate how the `StringIndexOutOfBoundsException` could potentially occur due to incorrect surrogate handling. It should be used as a reference on how to properly handle Unicode surrogates when implementing a function like this.
+

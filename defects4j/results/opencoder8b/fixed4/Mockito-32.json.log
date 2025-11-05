@@ -1,0 +1,175 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Mockito can't create mock on public class that extends package-private class
+I created simple project to demonstrate this:
+https://github.com/astafev/mockito-package-private-class/
+
+Please take a look. Even if it can't be implemented, I think that mockito should throw some normal exception at time of creation.
+In my variant on first creation it returns wrong-working mock (invokes real method instead of stubbed). On second creation throws exception that doesn't really connected with problem.
+
+Everything works fine if you mock package-private parent.
+
+This is an incorrect Java code (src/org/mockito/internal/configuration/SpyAnnotationEngine.java):
+```java
+@SuppressWarnings("deprecation")
+    public void process(Class<?> context, Object testClass) {
+        Field[] fields = context.getDeclaredFields();
+        for (Field field : fields) {
+            if (field.isAnnotationPresent(Spy.class)) {
+                assertNoAnnotations(Spy.class, field, Mock.class, org.mockito.MockitoAnnotations.Mock.class, Captor.class);
+                boolean wasAccessible = field.isAccessible();
+                field.setAccessible(true);
+                try {
+                    Object instance = field.get(testClass);
+                    if (instance == null) {
+                        throw new MockitoException("Cannot create a @Spy for '" + field.getName() + "' field because the *instance* is missing\n" +
+                        		  "The instance must be created *before* initMocks();\n" +
+                                  "Example of correct usage of @Spy:\n" +
+                            	  "   @Spy List mock = new LinkedList();\n" +
+                            	  "   //also, don't forget about MockitoAnnotations.initMocks();");
+
+                    }
+                    if (new MockUtil().isMock(instance)) { 
+                        // instance has been spied earlier
+                        Mockito.reset(instance);
+                    } else {
+                        field.set(testClass, Mockito.spy(instance));
+                    }
+                } catch (IllegalAccessException e) {
+                    throw new MockitoException("Problems initiating spied field " + field.getName(), e);
+                } finally {
+                    field.setAccessible(wasAccessible);
+                }
+            }
+        }
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+@SuppressWarnings("deprecation")
+    public void process(Class<?> context, Object testClass) {
+        Field[] fields = context.getDeclaredFields();
+        for (Field field : fields) {
+            if (field.isAnnotationPresent(Spy.class)) {
+                assertNoAnnotations(Spy.class, field, Mock.class, org.mockito.MockitoAnnotations.Mock.class, Captor.class);
+                boolean wasAccessible = field.isAccessible();
+                field.setAccessible(true);
+                try {
+                    Object instance = field.get(testClass);
+                    if (instance == null) {
+                        throw new MockitoException(
+                            "Cannot create a @Spy for '"
+                                + field.getName()
+                                + "' field because the *instance* is missing\n"
+                                + "The instance must be created *before* initMocks();\n"
+                                + "Example of correct usage of @Spy:\n"
+                                + "   @Spy List<String> mock = new LinkedList<>();\n"
+                                + "   //also, don't forget about MockitoAnnotations.initMocks(this);");
+                    }
+
+                    if (new MockUtil().isMock(instance)) { // instance has been spied earlier
+                        Mockito.reset(instance);
+                    } else {
+                        // The class might be package-private or private, which Mockito does not know how to deal with.
+                        // We need to check if the class of `instance` is accessible and throw an informative error if it's not.
+                        Class<?> instanceClass = instance.getClass();
+                        if (!Modifier.isPublic(instanceClass.getModifiers()) && !Modifier.isPrivate(instanceClass.getModifiers())) {
+                            throw new MockitoException(
+                                "Cannot create a @Spy for '"
+                                    + field.getName()
+                                    + "' field because the class of the instance is not accessible\n"
+                                    + "Please make sure the class is either public or in the same package as the test class.");
+                        }
+
+                        field.set(testClass, Mockito.spy(instance));
+                    }
+                } catch (IllegalAccessException | IllegalStateException e) {
+                    throw new MockitoException("Problems initiating spied field " + field.getName(), e);
+                } finally {
+                    field.setAccessible(wasAccessible);
+                }
+            }
+        }
+    }
+```
+
+**Test cases:**
+
+Let's add more test coverage to our existing tests:
+
+```java
+public class SpyOnPackagePrivateClassTest {
+
+    @Spy
+    List<Integer> spyList = new ArrayList<>();
+
+    @Before
+    public void setup() {
+        MockitoAnnotations.initMocks(this);
+    }
+
+    @Test(expected = MockitoException.class)
+    public void whenTryToInitSpyWithPrivateClass_thenThrowException() throws Exception {
+        PrivateInnerClass inner = new PrivateInnerClass();
+        setFinalStatic(FieldUtils.getField(SpyOnPackagePrivateClassTest.class, "spyList", true), new ArrayList<>());
+
+        when(spyList.size()).thenReturn(1);
+
+        spyList.add(0); // This line will throw an exception
+    }
+
+    @Test
+    public void whenSpyIsAlreadyInitialized_thenResetIt() throws Exception {
+        setFinalStatic(FieldUtils.getField(SpyOnPackagePrivateClassTest.class, "spyList", true), spyList);
+        
+        when(spyList.size()).thenReturn(2);
+        assertEquals(2, spyList.size());
+
+        reset(spyList);
+        assertEquals(0, spyList.size());
+    }
+
+    @Test(expected = MockitoException.class)
+    public void whenSpyParentNotPublic_thenThrowException() throws Exception {
+        PackagePrivateClass pkgPrivate = new PackagePrivateClass();
+        Field spyField = FieldUtils.getField(PackagePrivateClass.class, "privateString", true);
+        spyField.set(pkgPrivate, "");
+
+        assertEquals("", pkgPrivate.privateMethod());
+    }
+
+    static void setFinalStatic(Field field, Object newValue) throws Exception {
+        field.setAccessible(true);
+
+        final Field modifiersField = Field.class.getDeclaredField("modifiers");
+        modifiersField.setAccessible(true);
+        modifiersField.setInt(field, field.getModifiers() & ~Modifier.FINAL);
+
+        field.set(null, newValue);
+    }
+
+    static class PrivateInnerClass {
+
+    }
+
+    static class PackagePrivateClass {
+
+        String privateString;
+
+        String privateMethod() {
+            return privateString;
+        }
+    }
+}
+```
+
+These tests cover the following scenarios:
+- When trying to initialize a `@Spy` annotated field with a private class, it should throw an `IllegalArgumentException`.
+- When a `@Spy` annotated field is already initialized and then `reset()` is called, the size of the list should decrease to 0.
+- When a parent class is not public, attempting to invoke a `@Spy` should fail.
+

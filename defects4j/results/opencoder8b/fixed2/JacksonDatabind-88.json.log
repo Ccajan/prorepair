@@ -1,0 +1,118 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Missing type checks when using polymorphic type ids
+(report by Lukes Euler)
+JavaType supports limited amount of generic typing for textual representation, originally just to support typing needed for EnumMap (I think). Based on some reports, it appears that some of type compatibility checks are not performed in those cases; if so, they should be made since there is potential for abuse.
+The problem here although actual type assignment will fail later on, ability to trigger some of processing (instantiation of incompatible classes, perhaps assingnment of properties) may itself be vulnerability.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/jsontype/impl/ClassNameIdResolver.java):
+```java
+protected JavaType _typeFromId(String id, DatabindContext ctxt) throws IOException
+{
+    /* 30-Jan-2010, tatu: Most ids are basic class names; so let's first
+     *    check if any generics info is added; and only then ask factory
+     *    to do translation when necessary
+     */
+    TypeFactory tf = ctxt.getTypeFactory();
+    if (id.indexOf('<') > 0) {
+        // note: may want to try combining with specialization (esp for EnumMap)?
+        // 17-Aug-2017, tatu: As per [databind#1735] need to ensure assignment
+        //    compatibility -- needed later anyway, and not doing so may open
+        //    security issues.
+        JavaType t = tf.constructFromCanonical(id);
+            // Probably cleaner to have a method in `TypeFactory` but can't add in patch
+        return t;
+    }
+    Class<?> cls;
+    try {
+        cls =  tf.findClass(id);
+    } catch (ClassNotFoundException e) {
+        // 24-May-2016, tatu: Ok, this is pretty ugly, but we should always get
+        //   DeserializationContext, just playing it safe
+        if (ctxt instanceof DeserializationContext) {
+            DeserializationContext dctxt = (DeserializationContext) ctxt;
+            // First: we may have problem handlers that can deal with it?
+            return dctxt.handleUnknownTypeId(_baseType, id, this, "no such class found");
+        }
+        // ... meaning that we really should never get here.
+        return null;
+    } catch (Exception e) {
+        throw new IllegalArgumentException("Invalid type id '"+id+"' (for id type 'Id.class'): "+e.getMessage(), e);
+    }
+    return tf.constructSpecializedType(_baseType, cls);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import com.fasterxml.jackson.databind.BeanDescription;
+import com.fasterxml.jackson.databind.DatabindContext;
+import com.fasterxml.jackson.databind.JavaType;
+import com.fasterxml.jackson.databind.type.TypeBindings;
+
+protected JavaType _typeFromId(String id, DatabindContext ctxt) throws IOException
+{
+    /* 30-Jan-2010, tatu: Most ids are basic class names; so let's first
+     *    check if any generics info is added; and only then ask factory
+     *    to do translation when necessary
+     */
+    BeanDescription beanDesc = ctxt.getConfig().introspectClassAnnotations(getClassForId(id));
+    TypeFactory tf = ctxt.getTypeFactory();
+    int ltIndex = id.indexOf('<');
+    if (ltIndex > 0 && id.endsWith(">")) {
+        // Extract type bindings from the raw canonical string
+        String[] typeArgStrings = id.substring(ltIndex + 1, id.length() - 1).split(",");
+        String baseTypeName = id.substring(0, ltIndex);
+        JavaType baseType = tf.constructType(baseTypeName);
+
+        // Use BeanDescription's TypeBindings constructor to create a new instance
+        TypeBindings typeBindings = TypeBindings.create(beanDesc.getRawClass(), typeArgStrings);
+        JavaType specializedType = baseType.withTypeBindings(typeBindings);
+
+        // Ensure the constructed types are assignable to the base type
+        if (!baseType.isAssignableFrom(specializedType)) {
+            throw new IllegalArgumentException("Constructed type " + specializedType.getCanonicalName()
+                    + " is not assignable to base type " + baseType.getCanonicalName());
+        }
+
+        return specializedType;
+    }
+    Class<?> cls = getClassForId(id);
+    return tf.constructSpecializedType(_baseType, cls);
+}
+
+private Class<?> getClassForId(String id) throws ClassNotFoundException {
+    // Attempt to find class using type factory or class loader
+    Class<?> cls;
+    try {
+        cls = tf.findClass(id);
+    } catch (ClassNotFoundException e) {
+        // Fallback to current thread's context class loader if available
+        ClassLoader cl = Thread.currentThread().getContextClassLoader();
+        if (cl != null) {
+            try {
+                cls = Class.forName(id, false, cl);
+            } catch (Exception ex) {
+                throw new ClassNotFoundException("Unable to resolve class '" + id + "'", e);
+            }
+        } else {
+            throw e;
+        }
+    }
+    return cls;
+}
+```
+
+**Test Cases**:
+To verify the correctness of the solution, the following test cases can be used:
+
+1. Test with a valid class name without generic parameters.
+2. Test with a valid class name containing generic parameters and ensuring proper binding.
+3. Test with an invalid class name to see if it correctly throws a `ClassNotFoundException`.
+4. Test with a non-empty class name and `<` or `>` characters without enclosing generic parameters to see if it correctly throws an `IllegalArgumentException`.
+
+These tests would be written in a separate testing framework such as JUnit or TestNG and would require a mock `DatabindContext` and other dependencies to run properly.
+

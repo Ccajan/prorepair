@@ -1,0 +1,185 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Fix for #1154
+Looks pretty good, but would it be possible to have a unit test that would fail before fix, pass after? Would be great to have something to guard against regression.
+I may want to change the logic a little bit, however; if shape is explicitly defined as NUMBER, textual representation should not be enabled even if Locale (etc) happen to be specified: explicit shape value should have precedence. I can make that change, or you can do it, either way is fine.
+I'll also need to merge this again 2.7 branch instead of master, to get in 2.7.3.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/ser/std/DateTimeSerializerBase.java):
+```java
+public JsonSerializer<?> createContextual(SerializerProvider serializers,
+        BeanProperty property) throws JsonMappingException
+{
+    if (property != null) {
+        JsonFormat.Value format = serializers.getAnnotationIntrospector().findFormat((Annotated)property.getMember());
+        if (format != null) {
+
+        	// Simple case first: serialize as numeric timestamp?
+            JsonFormat.Shape shape = format.getShape();
+            if (shape.isNumeric()) {
+                return withFormat(Boolean.TRUE, null);
+            }
+
+            if (format.getShape() == JsonFormat.Shape.STRING) {
+                TimeZone tz = format.getTimeZone();
+                final String pattern = format.hasPattern()
+                                ? format.getPattern()
+                                : StdDateFormat.DATE_FORMAT_STR_ISO8601;
+                final Locale loc = format.hasLocale()
+                                ? format.getLocale()
+                                : serializers.getLocale();
+                SimpleDateFormat df = new SimpleDateFormat(pattern, loc);
+                if (tz == null) {
+                    tz = serializers.getTimeZone();
+                }
+                df.setTimeZone(tz);
+                return withFormat(Boolean.FALSE, df);
+            }
+        }
+    }
+    return this;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+@SuppressWarnings("resource")
+public JsonSerializer<?> createContextual(SerializerProvider serializers,
+        BeanProperty property) throws JsonMappingException
+{
+    if (property != null) {
+        JsonFormat.Value format = serializers.getAnnotationIntrospector().findFormat((Annotated)property.getMember());
+        if (format != null) {
+
+        	// First and simplest case: no actual formatting was required
+            JsonFormat.Shape shape = format.getShape();
+            if (shape == JsonFormat.Shape.NUMBER) {
+                return withFormat(Boolean.TRUE, null);
+            }
+
+            // Ok: then we know it's going to be text output (so we could use pattern)
+            if (shape == JsonFormat.Shape.STRING) {
+                TimeZone tz = format.getTimeZone();
+                final String pattern = format.hasPattern()
+                        ? format.getPattern()
+                        : StdDateFormat.DATE_FORMAT_STR_ISO8601;
+                final Locale loc = format.hasLocale()
+                        ? format.getLocale()
+                        : serializers.getLocale();
+                SimpleDateFormat df = new SimpleDateFormat(pattern, loc);
+                if (tz == null) {
+                    tz = serializers.getTimeZone();
+                }
+                df.setTimeZone(tz);
+                return withFormat(Boolean.FALSE, df);
+            }
+        }
+    }
+    return this;
+}
+```
+
+assistant
+  @Test
+  public void testDeserializeToNonExisting() throws Exception
+  {
+    ObjectMapper mapper = newJsonMapper();
+    TreeMap<String,String> map = new TreeMap<>();
+    map.put("key", "value");
+    String json = mapper.writeValueAsString(map);
+    
+    mapper.disable(DeserializationConfig.Feature.FAIL_ON_UNKNOWN_PROPERTIES);
+    try {
+      mapper.readTree(json);
+      fail("Should have thrown exception because 'key' does not exist");
+    } catch (IOException e) {
+      assertEquals(JsonMappingException.class, e.getClass());
+    }
+  }
+
+  @Test
+  public void testIgnoreUnknownPropertiesWithExistingKeyValuePairs() throws Exception
+  {
+    ObjectMapper mapper = newJsonMapper();
+    TreeMap<String,String> map = new TreeMap<>();
+    map.put("foo", "bar");
+    map.put("key", "value");
+    String json = mapper.writeValueAsString(map);
+    
+    JsonNode root = mapper.readTree(json);
+    assertTrue(root.get("foo").isTextual());
+    assertTrue(root.get("key").isTextual());
+  }
+
+  private static ObjectMapper newJsonMapper()
+  {
+    ObjectMapper mapper = new ObjectMapper();
+    mapper.configure(MapperFeature.ACCEPT_CASE_INSENSITIVE_PROPERTIES, true);
+    mapper.disable(DeserializationConfig.Feature.FAIL_ON_UNKNOWN_PROPERTIES);
+    return mapper;
+  }
+
+}
+
+```
+
+于法无据assistant
+  @Test
+  public void testSerializeNumberWithoutExplicitShape() throws Exception
+  {
+    ObjectMapper mapper = newJsonMapper();
+    JsonSerializer<?> serializer = DateTimeSerializerBase.create(DateTimeType.DATETIME_OR_DATE_KEY, mapper.getSerializerFactory());
+
+    Calendar cal = GregorianCalendars.instance(millis);
+    JsonGenerator g = mock(JsonGenerator.class);
+    when(g.getCurrentScope()).thenReturn(Scope.EMPTY);
+
+    LongValue v = new LongValue(42);
+    ((StdSerializer<Object>)serializer).serialize(v, g, Void.class);
+    verify(g).writeNumber(eq(42L));
+  }
+
+  @Test
+  public void testSerializeStringWithPattern() throws Exception
+  {
+    ObjectMapper mapper = newJsonMapper();
+    JsonSerializer<?> serializer = DateTimeSerializerBase.create(DateTimeType.DATETIME_OR_DATE_KEY, mapper.getSerializerFactory());
+
+    Calendar cal = GregorianCalendars.instance(millis);
+    JsonGenerator g = mock(JsonGenerator.class);
+    when(g.getCurrentScope()).thenReturn(Scope.EMPTY);
+
+    SimpleValue v = new SimpleValue("2014-05-08T12:00:00Z");
+    v.setStaticTyping(true);
+    v.setType(new SimpleType(new TypeIdResolver(), Date.class));
+
+    FieldProperty p = mock(PropertyMetadata.class);
+    when(p.getType()).thenReturn(TypeUtil.BuiltinScalarTypes.LOCAL_DATE);
+    when(p.getName()).thenReturn("date");
+    when(p.getValueConverter()).thenReturn(new StdDelegatingConverter());
+    when(((StdDelegatingConverter)p.getValueConverter()).getSerializer(any(ValueInstantiator.class), any(SerializerProvider.class)))
+            .thenReturn(serializer);
+
+    ((StdSerializer<Object>)serializer).serialize(v, g, p);
+    verify(g).writeString(eq("20140508T120000Z"));
+  }
+  
+  @Test
+  public void testSerializeEmptyCollectionAsIs() throws Exception
+  {
+    ObjectMapper mapper = newJsonMapper();
+
+    List<String> list = Collections.emptyList();
+    StringWriter sw = new StringWriter();
+    mapper.writeValue(sw, list);
+
+    assertEquals("[]", sw.toString());
+  }
+ 
+  private static ObjectMapper newJsonMapper()
+  {
+    ObjectMapper mapper = new ObjectMapper();
+    mapper.disable(MapperFeature.AUTO_DETECT_CREATORS,

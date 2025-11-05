@@ -1,0 +1,190 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Wide bounds to CMAESOptimizer result in NaN parameters passed to fitness function
+If you give large values as lower/upper bounds (for example -Double.MAX_VALUE as a lower bound), the optimizer can call the fitness function with parameters set to NaN.  My guess is this is due to FitnessFunction.encode/decode generating NaN when normalizing/denormalizing parameters.  For example, if the difference between the lower and upper bound is greater than Double.MAX_VALUE, encode could divide infinity by infinity.
+This is an incorrect Java code (src/main/java/org/apache/commons/math3/optimization/direct/CMAESOptimizer.java):
+```java
+private void checkParameters() {
+    final double[] init = getStartPoint();
+    final double[] lB = getLowerBound();
+    final double[] uB = getUpperBound();
+
+    // Checks whether there is at least one finite bound value.
+    boolean hasFiniteBounds = false;
+    for (int i = 0; i < lB.length; i++) {
+        if (!Double.isInfinite(lB[i]) ||
+            !Double.isInfinite(uB[i])) {
+            hasFiniteBounds = true;
+            break;
+        }
+    }
+    // Checks whether there is at least one infinite bound value.
+    boolean hasInfiniteBounds = false;
+    if (hasFiniteBounds) {
+        for (int i = 0; i < lB.length; i++) {
+            if (Double.isInfinite(lB[i]) ||
+                Double.isInfinite(uB[i])) {
+                hasInfiniteBounds = true;
+                break;
+            }
+        }
+
+        if (hasInfiniteBounds) {
+            // If there is at least one finite bound, none can be infinite,
+            // because mixed cases are not supported by the current code.
+            throw new MathUnsupportedOperationException();
+        } else {
+            // Convert API to internal handling of boundaries.
+            boundaries = new double[2][];
+            boundaries[0] = lB;
+            boundaries[1] = uB;
+
+            // Abort early if the normalization will overflow (cf. "encode" method).
+        }
+    } else {
+        // Convert API to internal handling of boundaries.
+        boundaries = null;
+    }
+
+    if (inputSigma != null) {
+        if (inputSigma.length != init.length) {
+            throw new DimensionMismatchException(inputSigma.length, init.length);
+        }
+        for (int i = 0; i < init.length; i++) {
+            if (inputSigma[i] < 0) {
+                throw new NotPositiveException(inputSigma[i]);
+            }
+            if (boundaries != null) {
+                if (inputSigma[i] > boundaries[1][i] - boundaries[0][i]) {
+                    throw new OutOfRangeException(inputSigma[i], 0, boundaries[1][i] - boundaries[0][i]);
+                }
+            }
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import org.apache.commons.math3.exception.DimensionMismatchException;
+import org.apache.commons.math3.exception.NotPositiveException;
+import org.apache.commons.math3.exception.MathIllegalStateException;
+import org.apache.commons.math3.exception.util.ExceptionContext;
+import org.apache.commons.math3.optim.OptimizationData;
+import org.apache.commons.math3.optim.PointValuePair;
+import org.apache.commons.math3.random.JDKRandomGenerator;
+import org.apache.commons.math3.random.RandomGenerator;
+import org.apache.commons.math3.util.FastMath;
+
+public class CMAESOptimizer {
+
+    private RandomGenerator randomGenerator;
+
+    public PointValuePair optimize(FitnessFunction f, OptimizationData... data)
+        throws NotConvergedException {
+        initialize(f, data);
+
+        while(!isConverged()) {
+            updateDistribution();
+            evaluateAndUpdatePopulation();
+        }
+
+        return getBestSolution();
+    }
+
+    private void initialize(FitnessFunction f, OptimizationData... data)
+        throws MathIllegalStateException {
+        int n;
+        try {
+            n = f.getDimension();
+        } catch (final Exception e) {
+            throw new MathIllegalStateException(e.getMessage(), e.getContext());
+        }
+        ExceptionContext context = ExceptionContext
+              .getInstance()
+              .createBuilder("n")
+              .build();
+        
+        randomGenerator = new JDKRandomGenerator();
+        double[] initialGuess = new double[n];
+
+        checkParameters(f.getLowerBound(), f.getUpperBound(), initialGuess, context);
+        decode(initialGuess); 
+        store(f, getBestSolution().getPoint());
+        resetArchive();  
+    }
+    
+    private static void checkParameters(final double[] lb, final double[] ub, double[] initialGuess,
+                                         ExceptionContext context) throws MathIllegalStateException {
+        if (lb == null || ub == null || initialGuess == null) {
+            throw new NullArgumentException(LocalizedFormats.ARGS_CANNOT_BE_NULL, context);
+        }
+        if (lb.length != ub.length) {
+            throw new DimensionMismatchException(lb.length, ub.length);
+        }
+        for (int i = 0; i < lb.length; ++i) { 
+            if (!(Double.isInfinite(ub[i]) && Double.isInfinite(lb[i])) &&
+                !(ub[i] >= lb[i])) {
+                throw new MathIllegalStateException(
+                        LocalizedFormats.BOUNDS_NOT_VALID, context);
+            }
+            if (!Double.isNaN(initialGuess[i])) {
+                continue;
+            }
+            if ((Double.isInfinite(lb[i]) && !Double.isInfinite(ub[i])) ||
+                (!Double.isInfinite(lb[i]) && Double.isInfinite(ub[i]))) {
+                continue;
+            }
+            throw new NotANumberException(LocalizedFormats.INITIAL_GUESS_SHOULD_BE_FINITE);
+        }
+    }
+
+    protected void evaluateAndUpdatePopulation()
+        throws NotConvergedException {
+        population.sort(SolutionComparator.POINT_COMPARATOR);
+        updateDistribution();
+        evolveStrategyVector();
+        updateVariables();
+        store(population.get(0)); 
+
+        if (maxIterations > 0 && iteration >= maxIterations) {
+            throw new MaxIterationExceededException(iteration, maxIterations);
+        }
+    }
+
+    protected static double logSumExp(double x, double y) {
+        double minLogSumExpArg = FastMath.min(x, y);
+        double tmp = FastMath.exp(x - minLogSumExpArg);
+        return minLogSumExpArg + FastMath.log(tmp + FastMath.exp(y - minLogSumExpArg));
+    }
+}
+
+class SolutionComparator implements Comparator<CMAESSolution> {
+    public static final Comparator<PointValuePair>
+           POINT_COMPARATOR = new PointValuePairComparator(PointValuePairComparator.Order.DECREASING);
+}
+
+class MaxIterationExceededException extends NotConvergedException {
+    public MaxIterationExceededException(int currentNumberOfIterations, int maximumNumberOfIterations) {
+        super(currentNumberOfIterations, maximumNumberOfIterations);
+    }
+}
+
+class NotANumberException extends MathIllegalStateException {
+    public NotANumberException(String msg) {
+        super(msg, ExceptionContext.getInstance().build());
+    }
+}
+
+class MathIllegalStateException extends MathRuntimeException {
+    public MathIllegalStateException(String message, ExceptionContext context) {
+        super(message, context);
+    }
+}
+```
+
+

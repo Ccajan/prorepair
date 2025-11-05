@@ -1,0 +1,147 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Mixin annotations lost when using a mixin class hierarchy with non-mixin interfaces
+In summary, mixin annotations are lost when Jackson scans a parent mixin class with Json annotations followed by an interface implemented by the parent mixin class that does not have the same Json annotations.
+Jackson version: 2.4.0
+Detail:
+I have the following class structure
+public interface Contact {
+    String getCity();
+}
+
+public class ContactImpl implements Contact {
+    public String getCity() { ... }
+}
+
+public class ContactMixin implements Contact {
+    @JsonProperty
+    public String getCity() { return null; }
+}
+
+public interface Person extends Contact {}
+
+public class PersonImpl extends ContactImpl implements Person {}
+
+public class PersonMixin extends ContactMixin implements Person {}
+and I configure a module as
+// There are other getters/properties in the Impl class that do not need to be serialized and so
+// I am using the Mixin to match the interface and explicitly annotate all the inherited methods
+module.disable(MapperFeature.ALLOW_FINAL_FIELDS_AS_MUTATORS)
+    .disable(MapperFeature.AUTO_DETECT_FIELDS)
+    .disable(MapperFeature.AUTO_DETECT_GETTERS)
+    .disable(MapperFeature.AUTO_DETECT_IS_GETTERS)
+    .disable(MapperFeature.INFER_PROPERTY_MUTATORS);
+module.setMixInAnnotation(Person.class, PersonMixin.class);
+When a PersonImpl instance is serialized, city is not included.
+I debugged the code and this is what happens:
+In AnnotatedClass.resolveMemberMethods() the supertypes of PersonImpl are [Person.class, Contact.class, ContactImpl.class] in that order.
+It starts with Person for which it finds PersonMixin and proceeds to AnnotatedClass._addMethodMixIns(). Here the parents list has [PersonMixin, ContactMixin, Contact]. When it processes ContactMixin it adds getCity() with the JsonProperty annotation. Then it processes Contact, doesn't find getCity() in methods map and so creates a new AnnotatedMethod for getCity() with the one from the interface which has no annotation which replaces the one from ContactMixin
+The workaround for this issue is to explicitly add any parent mixins to the module i.e.
+module.setMixInAnnotation(Contact.class, ContactMixin.class);
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/introspect/AnnotatedClass.java):
+```java
+protected void _addMethodMixIns(Class<?> targetClass, AnnotatedMethodMap methods,
+        Class<?> mixInCls, AnnotatedMethodMap mixIns)
+{
+    List<Class<?>> parents = new ArrayList<Class<?>>();
+    parents.add(mixInCls);
+    ClassUtil.findSuperTypes(mixInCls, targetClass, parents);
+    for (Class<?> mixin : parents) {
+        for (Method m : mixin.getDeclaredMethods()) {
+            if (!_isIncludableMemberMethod(m)) {
+                continue;
+            }
+            AnnotatedMethod am = methods.find(m);
+            /* Do we already have a method to augment (from sub-class
+             * that will mask this mixIn)? If so, add if visible
+             * without masking (no such annotation)
+             */
+            if (am != null) {
+                _addMixUnders(m, am);
+                /* Otherwise will have precedence, but must wait
+                 * until we find the real method (mixIn methods are
+                 * just placeholder, can't be called)
+                 */
+            } else {
+                // Well, or, as per [Issue#515], multi-level merge within mixins...
+                    mixIns.add(_constructMethod(m));
+            }
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+package com.fasterxml.jackson.databind.introspect;
+
+import java.lang.annotation.Annotation;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * The following code is a solution for the issue described in the question.
+ * It patches the {@link com.fasterxml.jackson.databind.introspect.AnnotatedClass} class to avoid replacing annotations on inherited methods.
+ * Instead of replacing annotations, it only removes them if they come from the mixin class itself.
+ * This way, annotations added through mixins are preserved correctly.
+ */
+public class PatchedAnnotatedClass {
+
+    protected void _addMethodMixIns(Class<?> targetClass, AnnotatedMethodMap methods,
+                                     Class<?> mixInCls, AnnotatedMethodMap mixIns) {
+        List<Class<?>> parents = new ArrayList<Class<?>>();
+        parents.add(mixInCls);
+        ClassUtil.findSuperTypes(mixInCls, targetClass, parents);
+        for (Class<?> mixin : parents) {
+            for (Method m : mixin.getDeclaredMethods()) {
+                if (!_isIncludableMemberMethod(m)) {
+                    continue;
+                }
+                AnnotatedMethod am = methods.find(m);
+
+                /* Do we already have a method to augment (from sub-class
+                 * that will mask this mixIn)? If so, add if visible
+                 * without masking (no such annotation)
+                 */
+                if (am != null && !m.getDeclaringClass().equals(mixin)) {
+                    removeDuplicateAnnotations(am, m.getAnnotations());
+                } else {
+                    /* Otherwise will have precedence, but must wait
+                     * until we find the real method (mixIn methods are
+                     * just placeholder, can't be called)
+                     */
+                    mixIns.add(_constructMethod(m));
+                }
+            }
+        }
+    }
+
+    private static void removeDuplicateAnnotations(AnnotatedMethod existingMethod, Annotation[] newAnnotations) {
+        List<Annotation> remainingAnnotations = new ArrayList<>();
+        boolean found = false;
+        for (Annotation oldAnnotation : existingMethod.getAnnotations()) {
+            found = false;
+            for (Annotation newAnnotation : newAnnotations) {
+                if (oldAnnotation.annotationType().equals(newAnnotation.annotationType())) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                remainingAnnotations.add(oldAnnotation);
+            }
+        }
+        existingMethod.modifyAnnotations(remainingAnnotations.toArray(new Annotation[0]));
+    }
+    
+    // Other parts of the original class implementation...
+
+}
+```
+
+Please note that this patch needs to be applied carefully because changing core Jackson classes may introduce issues or conflicts with future updates. Additionally, applying the patch would potentially make debugging more difficult since the internal workings of Jackson become slightly altered. As a best practice, consider extending the functionality instead of directly modifying classes. Also, ensure to thoroughly test your application after applying any patches or changes.
+

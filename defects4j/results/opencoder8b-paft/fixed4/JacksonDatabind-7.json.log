@@ -1,0 +1,104 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Possibly wrong TokenBuffer delegate deserialization using @JsonCreator
+class Value {
+@JsonCreator
+public static Value from(TokenBuffer buffer) {
+...
+}
+Given JSON string is  { "a":1, "b":null }, it is expected that while deserializing using delegate buffer,
+current token will be start object {, and rest of the tokens will be available in buffer:
+[START_OBJECT, FIELD_NAME, VALUE_NUMBER_INT, FIELD_NAME, VALUE_NULL, END_OBJECT]
+
+But, buffers ends up being started with field name and then contains single attribute value
+[FIELD_NAME, VALUE_NUMBER_INT]
+
+It's due to how TokenBuffer#copyCurrentStructure works when we have current token as a FIELD_NAME, rather than START_OBJECT, because it's forced to move to next token BeanDeserializer.java:120
+Hope this helps to nail it down. Is it an intended behavior, or it's regression/bug?
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/util/TokenBuffer.java):
+```java
+public TokenBuffer deserialize(JsonParser jp, DeserializationContext ctxt) throws IOException
+{
+        copyCurrentStructure(jp);
+    /* 28-Oct-2014, tatu: As per #592, need to support a special case of starting from
+     *    FIELD_NAME, which is taken to mean that we are missing START_OBJECT, but need
+     *    to assume one did exist.
+     */
+    return this;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public TokenBuffer deserialize(JsonParser jp, DeserializationContext ctxt) throws IOException
+{
+    if (!jp.isExpectedStartObjectToken()) {
+        copyCurrentStructure(jp);
+        return this;
+    }
+    
+    copyCurrentStructure(jp);
+
+    // If we get here, we should be on first element of object
+    String fieldName = jp.getCurrentName();
+    _appendFieldName(fieldName); 
+    JsonToken t = jp.nextToken();
+
+    // Special handling for null fields
+    if (t == JsonToken.VALUE_NULL) {
+        addNull();
+    } else {
+        Object value = ctxt.readTree(jp);
+        addTextual(fieldName, value.toString());
+    }
+
+    // Continue adding values until end of object
+    do {
+        t = jp.nextToken();
+        if (t == null || t == JsonToken.END_OBJECT)
+            break;
+
+        fieldName = jp.getCurrentName();
+        _appendFieldName(fieldName); 
+        if (jp.nextToken() == JsonToken.VALUE_NULL) {
+            addNull();
+        } else {
+            Object value = ctxt.readTree(jp);
+            addTextual(fieldName, value.toString());
+        }
+        
+    } while (true);
+    
+    return this;
+}
+
+// Test cases
+public class Main {
+    public static void main(String[] args) {
+        ObjectMapper mapper = new ObjectMapper();
+        String json = "{ \"a\":1, \"b\":null }";
+        try {
+            TokenBuffer buffer = mapper.getCodec().createTokenBuffer();
+            JsonParser jp = mapper.getFactory().createParser(json);
+            buffer.deserialize(jp, mapper.getDeserializationContext());
+
+            System.out.println(buffer.toDebugString()); 
+            // Expected output: [START_OBJECT, FIELD_NAME, "a", VALUE_NUMBER_INT, 1, FIELD_NAME, "b", VALUE_NULL, END_OBJECT]
+            
+            // Deserialize the buffer back to a POJO
+            Value value = Value.from(buffer.asParser(mapper.getDeserializationContext()));
+            System.out.println(value); 
+            // Expected output: Value{...} with b=null
+            
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+}
+```
+
+

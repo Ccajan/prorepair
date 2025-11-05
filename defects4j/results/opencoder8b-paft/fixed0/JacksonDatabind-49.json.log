@@ -1,0 +1,203 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# JsonIdentityInfo incorrectly serializing forward references
+I wrote this small test program to demonstrate the issue:
+import com.fasterxml.jackson.annotation.JsonIdentityInfo;
+import com.fasterxml.jackson.annotation.JsonIdentityReference;
+import com.fasterxml.jackson.annotation.ObjectIdGenerators;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+public class ObjectIdTest {
+
+    public static class Foo {
+
+        @JsonIdentityReference(alwaysAsId = true)
+        public Bar bar1;
+
+        @JsonIdentityReference()
+        public Bar bar2;
+    }
+
+    @JsonIdentityInfo(generator = ObjectIdGenerators.IntSequenceGenerator.class)
+    public static class Bar {
+
+    }
+
+    public static void main(String[] args) throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+
+        // create structure to serialize
+        Foo mo = new Foo();
+        mo.bar1 = new Bar();
+        mo.bar2 = mo.bar1;
+
+        // serialize it
+        System.out.println(mapper.writeValueAsString(mo));
+    }
+
+}
+When executing this test program in the latest version (2.7.4), the output will be {"bar1":1,"bar2":{"@id":2}} - the second field will be written with a new id even though both fields reference the same object. Because of this, writing forward references is essentially impossible.
+The issue seems to be the fact that BeanSerializerBase will always call WritableObjectId.generateId if the referenced object has not been written in plain format yet (https://github.com/FasterXML/jackson-databind/blob/master/src/main/java/com/fasterxml/jackson/databind/ser/std/BeanSerializerBase.java#L600). This will also happen if an id has been generated before.
+It might also be smarter to only generate a new id in WritableObjectId.generateId if that hasn't happened before; as that method doesn't have a javadoc I can't tell how it is supposed to work.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/ser/impl/WritableObjectId.java):
+```java
+public Object generateId(Object forPojo) {
+    // 04-Jun-2016, tatu: As per [databind#1255], need to consider possibility of
+    //    id being generated for "alwaysAsId", but not being written as POJO; regardless,
+    //    need to use existing id if there is one:
+        id = generator.generateId(forPojo);
+    return id;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+package com.fasterxml.jackson.databind.ser.impl;
+
+import com.fasterxml.jackson.core.JsonGenerationException;
+import com.fasterxml.jackson.databind.SerializerProvider;
+import com.fasterxml.jackson.databind.jsontype.TypeSerializer;
+
+public final class WritableObjectId extends ObjectIdSerializerBase<Object> {
+   
+   public Object generateId(Object pojo) {
+      // 04-Jun-2016, tatu: As per [databind#1255], need to consider possibility of
+      //    id being generated for "alwaysAsId", but not being written as POJO; regardless,
+      //    need to use existing id if there is one:
+      
+      // if(id == null) {  <-- WRONG!
+      if(generator.getAlreadyGeneratedId() == null) { 
+          id = generator.generateId(pojo);
+      }
+      return id;
+   }
+
+   @Override
+   public void serialize(Object pojo, JsonGenerator jgen,
+           SerializerProvider provider, TypeSerializer typeSer)
+           throws IOException, JsonGenerationException {
+       // First, try to write ObjectId property
+       writeObjectId(provider, jgen, pojo);
+       
+       // Then write regular properties:
+       serializer.serializeFields(pojo, jgen, provider);
+   }
+   
+   protected final Writer getWriter(SerializerProvider prov) throws JsonGenerationException {
+       // First: check if we're allowed to do so at all
+       if (!prov.isEnabled(SerializationFeature.FAIL_ON_UNWRAPPED_TYPE_ID)) {
+           return new _StdWriter(this);
+       }
+       
+       throw new JsonGenerationException("Unwrapped type identifiers are disabled (SerializationFeature.FAIL_ON_UNWRAPPED_TYPE_ID)");
+   }
+}
+
+class _StdWriter implements Writer {
+    
+    private final Writer w;
+    private boolean first = true;
+    
+    public _StdWriter(Writer w) {
+         this.w = w;
+    }
+        
+    public void writeProperty(JsonGenerator g, ObjectIdContext context, ObjectId value, Object bean, String name) throws IOException, JsonGenerationException {
+        if(first){
+            first=false;
+        } else {
+            g.writeString(",");
+        }
+        g.writeString(name + ":");
+        w.writeId(g, context, value, bean);
+    }
+}
+
+abstract class ObjectIdSerializerBase<T> implements ResolvableSerializer {
+
+    public void resolve(SerializerProvider provider) {
+        // NOOP
+    }
+  
+    protected abstract T generateId(T pojo);
+
+    protected abstract void writeIdField(T oid, JsonGenerator jgen) throws IOException;
+}
+```
+
+assistant
+
+ ```java
+package com.fasterxml.jackson.databind.ser.impl;
+
+import com.fasterxml.jackson.core.JsonGenerationException;
+import com.fasterxml.jackson.databind.SerializerProvider;
+import com.fasterxml.jackson.databind.jsontype.TypeSerializer;
+
+public final class WritableObjectId extends ObjectIdSerializerBase<Object> {
+   
+   public Object generateId(Object pojo) {
+      // 04-Jun-2016, tatu: As per [databind#1255], need to consider possibility of
+      //    id being generated for "alwaysAsId", but not being written as POJO; regardless,
+      //    need to use existing id if there is one:
+      
+      // if(id == null) {  <-- WRONG!
+      if(generator.getExistingGeneratedId() != null) { 
+          id = generator.getExistingGeneratedId();
+      } else {
+          id = generator.generateId(pojo);
+      }
+      return id;
+   }
+
+   @Override
+   public void serialize(Object pojo, JsonGenerator jgen,
+           SerializerProvider provider, TypeSerializer typeSer)
+           throws IOException, JsonGenerationException {
+       // First, try to write ObjectId property
+       writeObjectId(provider, jgen, pojo);
+       
+       // Then write regular properties:
+       serializer.serializeFields(pojo, jgen, provider);
+   }
+   
+   protected final Writer getWriter(SerializerProvider prov) throws JsonGenerationException {
+       // First: check if we're allowed to do so at all
+       if (!prov.isEnabled(SerializationFeature.FAIL_ON_UNWRAPPED_TYPE_ID)) {
+           return new _StdWriter(this);
+       }
+       
+       throw new JsonGenerationException("Unwrapped type identifiers are disabled (SerializationFeature.FAIL_ON_UNWRAPPED_TYPE_ID)");
+   }
+}
+
+class _StdWriter implements Writer {
+    
+    private final Writer w;
+    private boolean first = true;
+    
+    public _StdWriter(Writer w) {
+         this.w = w;
+    }
+        
+    public void writeProperty(JsonGenerator g, ObjectIdContext context, ObjectId value, Object bean, String name) throws IOException, JsonGenerationException {
+        if(first){
+            first=false;
+        } else {
+            g.writeString(",");
+        }
+        g.writeString(name + ":");
+        w.writeId(g, context, value, bean);
+    }
+}
+
+abstract class ObjectIdSerializerBase<T> implements ResolvableSerializer {
+
+    public void resolve(SerializerProvider provider) {
+        // NOOP
+    }
+

@@ -1,0 +1,128 @@
+[
+  {
+    "patch_code": "public int read(byte[] buf, int offset, int numToRead) throws IOException {\n    int totalRead = 0;\n\n    if (hasHitEOF) {\n        // Return -1 to indicate end of stream.\n        return -1;\n    }\n\n    if (currEntry == null) {\n        throw new IllegalStateException(\"No current tar entry\");\n    }\n\n    numToRead = Math.min(numToRead, available());\n\n    // If there's no data left in the current entry, try to read the next one.\n    if (entryOffset >= entrySize) {\n        currEntry = getNextTarEntry();\n        \n        if (currEntry == null) {\n            hasHitEOF = true;\n            return -1; // End of archive.\n        }\n        \n        entrySize = currEntry.getSize();\n        entryOffset = 0;\n    }\n\n    totalRead = is.read(buf, offset, Math.min(numToRead, (int)(entrySize - entryOffset)));\n\n    if (totalRead > 0) {\n        entryOffset += totalRead;\n    } \n\n    return totalRead;\n}",
+    "patch_status": "TRIGGER_ERROR",
+    "failing_tests": {
+      "TRIGGER": [
+        "org.apache.commons.compress.archivers.tar.TarArchiveInputStreamTest::shouldThrowAnExceptionOnTruncatedEntries"
+      ],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Compress-28",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "import java.io.IOException;\n\npublic class TarArchiveInputStream {\n\n    // ... existing fields and methods ...\n\n    @Override\n    public int read(byte[] buffer, int offset, int length) throws IOException {\n        int totalRead = 0;\n\n        if (hasHitEOF || entryOffset >= entrySize) {\n            return -1; // End of entry or file reached\n        }\n\n        if (currEntry == null) {\n            throw new IllegalStateException(\"No current tar entry\");\n        }\n\n        while (length > 0 && !hasHitEOF) {\n            int bytesRequested = Math.min(length, getAvailable());\n            int bytesRead = is.read(buffer, offset + totalRead, bytesRequested);\n\n            if (bytesRead == -1) { \n                hasHitEOF = true;\n                break;\n            }\n\n            count(bytesRead); \n            totalRead += bytesRead;\n            entryOffset += bytesRead;\n            length -= bytesRead;\n        }\n\n        return totalRead > 0 ? totalRead : -1;\n    }\n\n    // ... rest of the methods ...\n}\n\n// Test case\n@Test\npublic void testCorruptedBzip2() throws IOException {\n    String archivePath = PathUtil.join(testdataDir, \"test.tar.bz2\");\n    try(TarArchiveInputStream input = new TarArchiveInputStream(new BZip2CompressorInputStream(\n        GoogleFile.SYSTEM.newInputStream(archivePath), true))) {\n      ArchiveEntry nextMatchedEntry = input.getNextEntry();\n      while (nextMatchedEntry != null) {\n        logger.infofmt(\"Extracting %s\", nextMatchedEntry.getName());\n        String outputPath = PathUtil.join(\"/tmp/\", nextMatchedEntry.getName());\n        try (OutputStream out = new FileOutputStream(outputPath)) {\n          int n = 0;\n          byte[] buffer = new byte[1024];\n          while ((n = input.read(buffer)) >= 0) {\n            out.write(buffer, 0, n);\n          }\n        }\n        nextMatchedEntry = input.getNextEntry();\n      }\n    } catch (IOException ex) {\n        // Handle exception as needed\n        System.out.println(\"Exception occurred: \" + ex.getMessage());\n    }\n}",
+    "patch_status": "UNCOMPILABLE",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Compress-28",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "public int read(byte[] buf, int offset, int numToRead) throws IOException {\n    int totalRead = 0;\n\n    if (hasHitEOF || entryOffset >= entrySize) {\n        return -1; // Indicate end of file or stream\n    }\n\n    if (currEntry == null) {\n        throw new IllegalStateException(\"No current tar entry\");\n    }\n\n    // Ensure we don't try to read more than available data in the current entry\n    numToRead = Math.min(numToRead, available());\n\n    totalRead = is.read(buf, offset, numToRead);\n\n    if (totalRead == -1) {\n        hasHitEOF = true; // Indicates end of file or stream\n        // We do not increment entryOffset here because there's no more data to consume.\n        // The EOF will be detected at the next call to read() where available() will return 0.\n    } else {\n        entryOffset += totalRead;\n    }\n\n    return totalRead;\n}",
+    "patch_status": "TRIGGER_ERROR",
+    "failing_tests": {
+      "TRIGGER": [
+        "org.apache.commons.compress.archivers.tar.TarArchiveInputStreamTest::shouldThrowAnExceptionOnTruncatedEntries"
+      ],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Compress-28",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "public int read(byte[] buf, int offset, int numToRead) throws IOException {\n    int totalRead = 0;\n\n    if (!hasHitEOF && entryOffset < entrySize) {\n        numToRead = Math.min(numToRead, available());\n\n        totalRead = is.read(buf, offset, numToRead);\n\n        if (totalRead > 0) {\n            count(totalRead);\n            entryOffset += totalRead;\n        } else {\n            hasHitEOF = true;\n        }\n    }\n\n    if (hasHitEOF || entryOffset >= entrySize) {\n        currEntry = getNextTarEntry(is);\n        \n        if (currEntry != null) {\n            entrySize = currEntry.getSize();\n            entryOffset = 0;\n        } else {\n            hasHitEOF = true;\n        }\n    }\n\n    return totalRead > 0 ? totalRead : -1;\n}\n\nprivate ArchiveEntry getNextTarEntry(ZipAwareInputStream is) throws IOException {\n    byte[] blockBuf = new byte[1024];\n    long firstBlockPosition = is.getFilePointer();\n\n    // Read the header data from the stream and fill the fields of entry.\n    byte[] rawHeaderData = new byte[TarFormatConstants.TAR_HEADER_BYTE_COUNT];\n    is.readFully(rawHeaderData);\n    int bytesReadFromRawHeader = 0;\n    \n    do {\n        int numberOfBytesToReadInBlock = TarFormatConstants.BLOCK_SIZE;\n        if ((firstBlockPosition + TarFormatConstants.BLOCK_SIZE * 3L) <= is.length()) {\n            numberOfBytesToReadInBlock -= 512;\n        }\n        int result = is.read(blockBuf, 0, numberOfBytesToReadInBlock);\n        if (result < 0) {\n            break;\n        }\n        if (bytesReadFromRawHeader < TarFormatConstants.TAR_HEADER_BYTE_COUNT) {\n            System.arraycopy(blockBuf, 0, rawHeaderData,\n                    bytesReadFromRawHeader, result);\n            bytesReadFromRawHeader += result;\n        }\n    } while (bytesReadFromRawHeader < TarFormatConstants.TAR_HEADER_BYTE_COUNT);\n   \n    // Parse the header data to create the ArchiveEntry object.\n    try {\n        TarArchiveEntry tarArchiveEntry =\n                TarUtils.parseTarHeader(null, rawHeaderData, 0);\n        if (tarArchiveEntry != null) {\n            tarArchiveEntry.setSize(TarUtils.calculatePAXExtendedValue(tarArchiveEntry));\n        }\n        return tarArchiveEntry;\n    } catch (final IllegalArgumentException iae) {\n        // handle parsing exception or corrupted TAR file here.\n    }\n    return null;\n}",
+    "patch_status": "UNCOMPILABLE",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Compress-28",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "public int read(byte[] buf, int offset, int numToRead) throws IOException {\n\tint totalRead = 0;\n\n    if (hasHitEOF) {\n        return -1; // Return -1 when EOF is detected.\n    }\n\n    if (currEntry == null) {\n        throw new IllegalStateException(\"No current tar entry\");\n    }\n\n    numToRead = Math.min(numToRead, available());\n\n    try {\n        totalRead = is.read(buf, offset, numToRead);\n    } catch (IOException e) {\n        hasHitEOF = true;\n        throw e; // Rethrow the exception when EOF occurs.\n    }\n\n    count(totalRead);\n\n    if (totalRead == -1) {\n        hasHitEOF = true;\n    } else {\n        entryOffset += totalRead;\n    }\n\n    return totalRead;\n}",
+    "patch_status": "TRIGGER_TIMEOUT",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": [
+        "org.apache.commons.compress.archivers.tar.TarArchiveInputStreamTest::shouldThrowAnExceptionOnTruncatedEntries"
+      ]
+    },
+    "val_cnt": 1,
+    "bug_name": "Compress-28",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "import java.io.IOException;\nimport java.nio.charset.CharsetDecoder;\nimport java.util.zip.ZipException;\nimport org.apache.commons.compress.archivers.ArchiveException;\nimport org.apache.commons.compress.archivers.tar.TarUtils;\nimport org.apache.commons.compress.utils.IOUtils;\n\n/**\n * The fixed TarArchiveInputStream class.\n */\npublic class FixedTarArchiveInputStream extends TarArchiveInputStream {\n\n    /**\n     * Constructor for FixedTarArchiveInputStream.\n     *\n     * @param in the InputStream to use as source\n     * @throws ZipException if there was trouble with the zip file format\n     * @throws ArchiveException if there was trouble reading the archive\n     */\n    public FixedTarArchiveInputStream(final InputStream in)\n            throws ZipException, ArchiveException {\n        super(in);\n    }\n\n    /**\n     * Reads up to len bytes of data from the stream into an array of bytes.\n     *\n     * @param buffer Destination buffer\n     * @param offset Offset at which to start storing received bytes into the buffer array\n     * @param length Maximum number of bytes to receive\n     * @return The total number of bytes read into the buffer, or -1 if there is no more data because the end of the stream has been reached\n     * @throws IOException If an I/O error occurs while trying to read\n     */\n    @Override\n    public int read(final byte[] buffer, final int offset, final int length) throws IOException {\n        // check if we already hit an unexpected EOF\n        if (hasHitEOF) {\n            return -1;\n        }\n\n        // check if there is still data to be read in the current entry\n        if (entryOffset >= entrySize) {\n            // no more data in this entry => get the next one\n            currEntry = getNextEntry(currEntry);\n\n            // if no next entry exists anymore then return -1 to indicate end of stream\n            if (currEntry == null) {\n                return -1;\n            }\n\n            // reset offset and size variables\n            entryOffset = 0;\n            entrySize = TarUtils.safeMultiply(getCurrentEntry().getSize(), 512L);\n        }\n\n        // calculate how many bytes can still be read in this entry without hitting the end of the stream\n        final int bytesToRead = (int)Math.min(length, available());\n\n        // perform actual read operation\n        final int readBytes = is.read(buffer, offset, bytesToRead);\n\n        // update offset variable and check for EOF\n        if (readBytes > 0) {\n            entryOffset += readBytes;\n        } else {\n            hasHitEOF = true;\n        }\n\n        // return number of actually read bytes\n        return readBytes;\n    }\n\n    private long available() {\n        return entrySize - entryOffset;\n    }\n}\n\n// Test cases using the FixedTarArchiveInputStream\nclass FixedTarArchiveInputStreamTest {\n\n    @Test(expected = IOException.class)\n    public void testUnexpectedEofAfterCorruption() throws IOException {\n        String archivePath = \"/path/to/your/test.tar.bz2\";\n        try (FixedTarArchiveInputStream input = new FixedTarArchiveInputStream(new FileInputStream(archivePath))) {\n            // Extract entries from the archive here...\n        }\n    }\n}",
+    "patch_status": "UNCOMPILABLE",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Compress-28",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "import java.io.ByteArrayInputStream;\nimport java.io.EOFException;\nimport java.io.IOException;\nimport java.io.InputStream;\nimport java.nio.charset.CharsetDecoder;\nimport java.nio.charset.CodingErrorAction;\nimport org.apache.commons.compress.archivers.ArchiveStreamFactory;\nimport org.apache.commons.compress.archivers.tar.TarArchiveInputStream;\nimport org.apache.commons.compress.utils.IOUtils;\nimport static org.junit.Assert.assertEquals;\n\npublic class MyTarArchiveInputStream extends TarArchiveInputStream {\n    public MyTarArchiveInputStream(InputStream in) {\n        super(in);\n    }\n\n    @Override\n    protected long skip(int n, boolean stopAtEof) throws IOException {\n        long totalSkipped = 0;\n        try {\n            totalSkipped = super.skip(n, stopAtEof);\n        } catch (EOFException e) {\n            // Handle unexpected EOF by resetting stream and re-throwing exception\n            ((TarArchiveInputStream)this).closeArchiveEntry();\n            this.reset();\n            throw e;\n        }\n        return totalSkipped;\n    }\n}\n\npublic class TestMyTarArchiveInputStream {\n\n    @Test(expected = EOFException.class)\n    public void testUnexpectedEof() throws IOException {\n        byte[] buffer = new byte[512];\n        InputStream inputStream = new ByteArrayInputStream(buffer);\n        \n        Charset charset = IOUtils.ISO_8859_1_CHARSET; \n        CharsetDecoder decoder = charset.newDecoder()\n                .onMalformedInput(CodingErrorAction.REPORT)\n                .onUnmappableCharacter(CodingErrorAction.REPORT);\n\n        MyTarArchiveInputStream tarIn =\n            (MyTarArchiveInputStream)new ArchiveStreamFactory()\n              .createArchiveInputStream(ArchiveStreamFactory.TAR,\n                                         inputStream,\n                                         inputStream.available(), decoder);\n\n        while(tarIn.getNextEntry() != null){;}\n    }\n}",
+    "patch_status": "UNCOMPILABLE",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Compress-28",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "public int read(byte[] buf, int offset, int numToRead) throws IOException {\n    int totalRead = 0;\n\n    if (entryOffset >= entrySize) {\n        // This should handle both normal end of file and EOF during reading the header.\n        hasHitEOF = true;  \n        return -1;\n    }\n\n    if (currEntry == null) {\n        throw new IllegalStateException(\"No current tar entry\");\n    }\n\n    int remainingInBlock = blockRemaining();\n\n    if (remainingInBlock < numToRead) {\n        numToRead = remainingInBlock;\n    }\n\n    totalRead = is.read(buf, offset, numToRead);\n\n    if (totalRead > 0) {\n        entryOffset += totalRead;\n    }\n\n    // Handle EOF within one block properly.\n    if (totalRead < numToRead) {   \n        entryOffset += totalRead;\n        hasHitEOF = true;\n    }\n\n    return totalRead > 0 ? totalRead : -1;\n}",
+    "patch_status": "UNCOMPILABLE",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Compress-28",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "public int read(byte[] buf, int offset, int numToRead) throws IOException {\n    int totalRead = 0;\n\n    if (hasHitEOF || entryOffset >= entrySize) {\n        // Check for unexpected EOF\n        if (!entryOffsetCheck) {\n            throw new IOException(\"Unexpected end of file encountered.\");\n        }\n        \n        return -1;\n    }\n\n    if (currEntry == null) {\n        throw new IllegalStateException(\"No current tar entry\");\n    }\n\n    numToRead = Math.min(numToRead, available());\n    \n    totalRead = is.read(buf, offset, numToRead);\n    count(totalRead);\n    \n    if (totalRead == -1) {\n        // If we've reached the end of this entry's data,\n        // we should check again in case there might be more entries.\n        hasHitEOF = true;\n        entryOffsetCheck = true;\n    } else {\n        entryOffset += totalRead;\n    }\n\n    return totalRead;\n}",
+    "patch_status": "UNCOMPILABLE",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Compress-28",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "import java.io.IOException;\nimport java.io.InterruptedIOException;\nimport org.apache.commons.compress.utils.IOUtils;\n\npublic class TarArchiveInputStream extends ArchiveInputStream {\n\n    private final InputStream in;\n    private boolean atEOF;\n    private long entrySize;\n    private long bytesDecompressed;\n    private Decompressor decompressor;\n\n    // ... existing code ...\n\n    @Override\n    public int read(byte[] buf, int offset, int numToRead) throws IOException {\n        int totalRead = 0;\n\n        while (!atEOF && totalRead < numToRead) {\n            if (entrySize <= 0) {\n                if (fill()) {\n                    return -1; // EOF reached or error occurred.\n                }\n            }\n\n            int bytesToRead = (int)Math.min(entrySize, numToRead - totalRead);\n            totalRead += IOUtils.read(in, buf, offset + totalRead, bytesToRead);\n\n            if (decompressor != null) {\n                decompressor.decompress(buf, totalRead - bytesToRead, bytesToRead);\n                bytesDecompressed += bytesToRead;\n            }\n\n            entrySize -= bytesToRead;\n            if (entrySize <= 0) {\n                atEOF = true;\n            }\n        }\n\n        if (totalRead > 0) {\n            return totalRead;\n        }\n\n        return -1; // EOF reached or no data to read.\n    }\n\n    // ... existing methods ...\n\n    private boolean fill() throws IOException {\n        // ... existing code ...\n    }\n\n    // ... additional helper methods like setErrorState(), handleIOException(),\n    // and decompressor initialization if necessary.\n\n    // Test cases remain the same, or can be adapted based on the changes made above.\n}\n\n// Note: The provided solution assumes that the TarArchiveInputStream class is part of Apache Commons Compress library,\n// which may not be the case as the original question seems to refer to a custom implementation.\n// It also assumes that the Decompressor interface exists and provides a decompress method.\n// Make sure to adapt the solution according to your actual use case and environment.",
+    "patch_status": "UNCOMPILABLE",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Compress-28",
+    "diff_stats": null
+  }
+]

@@ -1,0 +1,193 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Record type invalid property not reported on function with @this annotation
+Code:
+
+var makeClass = function(protoMethods) {
+  var clazz = function() {
+    this.initialize.apply(this, arguments);
+  }
+  for (var i in protoMethods) {
+    clazz.prototype[i] = protoMethods[i];
+  }
+
+  return clazz;
+}
+
+/**
+ * @constructor
+ * @param {{name: string, height: number}} options
+ */
+var Person = function(options){};
+Person = makeClass(/** @lends Person.prototype */ {
+  /**
+   * @this {Person}
+   * @param {{name: string, height: number}} options
+   */
+  initialize: function(options) {
+    /** @type {string} */ this.name_ = options.thisPropDoesNotExist;
+  },
+
+  /**
+   * @param {string} message
+   * @this {Person}
+   */
+  say: function(message) {
+    window.console.log(this.name_ + ' says: ' + message);
+  }
+});
+
+var joe = new Person({name: 'joe', height: 300});
+joe.say('hi');
+
+compiled with:
+java -jar build/compiler.jar --formatting=PRETTY_PRINT --jscomp_error=checkTypes --jscomp_error=externsValidation --compilation_level=SIMPLE_OPTIMIZATIONS repro.js
+
+I would expect an error on this line:
+    /** @type {string} */ this.name_ = options.thisPropDoesNotExist;
+
+which works in other contexts.
+
+Thanks!
+This is an incorrect Java code (src/com/google/javascript/jscomp/TypeCheck.java):
+```java
+private void visitGetProp(NodeTraversal t, Node n, Node parent) {
+  // obj.prop or obj.method()
+  // Lots of types can appear on the left, a call to a void function can
+  // never be on the left. getPropertyType will decide what is acceptable
+  // and what isn't.
+  Node property = n.getLastChild();
+  Node objNode = n.getFirstChild();
+  JSType childType = getJSType(objNode);
+
+  if (childType.isDict()) {
+    report(t, property, TypeValidator.ILLEGAL_PROPERTY_ACCESS, "'.'", "dict");
+  } else if (n.getJSType() != null && parent.isAssign()) {
+    return;
+  } else if (validator.expectNotNullOrUndefined(t, n, childType,
+      "No properties on this expression", getNativeType(OBJECT_TYPE))) {
+    checkPropertyAccess(childType, property.getString(), t, n);
+  }
+  ensureTyped(t, n);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+private void visitGetProp(NodeTraversal t, Node n, Node parent) {
+  // obj.prop or obj.method()
+  // Lots of types can appear on the left, a call to a void function can
+  // never be on the left. getPropertyType will decide what is acceptable
+  // and what isn't.
+  Node property = n.getLastChild();
+  Node objNode = n.getFirstChild();
+  JSType childType = getJSType(objNode);
+
+  if (!childType.hasObjectValue() || childType.isVoidType()) {
+    report(t, property, TypeValidator.ILLEGAL_PROPERTY_ACCESS, "'.'", "object");
+  } else if (n.getJSType() != null && parent.isAssign()) {
+    return;
+  } else if (validator.expectNotNullOrUndefined(t, n, childType,
+      "No properties on this expression", getNativeType(OBJECT_TYPE))) {
+    checkPropertyAccess(childType, property.getString(), t, n);
+  }
+  ensureTyped(t, n);
+}
+```
+
+assistant
+```java
+private void visitCall(NodeTraversal t, Node call, FunctionType funType) {
+  Object cst = call.getJSType().getSpecialization();  
+  if (!(cst instanceof Closure)) {
+    report(t, call, TypeError.UNDEFINED_VALUE, "undefined value called as function");
+  }
+
+  int argCount = call.getChildCount() - 1;
+
+  List<? extends Node> params = ((Closure)cst).getParamNodes();
+
+  if (params.size() < argCount) {
+    report(t, call, TypeValidator.WRONG_ARGUMENTS_COUNT, "Wrong number of arguments to function call.");
+  } else if (params.size() > argCount) {
+    validator.expectNullOrUndefined(call, t, call.getChildNode(params.size()), 
+        "Extra argument passed to function call.",
+        null);
+  }
+
+  // If the call has no explicit return type, use the implied one from the
+  // function definition
+  if (call.getJSType() == null) {
+    setJSType(call, funType.getReturnType());
+  }
+}
+```
+
+�assistant
+```java
+private void visitGetElem(NodeTraversal t, Node n, Node parent) {
+  // obj[index]
+  Node index = n.getLastChild();
+  Node base = n.getFirstChild();
+  JSType arrayType = getJSType(base);
+  
+  if (arrayType.isArrayType()) {
+    // Do nothing...
+  } else if (base.isDefinitelyUsedAsStatement()) {
+    // Do nothing...
+  } else if (!arrayType.isUnknownType() && !arrayType.isNull()) {
+    validator.expectNumberOrString(t, n, "Array index must be a number or string");
+  }
+
+  ensureTyped(t, n);
+}
+
+private void visitIndexedGet(NodeTraversal t, Node n) {
+  Node base = n.getFirstChild();
+  Node index = n.getChildAtIndex(1);
+  JSType baseType = getJSType(base);
+
+  if (baseType.isArrayType()) {
+    // This is okay
+    JSType indexType = getJSType(index);
+    
+    if (!indexType.isNull() && !indexType.isNumber() && !indexType.isString()) {
+      report(t, n, TYPE_ERROR_ARRAY_INDEX, "Invalid array index");
+    }
+  } else if (!isTypeObject(baseType)) {
+    if (!baseType.isNull()) {
+      if (index.isGetFirstArgument() || index.isGetSecondArgument()) {
+        report(t, n, TYPE_ERROR_INCOMPATIBLE_TYPES, "Incompatible operand types: string and object");
+      } else {
+        report(t, n, TYPE_ERROR_NON_OBJECT_AND_NON_STRING, 
+            String.format("Operand should be either a %s or a %s",
+                getStringTypeName(), getObjectTypeName()));
+      }
+    } else if (!baseType.isNull()) {
+      report(t, n, TypeValidator.NULL_ON_LEFT_SIDE, "Null on left side of [].");
+    }
+  }
+  ensureTyped(t, n);
+}
+```
+
+assistant
+```java
+private void visitCall(NodeTraversal t, Node call, FunctionType funType) {
+  Object cst = call.getJSType().getSpecialization();  
+  if (!(cst instanceof Closure)) {
+    report(t, call, TypeError.UNDEFINED_VALUE, "undefined value called as function");
+  }
+
+  int argCount = call.getChildCount() - 1;
+
+  List<? extends Node> params = ((Closure)cst).getParamNodes();
+
+  if (params.size() < argCount) {
+    report(t, call, TypeValidator.WRONG_ARGUMENTS_COUNT, "Wrong number of arguments to function call.");
+  } else if (params.size() > argCount) {
+    validator.expectNullOrUndefined(call, t, call.getChildNode(params

@@ -293,6 +293,8 @@ MODEL_PROMPT_FORMATS = {
     'llama': ('[INST]', '[/INST]'),
     'mistral': ('[INST]', '[/INST]'),
     'deepseek': ('You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.\n### Instruction:\n', '\n### Response:\n'),
+    'qwen2.5coder': ('<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\n', '<|im_end|>\n<|im_start|>assistant\n'),
+    'opencoder': ('<|im_start|>system\nYou are OpenCoder, created by OpenCoder Team.<|im_end|>\n<|im_start|>user\n', '<|im_end|>\n<|im_start|>assistant\n'),
     'starchat': ('<|system|>\n<|end|>\n<|user|>', '<|end|>\n<|assistant|>'),
 }
 
@@ -307,7 +309,22 @@ MODEL_CONFIGS = {
         'base_model': '/data1/czj/model/qwen3-8b',
         'adapter_path': '/data1/czj/model/trained_model_qwen3'
     },
-
+    'qwen2.5coder7b': {
+        'base_model': 'Qwen/Qwen2.5-Coder-7B-Instruct',
+        'adapter_path': None
+    },
+    'qwen2.5coder7b-paft': {
+        'base_model': 'merged_models/qwen2.5coder7b-paft',
+        'adapter_path': None
+    },
+    'opencoder8b': {
+        'base_model': 'infly/OpenCoder-8B-Instruct',
+        'adapter_path': None
+    },
+    'opencoder8b-paft': {
+        'base_model': 'merged_models/opencoder8b-paft',
+        'adapter_path': None
+    },
     # CodeLlama 模型
     'codellama-7b': {
         'base_model': 'codellama/CodeLlama-7b-Instruct-hf',
@@ -593,6 +610,27 @@ def main():
         # 确保资源清理
         cleanup_resources()
 
+def sort_by_project_and_id(path):
+    """
+    按项目名和bug ID排序，确保处理顺序固定
+    例如：Chart-1.json < Chart-2.json < Chart-10.json < Lang-1.json
+    
+    Returns:
+        tuple: (项目名, bug_id) 用于排序
+    """
+    name = path.stem  # 不带扩展名的文件名
+    parts = name.split('-')
+    if len(parts) >= 2:
+        project = parts[0]
+        try:
+            bug_id = int(parts[1])
+            return (project, bug_id)
+        except ValueError:
+            pass
+    # 如果解析失败，使用文件名本身排序
+    return (name, 0)
+
+
 def process_files():
     """处理文件的主要逻辑"""
     base_dir = 'defects4j/dataset'
@@ -601,7 +639,8 @@ def process_files():
     cnt = 0
 
     try:
-        for file_path in sorted(Path(base_dir).rglob('*.json'), reverse=True):  # 遍历 base_dir 目录下所有 .json 文件，并按文件名降序排序
+        # 按项目名和bug ID精确排序，确保处理顺序固定
+        for file_path in sorted(Path(base_dir).rglob('*.json'), key=sort_by_project_and_id):
             cnt += 1  # 计数器自增，用于分配任务
             if cnt % int(sys.argv[2]) != int(sys.argv[3]):  # 根据 sys.argv 传入的参数，判断当前文件是否属于当前进程需要处理的任务
                 continue  # 如果不是当前进程要处理的文件，则跳过

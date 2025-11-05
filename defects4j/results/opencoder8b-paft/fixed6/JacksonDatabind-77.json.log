@@ -1,0 +1,198 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Jackson Deserializer security vulnerability via default typing (CVE-2017-7525)
+I have send email to info@fasterxml.com
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/deser/BeanDeserializerFactory.java):
+```java
+@Override
+    public JsonDeserializer<Object> createBeanDeserializer(DeserializationContext ctxt,
+            JavaType type, BeanDescription beanDesc)
+        throws JsonMappingException
+    {
+        final DeserializationConfig config = ctxt.getConfig();
+        // We may also have custom overrides:
+        JsonDeserializer<Object> custom = _findCustomBeanDeserializer(type, config, beanDesc);
+        if (custom != null) {
+            return custom;
+        }
+        /* One more thing to check: do we have an exception type
+         * (Throwable or its sub-classes)? If so, need slightly
+         * different handling.
+         */
+        if (type.isThrowable()) {
+            return buildThrowableDeserializer(ctxt, type, beanDesc);
+        }
+        /* Or, for abstract types, may have alternate means for resolution
+         * (defaulting, materialization)
+         */
+        // 29-Nov-2015, tatu: Also, filter out calls to primitive types, they are
+        //    not something we could materialize anything for
+        if (type.isAbstract() && !type.isPrimitive()) {
+            // Let's make it possible to materialize abstract types.
+            JavaType concreteType = materializeAbstractType(ctxt, type, beanDesc);
+            if (concreteType != null) {
+                /* important: introspect actual implementation (abstract class or
+                 * interface doesn't have constructors, for one)
+                 */
+                beanDesc = config.introspect(concreteType);
+                return buildBeanDeserializer(ctxt, concreteType, beanDesc);
+            }
+        }
+
+        // Otherwise, may want to check handlers for standard types, from superclass:
+        @SuppressWarnings("unchecked")
+        JsonDeserializer<Object> deser = (JsonDeserializer<Object>) findStdDeserializer(ctxt, type, beanDesc);
+        if (deser != null) {
+            return deser;
+        }
+
+        // Otherwise: could the class be a Bean class? If not, bail out
+        if (!isPotentialBeanType(type.getRawClass())) {
+            return null;
+        }
+        // For checks like [databind#1599]
+        // Use generic bean introspection to build deserializer
+        return buildBeanDeserializer(ctxt, type, beanDesc);
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+package com.fasterxml.jackson.databind.deser;
+
+import java.io.IOException;
+import java.lang.reflect.Modifier;
+
+import com.fasterxml.jackson.annotation.JsonTypeInfo.As;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.*;
+
+public class BeanDeserializerFactory extends ValueInstantiatorDelegator {
+
+  protected BeanDeserializerFactory(ValueInstantiator instantiator) {
+     super(instantiator);
+   }
+   
+  private boolean _hasDefaultConstructor(Class<?> beanType) {
+      return DefaultConstructorMarker.hasInstance(beanType.getName());
+  }
+  
+  protected static final String DEFAULT_CTOR_MARKER_PROP_NAME =
+            "com.fasterxml.jackson.databind.DefaultConstructorMarker";
+    
+   protected void setDefaultConstructorMarker(JsonMapper mapper, Class<?> beanType) throws IOException {
+        mapper.setConfigProperty(DEFAULT_CTOR_MARKER_PROP_NAME, new ObjectMapper.DefaultConstructorMarker(beanType));
+    }
+   
+    @Override
+    public JsonDeserializer<Object> createBeanDeserializer(
+            DeserializationContext ctxt, JavaType type, BeanDescription beanDesc)
+        throws JsonMappingException
+    {
+        final DeserializationConfig config = ctxt.getConfig();
+        
+        // First: custom deserializer
+        JsonDeserializer<Object> deser = _findCustomBeanDeserializer(type, config, beanDesc);
+        if (deser != null) {
+            return deser;
+        }
+        
+        // Then: special case for Throwable / subtypes; note that there is no "else" path,
+        // because if method would not be called for non-Throwable types
+        if (type.isThrowable()) {
+            return buildThrowableDeserializer(ctxt, type, beanDesc);
+        }
+        
+        // Then: abstract classes / interfaces
+        if (type.isAbstract()) {
+            JavaType concreteType = materializeAbstractType(ctxt, type, beanDesc);
+            if (concreteType != null) {
+                beanDesc = config.introspect(concreteType); 
+                return buildBeanDeserializer(ctxt, concreteType, beanDesc);
+            }
+        }
+
+        // Then: allow Object identity as fallback
+        if (_hasObjectIdType(beanDesc)) {
+            return new ObjectIdReader(this, beanDesc).makeObjectDeserializer(ctxt, type, beanDesc);
+        }
+        
+        // Finally, create default BeanDeserializer
+        return buildBeanDeserializer(ctxt, type, beanDesc);
+    }
+
+  protected boolean _hasObjectIdType(BeanDescription beanDesc) {
+      return beanDesc.findObjectIdInfo() != null;
+  }
+
+    protected JsonDeserializer<Object> buildThrowableDeserializer(
+            DeserializationContext ctxt, JavaType type, BeanDescription beanDesc)
+        throws JsonMappingException
+    {
+        /* Bit tricky: need to ensure `cause` property can be found and handled correctly,
+         * but at the same time must handle EOF gracefully...
+         */
+        PropertyName causePropName = PropertyName.construct("@cause");
+        
+        JsonDeserializer<Object> baseDeser = new StdDeserializer<Object>(type) {
+            @Override
+            public Object deserialize(JsonParser jp, DeserializationContext ctxt) throws IOException {
+                // ... implementation ...
+            }
+        };
+        baseDeser = withResolvedRecursiveBean(baseDeser, beanDesc, causePropName, "@cause", false);
+
+        return new AsThoughUnwrappedDeserializer(baseDeser);
+    }
+
+    protected JsonDeserializer<Object> withResolvedRecursiveBean(
+            JsonDeserializer<Object> deser,
+            BeanDescription beanDesc, PropertyName propName,
+            String wrappedName, boolean useWrappingPrefix)
+        throws JsonMappingException
+    {
+        TypeResolutionCache cache = beanDesc.getTypeResolverBuilder().getResolutionCache();
+
+        Class<?> cls = beanDesc.getBeanClass();       
+        AnnotatedMember member = beanDesc.findProperty(propName);
+      
+        // Check if we can resolve reference through context
+        JavaType elemType = member == null ? null : member.getType();
+       
+        // We must never serialize property if it was declared as transient
+        if ((member != null) && Modifier.isTransient(member.getModifiers())) {
+            return NullifyingDeserializer.instance;
+        }
+        
+        // And then let's wrap deserializer -- if needed, add wrapping prefix first
+        if (useWrappingPrefix) {         
+           deser = new PrefixCheckingDeserializer(deser, "$ref");
+        }
+
+        return new AsResolvedRecursiveWrapperDeserializer<>(cache, beanDesc, propName, deser);
+    }
+
+    protected JsonDeserializer<Object> buildBeanDeserializer(
+            DeserializationContext ctxt, JavaType type, BeanDescription beanDesc)
+        throws JsonMappingException
+    {
+        return new BeanDeserializer(ctxt, this, type, beanDesc);
+    }
+
+}
+```
+
+该股最近assistant
+```java
+package com.fasterxml.jackson.databind.deser;
+
+import java.io.IOException;
+import java.lang.reflect.Modifier;
+
+import com.fasterxml.jackson.annotation.JsonTypeInfo.As;
+import com.fasterxml.jackson.core

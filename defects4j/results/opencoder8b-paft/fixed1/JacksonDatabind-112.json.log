@@ -1,0 +1,237 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# StringCollectionDeserializer fails with custom collection
+Seeing this with Jackson 2.9.8.
+We have a custom collection implementation, which is wired to use its "immutable" version for deserialization. The rationale is that we don't want accidental modifications to the data structures that come from the wire, so they all are forced to be immutable.
+After upgrade from 2.6.3 to 2.9.8, the deserialization started breaking with the message:
+
+Cannot construct instance of XXX (although at least one Creator exists): no default no-arguments constructor found
+
+This happens ONLY when you deserialize a custom collection of strings as a property of the other object. Deserializing the custom collection of strings directly works fine, and so does the deserialization of custom collection of non-strings. I believe either the StringCollectionDeserializer should not be invoked for custom collections, or perhaps it does not handle the delegation as expected.
+Please see comments for repro and workaround.
+Thanks!
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/deser/std/StringCollectionDeserializer.java):
+```java
+public JsonDeserializer<?> createContextual(DeserializationContext ctxt,
+        BeanProperty property) throws JsonMappingException
+{
+    // May need to resolve types for delegate-based creators:
+    JsonDeserializer<Object> delegate = null;
+    if (_valueInstantiator != null) {
+        // [databind#2324]: check both array-delegating and delegating
+        AnnotatedWithParams delegateCreator = _valueInstantiator.getDelegateCreator();
+        if (delegateCreator != null) {
+            JavaType delegateType = _valueInstantiator.getDelegateType(ctxt.getConfig());
+            delegate = findDeserializer(ctxt, delegateType, property);
+        }
+    }
+    JsonDeserializer<?> valueDeser = _valueDeserializer;
+    final JavaType valueType = _containerType.getContentType();
+    if (valueDeser == null) {
+        // [databind#125]: May have a content converter
+        valueDeser = findConvertingContentDeserializer(ctxt, property, valueDeser);
+        if (valueDeser == null) {
+        // And we may also need to get deserializer for String
+            valueDeser = ctxt.findContextualValueDeserializer(valueType, property);
+        }
+    } else { // if directly assigned, probably not yet contextual, so:
+        valueDeser = ctxt.handleSecondaryContextualization(valueDeser, property, valueType);
+    }
+    // 11-Dec-2015, tatu: Should we pass basic `Collection.class`, or more refined? Mostly
+    //   comes down to "List vs Collection" I suppose... for now, pass Collection
+    Boolean unwrapSingle = findFormatFeature(ctxt, property, Collection.class,
+            JsonFormat.Feature.ACCEPT_SINGLE_VALUE_AS_ARRAY);
+    NullValueProvider nuller = findContentNullProvider(ctxt, property, valueDeser);
+    if (isDefaultDeserializer(valueDeser)) {
+        valueDeser = null;
+    }
+    return withResolved(delegate, valueDeser, nuller, unwrapSingle);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public JsonDeserializer<?> createContextual(DeserializationContext ctxt,
+        BeanProperty property) throws JsonMappingException
+{
+    // May need to resolve types for delegate-based creators:
+    JsonDeserializer<Object> delegate = null;
+    if (_valueInstantiator != null) {
+        // [databind#2324]: check both array-delegating and delegating
+        AnnotatedWithParams delegateCreator = _valueInstantiator.getDelegateCreator();
+        if (delegateCreator != null) {
+            JavaType delegateType = _valueInstantiator.getDelegateType(ctxt.getConfig());
+            // We're going to customize it further, but first need to make sure it can even be called
+            if (!ctxt.isEnabled(DeserializationFeature.FAIL_ON_INVALID_SUBTYPE)) {
+                delegate = ctxt.findRootDeserializer(delegateType);
+            }
+        }
+    }
+    JsonDeserializer<?> valueDeser = _valueDeserializer;
+    final JavaType valueType = _containerType.getContentType();
+    if (valueDeser == null) {
+        // [databind#125]: May have a content converter
+        valueDeser = findConvertingContentDeserializer(ctxt, property, valueDeser);
+        if (valueDeser == null) {
+            // And we may also need to get deserializer for String
+            valueDeser = ctxt.findContextualValueDeserializer(valueType, property);
+        }
+    } else { // if directly assigned, probably not yet contextual, so:
+        valueDeser = ctxt.handleSecondaryContextualization(valueDeser, property, valueType);
+    }
+    // 11-Dec-2015, tatu: Should we pass basic `Collection.class`, or more refined? Mostly
+    //   comes down to "List vs Collection" I suppose... for now, pass Collection
+    Boolean unwrapSingle = findFormatFeature(ctxt, property, Collection.class,
+            JsonFormat.Feature.ACCEPT_SINGLE_VALUE_AS_ARRAY);
+    NullValueProvider nuller = findContentNullProvider(ctxt, property, valueDeser);
+    if (isDefaultDeserializer(valueDeser)) {
+        valueDeser = null;
+    }
+    return withResolved(delegate, valueDeser, nuller, unwrapSingle);
+}
+```
+
+给付金钱assistant
+杨晓凡
+
+
+�assistant
+"We had previously used a customized deserialization mechanism for the type 'XXX'. Now it appears that the upgrade causes this customization to fail during deserialization.
+
+Analyzing the error message, it seems that there is no suitable default no-arguments constructor found for the class 'XXX'. This suggests that the custom deserialization logic did not consider the scenario where the default constructor was unavailable.
+
+To fix this issue, we need to modify the custom deserialization mechanism to ensure that the class 'XXX' has a default no-arguments constructor before deserialization. If the class already has such a constructor, there is no need for any changes."
+
+Updated Code:
+```java
+public static void main(String[] args) {
+    ObjectMapper mapper = new ObjectMapper();
+    
+    try {
+        // Deserialize without-default constructor
+        CustomObject obj = mapper.readValue("{\"customCollection\": [\"string1\", \"string2\"]}", CustomObject.class);
+        
+        System.out.println(obj.getCustomCollection()); // Output: [string1, string2]
+    } catch (IOException e) {
+        e.printStackTrace();
+    }
+}
+
+// CustomObject
+static class CustomObject {
+    private ImmutableCustomCollection customCollection;
+
+    public ImmutableCustomCollection getCustomCollection() {
+        return customCollection;
+    }
+
+    public void setCustomCollection(ImmutableCustomCollection customCollection) {
+        this.customCollection = customCollection;
+    }
+}
+
+// ImmutableCustomCollection
+static class ImmutableCustomCollection {
+    private List<String> strings = new ArrayList<>();
+
+    public void add(String s) {
+        strings.add(s);
+    }
+
+    @Override
+    public String toString() {
+        return strings.toString();
+    }
+}
+
+// CustomCollectionDeserializer
+public static class CustomCollectionDeserializer extends StdDeserializer<ImmutableCustomCollection> {
+
+    public CustomCollectionDeserializer() {
+        super(ImmutableCustomCollection.class);
+    }
+
+    @Override
+    public ImmutableCustomCollection deserialize(JsonParser p, DeserializationContext ctxt) throws IOException {
+        ImmutableCustomCollection result = new ImmutableCustomCollection();
+        
+        if(p.currentToken() == JsonToken.START_ARRAY){
+            p.nextToken();
+            
+            while(p.currentToken() != JsonToken.END_ARRAY){
+                result.add(p.getValueAsString());
+                p.nextToken();
+            }
+        } else {
+            throw new IllegalStateException("Start array token not found");
+        }
+        
+        return result;
+    }
+}
+```
+
+
+Gassistant
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

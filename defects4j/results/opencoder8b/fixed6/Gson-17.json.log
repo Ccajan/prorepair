@@ -1,0 +1,172 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Fixed DefaultDateTypeAdapter nullability issue and JSON primitives contract
+Regression in:
+
+b8f616c - Migrate DefaultDateTypeAdapter to streaming adapter (#1070)
+
+Bug reports:
+
+#1096 - 2.8.1 can't serialize and deserialize date null (2.8.0 works fine)
+#1098 - Gson 2.8.1 DefaultDateTypeAdapter is not null safe.
+#1095 - serialize date sometimes TreeTypeAdapter, sometimes DefaultDateTypeAdapter?
+This is an incorrect Java code (gson/src/main/java/com/google/gson/DefaultDateTypeAdapter.java):
+```java
+public Date read(JsonReader in) throws IOException {
+  if (in.peek() != JsonToken.STRING) {
+    throw new JsonParseException("The date should be a string value");
+  }
+  Date date = deserializeToDate(in.nextString());
+  if (dateType == Date.class) {
+    return date;
+  } else if (dateType == Timestamp.class) {
+    return new Timestamp(date.getTime());
+  } else if (dateType == java.sql.Date.class) {
+    return new java.sql.Date(date.getTime());
+  } else {
+    // This must never happen: dateType is guarded in the primary constructor
+    throw new AssertionError();
+  }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import com.google.gson.JsonIOException;
+import com.google.gson.JsonSyntaxException;
+
+import java.io.IOException;
+import java.util.Date;
+
+/**
+ * Adapter for converting a {@link Date} from JSON.
+ *
+ * @since 2.8.1
+ */
+public final class DefaultDateTypeAdapter extends TypeAdapter<Date> {
+
+    public static final String TIMESTAMP_PATTERN = "yyyy-MM-dd'T'HH:mm:ss.SSS";
+
+    private final Type type;
+
+    public DefaultDateTypeAdapter() {
+        this(Type.DATETIME);
+    }
+
+    /**
+     * Constructor that sets date format.
+     *
+     * @param type type of this date adapter.
+     */
+    public DefaultDateTypeAdapter(Type type) {
+        this.type = type;
+    }
+
+    @Override
+    public void write(JsonWriter out, Date value) throws IOException {
+        if (value == null) {
+            out.nullValue();
+            return;
+        }
+        switch (type) {
+            case TIMESTAMP:
+                out.value(value.toInstant().toString());
+                break;
+            case DATE_ONLY:
+                // Use SQL style formatting as per ISO-8601 section 5.6.
+                out.value(new java.text.SimpleDateFormat("yyyy-MM-dd").format(value));
+                break;
+            default:
+                throw new AssertionError();
+        }
+    }
+
+    @Override
+    public Date read(JsonReader in) throws IOException {
+        if (in.peek() == JsonToken.NULL) {
+            in.nextNull();
+            return null;
+        }
+        try {
+            switch (type) {
+                case TIMESTAMP:
+                    return new Date(java.time.Instant.parse(in.nextString()).toEpochMilli());
+                case DATE_ONLY:
+                    return new java.text.SimpleDateFormat("yyyy-MM-dd").parse(in.nextString());
+                default:
+                    throw new AssertionError();
+            }
+        } catch (IllegalArgumentException e) {
+            throw new JsonSyntaxException(in.getJsonStream(), e);
+        }
+    }
+
+    private enum Type {
+        DATETIME,
+        TIMESTAMP,
+        DATE_ONLY
+    }
+}
+```
+
+**Test Cases**:
+```java
+import com.google.gson.Gson;
+import org.junit.Assert;
+import org.junit.Test;
+
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.util.Calendar;
+import java.util.Date;
+
+public class DefaultDateTypeAdapterTest {
+
+    private final Gson gson = new Gson();
+
+    @Test
+    public void testDeserializeFromString() throws ParseException {
+        String jsonDateTime = "\"2023-10-10T08:00:00.000Z\"";
+        String jsonDateOnly = "\"2023-10-10\"";
+        SimpleDateFormat dateFormat = new SimpleDateFormat(DefaultDateTypeAdapter.TIMESTAMP_PATTERN);
+
+        DefaultDateTypeAdapter adapterDateTime = new DefaultDateTypeAdapter(DefaultDateTypeAdapter.Type.TIMESTAMP);
+        Assert.assertEquals(
+                dateFormat.parse(jsonDateTime.substring(1, jsonDateTime.length()-1)),
+                adapterDateTime.read(new com.google.gson.stream.JsonReader(new com.google.gson.stream.StringReader(jsonDateTime)))
+        );
+
+        DefaultDateTypeAdapter adapterDateOnly = new DefaultDateTypeAdapter(DefaultDateTypeAdapter.Type.DATE_ONLY);
+        Assert.assertEquals(
+                new SimpleDateFormat("yyyy-MM-dd").parse(jsonDateOnly.substring(1, jsonDateOnly.length()-1)),
+                adapterDateOnly.read(new com.google.gson.stream.JsonReader(new com.google.gson.stream.StringReader(jsonDateOnly)))
+        );
+    }
+
+    @Test
+    public void testSerializeFromDate() {
+        Calendar calendar = Calendar.getInstance();
+        calendar.set(2023, Calendar.OCTOBER, 10, 8, 0, 0);
+        Date expectedDateTime = calendar.getTime();
+
+        calendar.set(Calendar.HOUR_OF_DAY, 0);
+        calendar.set(Calendar.MINUTE, 0);
+        calendar.set(Calendar.SECOND, 0);
+        calendar.set(Calendar.MILLISECOND, 0);
+        Date expectedDateOnly = calendar.getTime();
+
+        DefaultDateTypeAdapter adapterDateTime = new DefaultDateTypeAdapter(DefaultDateTypeAdapter.Type.TIMESTAMP);
+        Assert.assertEquals("\"2023-10-10T08:00:00.000Z\"", gson.toJsonTree(expectedDateTime).getAsJsonObject().get("$date").toString());
+
+        DefaultDateTypeAdapter adapterDateOnly = new DefaultDateTypeAdapter(DefaultDateTypeAdapter.Type.DATE_ONLY);
+        Assert.assertEquals("\"2023-10-10\"", gson.toJsonTree(expectedDateOnly).getAsJsonObject().get("$date").toString());
+    }
+}
+```
+
+These test cases cover deserialization from a string to a `Date` object using both the timestamp pattern and the date only pattern, as well as serialization from a `Date` object to a string in the same two formats. The use of `$date` in the expected output is to match the output format when using the GSON `toJson()` method with custom serializers.
+

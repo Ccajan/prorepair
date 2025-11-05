@@ -1,0 +1,113 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# EnumMap keys not using enum's `@JsonProperty` values unlike Enum values
+Based on these issues:
+https://github.com/FasterXML/jackson-databind/issues/677
+https://github.com/FasterXML/jackson-databind/issues/1148
+https://github.com/FasterXML/jackson-annotations/issues/96
+
+I implemented @JsonProperty for my enum constants and they show up nicely when they are property values. But I also have an EnumMap which uses the enum, and it's generated JSON uses the original enum names for the keys and not the JsonProperty values.
+
+Using 2.8.1 (in spring boot 4.3.2)
+
+Thanks!
+
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/ser/std/StdKeySerializers.java):
+```java
+@SuppressWarnings("unchecked")
+    public static JsonSerializer<Object> getFallbackKeySerializer(SerializationConfig config,
+            Class<?> rawKeyType)
+    {
+        if (rawKeyType != null) {
+            // 29-Sep-2015, tatu: Odd case here, of `Enum`, which we may get for `EnumMap`; not sure
+            //   if that is a bug or feature. Regardless, it seems to require dynamic handling
+            //   (compared to getting actual fully typed Enum).
+            //  Note that this might even work from the earlier point, but let's play it safe for now
+            // 11-Aug-2016, tatu: Turns out we get this if `EnumMap` is the root value because
+            //    then there is no static type
+            if (rawKeyType == Enum.class) {
+                return new Dynamic();
+            }
+            if (rawKeyType.isEnum()) {
+                return new Default(Default.TYPE_ENUM, rawKeyType);
+            }
+        }
+        return DEFAULT_KEY_SERIALIZER;
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.databind.BeanDescription;
+import com.fasterxml.jackson.databind.KeyDeserializer;
+import com.fasterxml.jackson.databind.Module.SetupContext;
+import com.fasterxml.jackson.databind.SerializerProvider;
+import com.fasterxml.jackson.databind.jsontype.TypeSerializer;
+import com.fasterxml.jackson.databind.ser.std.StdSerializer;
+
+import java.io.IOException;
+import java.lang.reflect.Field;
+import java.util.EnumMap;
+import java.util.HashMap;
+import java.util.Map;
+
+@SuppressWarnings("unchecked")
+public class EnumKeySerializer extends StdSerializer<Enum<?>> {
+
+    private final Map<Enum<?>, String> jsonNameCache = new HashMap<>();
+    
+    protected EnumKeySerializer() {
+        super(Enum.class);
+    }
+
+    @Override
+    public void serialize(Enum<?> key, JsonGenerator jgen, SerializerProvider provider) throws IOException {
+        jgen.writeString(getJsonKeyName(key));
+    }
+    
+    private String getJsonKeyName(Enum<?> key) {
+        return jsonNameCache.computeIfAbsent(key, k -> {
+            try {
+                Field field = k.getClass().getField(k.name());
+                JsonProperty annotation = field.getAnnotation(JsonProperty.class);
+                return annotation.value();
+            } catch (NoSuchFieldException e) {
+                throw new IllegalStateException(e.getMessage(), e);
+            }
+        });
+    }
+
+    @Override
+    public KeyDeserializer findKeyDeserializer(SetupContext ctxt, BeanDescription beanDesc,
+                                                 TypeSerializer vts, KeyDeserializer deser)
+            throws IllegalArgumentException
+    {
+        return new Deserializer(this);
+    }
+
+    protected static final class Deserializer extends com.fasterxml.jackson.databind.key.Deserializer.Base {
+        
+        protected final EnumKeySerializer _serializer;
+
+        public Deserializer(EnumKeySerializer serializer) {
+            super(serializer.handledType());
+            this._serializer = serializer;
+        }
+
+        @SuppressWarnings({"unchecked"})
+        @Override
+        public Object deserializeKey(String key, com.fasterxml.jackson.core.JsonParser jp, SerializerProvider ctxt)
+                throws IOException
+        {
+            return Enum.valueOf((Class<Enum>) handledType(), _serializer.getEnumConstantForJsonName(key));
+        }
+    }
+}
+```
+
+

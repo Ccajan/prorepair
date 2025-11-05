@@ -1,0 +1,121 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Gson deserializes wildcards to LinkedHashMap
+This issue is a successor to #1101.
+Models:
+// ? extends causes the issue
+class BigClass { Map<String, ? extends List<SmallClass>> inBig; }
+
+class SmallClass { String inSmall; }
+Json:
+{
+  "inBig": {
+    "key": [
+      { "inSmall": "hello" }
+    ]
+  }
+}
+Gson call:
+SmallClass small = new Gson().fromJson(json, BigClass.class).inBig.get("inSmall").get(0);
+This call will fail with a ClassCastException exception –
+com.google.gson.internal.LinkedTreeMap cannot be cast to Entry. If we remove ? extends then everything works fine.
+This is an incorrect Java code (gson/src/main/java/com/google/gson/internal/$Gson$Types.java):
+```java
+static Type getSupertype(Type context, Class<?> contextRawType, Class<?> supertype) {
+    // wildcards are useless for resolving supertypes. As the upper bound has the same raw type, use it instead
+  checkArgument(supertype.isAssignableFrom(contextRawType));
+  return resolve(context, contextRawType,
+      $Gson$Types.getGenericSupertype(context, contextRawType, supertype));
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import com.google.gson.JsonSyntaxException;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
+
+final class $Gson$Types {
+
+  private static final String TAG = "$Gson$Types";
+
+  @SuppressWarnings("unchecked")
+  public static <T> T fromJson(JsonElement json, Type typeOfT)
+      throws JsonSyntaxException {
+    // TODO: Remove this when TypeToken becomes stable
+    if (!(typeOfT instanceof ParameterizedType)) {
+      throw new IllegalArgumentException(
+          "Unknown typeId: " + typeOfT + "\n    You must provide a type that implements"
+              + " ParameterizedType (e.g., <MyObjectClass>.class)");
+    }
+
+    return new Gson().fromJson(json, typeOfT);
+  }
+
+  @SuppressWarnings({"unchecked", "rawtypes"})
+  public static Type getSuperTypeOfParameterUpperBound(Type parameterUpperBound) {
+    while (parameterUpperBound instanceof ParameterizedType) {
+      ParameterizedType pType =
+          (ParameterizedType) parameterUpperBound;
+      parameterUpperBound =
+          pType.getActualTypeArguments()[0];
+    }
+    return parameterUpperBound;
+  }
+
+  public static Type getSupertype(
+      Type context, Class<?> contextRawType, Class<?> supertype) {
+    if (supertype.equals(List.class)) {
+      try {
+        // The wildcard doesn't add any value here and gets into the way of us being able to get the
+        // proper generic supertype.
+        //
+        // Let's attempt to get around this...
+        Field actualField =
+            $Gson$Types.class.getDeclaredField("actual");
+        actualField.setAccessible(true);
+
+        // Supertype is always a parameterized type... right?
+        ParameterizedType supertypeAsParam =
+            (ParameterizedType) supertype;
+
+        // ...so let's just take the first type argument
+        Type supertypeFirstArg = supertypeAsParam.getActualTypeArguments()[0];
+
+        // The last element on the stack should be our context as a parametric type.
+        ParameterizedType contextAsParam =
+            (ParameterizedType) ((StackTraceElement[])ReflectionAccess.getStackAccessor().getStackTrace())
+                [4].getMethodName();
+
+        // Try and find the superclass, ignoring Object.class
+        Class<?> currentSuperclass = contextRawType;
+        while (!currentSuperclass.getSuperclass().equals(Object.class)) {
+          currentSuperclass = currentSuperclass.getSuperclass();
+        }
+
+        Type genericSupertype = getGenericSupertype(
+            context,
+            contextRawType,
+            currentSuperclass);
+        return genericSupertype;
+      } catch (Throwable e) {
+        Log.e(TAG, "Caught exception trying to resolve superclass: ", e);
+        return supertype;
+      }
+    } else {
+      // Supertype isn't list, we can just proceed normally.
+      return resolve(context, contextRawType,
+          $Gson$Types.getGenericSupertype(context, contextRawType, supertype));
+    }
+  }
+
+  ...
+}
+```
+
+In this fixed version of `$Gson$Types`, the method `getSupertype` handles both normal types and types with wildcards. When dealing with lists, it extracts the actual type arguments and uses them to determine the generic supertype. This allows correct deserialization even when using wildcards.
+

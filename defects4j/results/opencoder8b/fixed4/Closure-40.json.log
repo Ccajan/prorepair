@@ -1,0 +1,185 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# smartNameRemoval causing compiler crash
+What steps will reproduce the problem?
+Compiler the following code in advanced mode:
+
+{{{
+var goog = {};
+goog.inherits = function(x, y) {};
+var ns = {};
+/** @constructor */ ns.PageSelectionModel = function(){};
+
+/** @constructor */ 
+ns.PageSelectionModel.FooEvent = function() {};
+/** @constructor */ 
+ns.PageSelectionModel.SelectEvent = function() {};
+goog.inherits(ns.PageSelectionModel.ChangeEvent, ns.PageSelectionModel.FooEvent);
+}}}
+
+What is the expected output? What do you see instead?
+The compiler will crash. The last var check throws an illegal state exception because it knows something is wrong.
+
+The crash is caused by smartNameRemoval. It has special logic for counting references in class-defining function calls (like goog.inherits), and it isn't properly creating a reference to PageSelectionModel.
+This is an incorrect Java code (src/com/google/javascript/jscomp/NameAnalyzer.java):
+```java
+public void visit(NodeTraversal t, Node n, Node parent) {
+
+  // Record global variable and function declarations
+  if (t.inGlobalScope()) {
+    if (NodeUtil.isVarDeclaration(n)) {
+      NameInformation ns = createNameInformation(t, n, parent);
+      Preconditions.checkNotNull(ns);
+      recordSet(ns.name, n);
+    } else if (NodeUtil.isFunctionDeclaration(n)) {
+      Node nameNode = n.getFirstChild();
+      NameInformation ns = createNameInformation(t, nameNode, n);
+      if (ns != null) {
+        JsName nameInfo = getName(nameNode.getString(), true);
+        recordSet(nameInfo.name, nameNode);
+      }
+    } else if (NodeUtil.isObjectLitKey(n, parent)) {
+      NameInformation ns = createNameInformation(t, n, parent);
+      if (ns != null) {
+        recordSet(ns.name, n);
+      }
+    }
+  }
+
+  // Record assignments and call sites
+  if (n.isAssign()) {
+    Node nameNode = n.getFirstChild();
+
+    NameInformation ns = createNameInformation(t, nameNode, n);
+    if (ns != null) {
+      if (ns.isPrototype) {
+        recordPrototypeSet(ns.prototypeClass, ns.prototypeProperty, n);
+      } else {
+        recordSet(ns.name, nameNode);
+      }
+    }
+  } else if (n.isCall()) {
+    Node nameNode = n.getFirstChild();
+    NameInformation ns = createNameInformation(t, nameNode, n);
+    if (ns != null && ns.onlyAffectsClassDef) {
+      JsName name = getName(ns.name, false);
+      if (name != null) {
+      refNodes.add(new ClassDefiningFunctionNode(
+          name, n, parent, parent.getParent()));
+      }
+    }
+  }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public void visit(NodeTraversal t, Node n, Node parent) {
+
+  // Record global variable and function declarations
+  if (t.inGlobalScope()) {
+    if (NodeUtil.isVarDeclaration(n)) {
+      NameInformation ns = createNameInformation(t, n, parent);
+      Preconditions.checkNotNull(ns);
+      recordSet(ns.name, n);
+    } else if (NodeUtil.isFunctionDeclaration(n)) {
+      Node nameNode = n.getFirstChild();
+      NameInformation ns = createNameInformation(t, nameNode, n);
+      if (ns != null) {
+        JsName nameInfo = getName(nameNode.getString(), true);
+        recordSet(nameInfo.name, nameNode);
+      }
+    } else if (NodeUtil.isObjectLitKey(n, parent)) {
+      NameInformation ns = createNameInformation(t, n, parent);
+      if (ns != null) {
+        recordSet(ns.name, n);
+      }
+    }
+  }
+
+  // Record assignments and call sites
+  if (n.isAssign()) {
+    Node nameNode = n.getFirstChild();
+
+    NameInformation ns = createNameInformation(t, nameNode, n);
+    if (ns != null) {
+      if (ns.isPrototype) {
+        recordPrototypeSet(ns.prototypeClass, ns.prototypeProperty, n);
+      } else {
+        recordSet(ns.name, nameNode);
+      }
+    }
+  } else if (n.isCall()) {
+    Node nameNode = n.getFirstChild();
+    NameInformation ns = createNameInformation(t, nameNode, n);
+    if (ns != null && ns.onlyAffectsClassDef) {
+      JsName name = getName(ns.name, false);
+      if (name != null) {
+        refNodes.add(new ClassDefiningFunctionNode(
+            name, n, parent, parent.getParent()));
+      }
+    }
+  }
+
+  // New condition added to handle inheritance calls properly.
+  if (n.isCall() && NodeUtil.isName(parent.getLastChild())) {
+    Node grandparent = parent.getParent();
+    while (!grandparent.isScript() && !grandparent.isExprResult()) {
+      grandparent = grandparent.getParent();
+    }
+
+    String name = parent.getLastChild().getString();
+    JsName jsName = getName(name, false);
+
+    if (jsName != null && "goog.inherits".equals(jsName.name)) {
+      JsName className = getClassName(grandparent);
+      if (className != null) {
+        JsName protoName = getFirstArgumentOfInherits(grandparent);
+        if (protoName != null) {
+          setInheritanceRelation(className, protoName, n);
+        }
+      }
+    }
+  }
+}
+
+private JsName getClassName(Node node) {
+  for (Node current = node.getFirstChild(); current != null; current = current.getNext()) {
+    if (current.isString() && current.getParent().isGetProp()) {
+      return getName(current.getString(), false);
+    }
+  }
+  return null;
+}
+
+private JsName getFirstArgumentOfInherits(Node node) {
+  Node firstArgNode = node.getLastChild().getFirstChild();
+  while (firstArgNode != null && !firstArgNode.isString()) {
+    firstArgNode = firstArgNode.getNext();
+  }
+
+  if (firstArgNode != null) {
+    return getName(firstArgNode.getString(), false);
+  }
+  
+  return null;
+}
+
+private void setInheritanceRelation(JsName superclass, JsName subclass, Node inheritsCall) {
+  JsName superClassJsName = new JsName(superclass.name);
+  JsName subClassJsName = new JsName(subclass.name);
+
+  inheritanceTree.put(subClassJsName, superClassJsName);
+
+  refNodes.add(new ClassDefiningFunctionNode(
+      subClassJsName, inheritsCall, inheritsCall.getParent(),
+      inheritsCall.getParent().getParent()));
+}
+```
+
+This revised code adds additional checks within the `visit` method to specifically handle cases where the `goog.inherits` function is called as part of defining classes or inheriting from other classes. This should resolve the issue causing the compiler crash.
+

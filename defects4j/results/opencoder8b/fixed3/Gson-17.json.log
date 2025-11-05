@@ -1,0 +1,112 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Fixed DefaultDateTypeAdapter nullability issue and JSON primitives contract
+Regression in:
+
+b8f616c - Migrate DefaultDateTypeAdapter to streaming adapter (#1070)
+
+Bug reports:
+
+#1096 - 2.8.1 can't serialize and deserialize date null (2.8.0 works fine)
+#1098 - Gson 2.8.1 DefaultDateTypeAdapter is not null safe.
+#1095 - serialize date sometimes TreeTypeAdapter, sometimes DefaultDateTypeAdapter?
+This is an incorrect Java code (gson/src/main/java/com/google/gson/DefaultDateTypeAdapter.java):
+```java
+public Date read(JsonReader in) throws IOException {
+  if (in.peek() != JsonToken.STRING) {
+    throw new JsonParseException("The date should be a string value");
+  }
+  Date date = deserializeToDate(in.nextString());
+  if (dateType == Date.class) {
+    return date;
+  } else if (dateType == Timestamp.class) {
+    return new Timestamp(date.getTime());
+  } else if (dateType == java.sql.Date.class) {
+    return new java.sql.Date(date.getTime());
+  } else {
+    // This must never happen: dateType is guarded in the primary constructor
+    throw new AssertionError();
+  }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import com.google.gson.TypeAdapter;
+import com.google.gson.stream.JsonReader;
+import com.google.gson.stream.JsonWriter;
+
+import java.io.IOException;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.Locale;
+
+/**
+ * Adapter for {@link Date}.
+ */
+public final class DefaultDateTypeAdapter extends TypeAdapter<Date> {
+
+  private final ThreadLocal<SimpleDateFormat> formatter =
+      new ThreadLocal<SimpleDateFormat>() {
+        @Override
+        protected SimpleDateFormat initialValue() {
+          return new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US);
+        }
+      };
+
+  @Override public void write(final JsonWriter out, final Date value) throws IOException {
+    if (value == null) {
+      out.nullValue();
+      return;
+    }
+
+    // Remove time zone offset as it's not required for serialization
+    SimpleDateFormat sdf = formatter.get();
+    String jsonFormattedDate = sdf.format(value).replace("GMT", "UTC");
+    out.value(jsonFormattedDate.substring(0, 22) + 'Z');
+  }
+
+  @Override public Date read(final JsonReader in) throws IOException {
+    if (in.peek() == JsonToken.NULL) {
+      in.nextNull();
+      return null;
+    }
+
+    try {
+      // Convert "2000-01-01T00:00:00Z" format into "2000-01-01 00:00:00 GMT"
+      String dateStr = in.nextString().substring(0, 19) + ' ' + in.nextString().toUpperCase(Locale.US);
+
+      // Parse with time zone
+      SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss Z", Locale.US);
+      return sdf.parse(dateStr);
+    } catch (final ParseException e) {
+      throw new IOException(e);
+    }
+  }
+}
+```
+
+**Test Cases**:
+To verify the correctness of the solution, consider the following test cases:
+
+1. Serialization:
+   ```java
+   assertDateEqual(new DefaultDateTypeAdapter().write(null), null);
+   assertDateEqual(new DefaultDateTypeAdapter().write(new Date()), "2023-04-01T12:00:00Z");
+   ```
+
+2. Deserialization:
+   ```java
+   assertDateEqual(new DefaultDateTypeAdapter().read(null), null);
+   assertDateEqual(new DefaultDateTypeAdapter().read(JsonParser.parseString("\"2023-04-01T12:00:00Z\"")), new Date());
+   assertDateEqual(new DefaultDateTypeAdapter().read(JsonParser.parseString("\"2023-04-02T06:30:00+07:00\"")), new Date(...)); // Replace ... with actual millis value
+   ```
+Please note that `assertDateEqual` method is assumed to be defined elsewhere in your testing setup to compare dates.
+
+Replace the dots (`...`) with the correct `Date` object representation when using the deserialization test case.
+

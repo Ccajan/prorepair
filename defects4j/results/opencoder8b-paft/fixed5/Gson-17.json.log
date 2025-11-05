@@ -1,0 +1,177 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Fixed DefaultDateTypeAdapter nullability issue and JSON primitives contract
+Regression in:
+
+b8f616c - Migrate DefaultDateTypeAdapter to streaming adapter (#1070)
+
+Bug reports:
+
+#1096 - 2.8.1 can't serialize and deserialize date null (2.8.0 works fine)
+#1098 - Gson 2.8.1 DefaultDateTypeAdapter is not null safe.
+#1095 - serialize date sometimes TreeTypeAdapter, sometimes DefaultDateTypeAdapter?
+This is an incorrect Java code (gson/src/main/java/com/google/gson/DefaultDateTypeAdapter.java):
+```java
+public Date read(JsonReader in) throws IOException {
+  if (in.peek() != JsonToken.STRING) {
+    throw new JsonParseException("The date should be a string value");
+  }
+  Date date = deserializeToDate(in.nextString());
+  if (dateType == Date.class) {
+    return date;
+  } else if (dateType == Timestamp.class) {
+    return new Timestamp(date.getTime());
+  } else if (dateType == java.sql.Date.class) {
+    return new java.sql.Date(date.getTime());
+  } else {
+    // This must never happen: dateType is guarded in the primary constructor
+    throw new AssertionError();
+  }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+
+import org.threeten.bp.LocalDateTime;
+
+import java.io.StringWriter;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+
+class Issue1096 {
+  public static void main(String[] args) throws Exception {
+    Gson gson = new GsonBuilder()
+      .setDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ")
+      .create();
+
+    String json = "{\"time\":\"2017-11-01T08:31:15.123+0000\"}";
+    LocalDateTime time = gson.fromJson(json, LocalDateTime.class);
+
+    System.out.println(time);
+  }
+}
+
+class DateTypeAdapter implements com.google.gson.TypeAdapter<Date> {
+
+  private final SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+
+  @Override
+  public void write(com.google.gson.stream.JsonWriter out, Date value) throws java.io.IOException {
+    if(value!=null){
+      synchronized(dateFormat){
+        out.value(dateFormat.format(value));
+      }
+    }
+  }
+
+  @Override
+  public Date read(JsonReader in) throws IOException {
+    if (in.peek() == JsonToken.NULL) {
+      in.nextNull();
+      return null;
+    }
+    try {
+      String dateString = in.nextString();
+      synchronized (dateFormat) {
+        return dateFormat.parse(dateString);
+      }
+    } catch(Exception e) {
+      throw new JsonSyntaxException(e.getMessage(), e);
+    }
+  }
+}
+
+class CustomSerializer {
+  public static void main(String[] args) throws Exception{
+    
+    Gson gson=new GsonBuilder().registerTypeAdapter(Date.class,new DateTypeAdapter()).create();
+    
+    String json="{\"time\":\"2017-11-01 10:31:15\"}";
+    Date date=gson.fromJson(json,Date.class);
+    
+    StringWriter sw=new StringWriter();
+    JsonWriter writer=gson.newJsonWriter(sw);
+    
+    gson.toJson(date,writer);
+    
+    System.out.println(sw.toString());      
+  }
+}
+```
+
+gassistant
+```java
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.reflect.TypeToken;
+import org.threeten.bp.LocalDateTime;
+import java.io.StringWriter;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+
+class DateTypeAdapterTest {
+
+    public static class DateObject {
+        public Date dateField;
+    }
+
+    public static void main(String[] args) {
+        Gson gson = new GsonBuilder()
+                .registerTypeAdapter(Date.class, new DateTypeAdapter())
+                .create();
+
+        String json = "{\"dateField\": \"2021-05-23T13:14:00Z\"}";
+        LocalDateTime expectedTime = LocalDateTime.of(2021, 5, 23, 21, 14); // Convert UTC to local time
+
+        DateObject obj = gson.fromJson(json, new TypeToken<DateObject>(){}.getType());
+
+        assert gson.toJson(obj).equals(json);
+        assert obj.dateField.toInstant().atZone(java.time.ZoneId.systemDefault()).toLocalDateTime().isEqual(expectedTime);
+
+        StringWriter writer = new StringWriter();
+        gson.toJson(obj, writer);
+
+        assert writer.toString().equals(json);
+    }
+
+    public static class DateTypeAdapter implements com.google.gson.TypeAdapter<Date> {
+
+        private final SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'");
+
+        @Override
+        public void write(com.google.gson.stream.JsonWriter out, Date value) throws java.io.IOException {
+            if (value != null) {
+                synchronized (dateFormat) {
+                    out.value(dateFormat.format(value));
+                }
+            }
+        }
+
+        @Override
+        public Date read(JsonReader in) throws IOException {
+            if (in.peek() == JsonToken.NULL) {
+                in.nextNull();
+                return null;
+            }
+            try {
+                String dateString = in.nextString();
+                synchronized (dateFormat) {
+                    return dateFormat.parse(dateString);
+                }
+            } catch (ParseException e) {
+                throw new JsonSyntaxException(e.getMessage(), e);
+            }
+        }
+    }
+}
+```
+
+

@@ -1,0 +1,194 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Incorrect handling of self-closing tags noframes, style and title cause remainder of document to be html-escaped
+Given the input:
+<html>
+<head>
+	<style />   <!-- < - - this is the culprit -->
+</head>
+<body>
+	<p>Whatever</p>
+</body>
+</html>
+JSoup 1.8.2 and also http://try.jsoup.org/~lJwWpjXYUSTBeBZhdEnS3Mt56g4 will produce:
+    <html>
+     <head> 
+      <style></style>
+     </head>
+     <body>
+       &lt;/head&gt; &lt;body&gt; &lt;p&gt;Whatever&lt;/p&gt; &lt;/body&gt; &lt;/html&gt;
+     </body>
+    </html>
+With <title/> instead of <style/>, the result is different but still wrong (http://try.jsoup.org/~BZ3uoMki-r904fZxUOWJgLJO7r8 ):
+<html>
+ <head> 
+  <title></title>
+ </head>
+ <body>
+   &lt;/head&gt;  
+  <p>Whatever</p>  
+ </body>
+</html>
+That weirdness was fixed for <script> with Issue #305: http://try.jsoup.org/~3Ms6TQCrrdaA_uPgxgURYYvwFAg
+<html>
+ <head> 
+  <script></script> 
+ </head> 
+ <body> 
+  <p>Whatever</p>  
+ </body>
+</html>
+Looking at the source, it seems only the HtmlTreeBuilderState handling for <noframes>, <style> and <title> in the methods handleRawText and handleRcData doesn't get along with the self-closing tags.
+Any other tagname I've checked (and I tried to cover all branches of that case StartTag switch) results in a good parse similar to the <script> case, which is what I'd expect.
+Thanks for looking into this!
+This is an incorrect Java code (src/main/java/org/jsoup/parser/HtmlTreeBuilderState.java):
+```java
+private static void handleRawtext(Token.StartTag startTag, HtmlTreeBuilder tb) {
+    tb.insert(startTag);
+    tb.tokeniser.transition(TokeniserState.Rawtext);
+    tb.markInsertionMode();
+    tb.transition(Text);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+private static void handleRawtext(Token.StartTag startTag, HtmlTreeBuilder tb) {
+    if ("noframes".equals(startTag.tag()) || "style".equals(startTag.tag()) || "title".equals(startTag.tag())) { // only process these three tags
+        tb.insert(startTag);
+        tb.tokeniser.transition(TokeniserState.Rawtext);
+        tb.markInsertionMode();
+        tb.transition(Text);
+    } else { // others tags treat as normal
+        tb.insert(startTag);
+        tb.tokeniser.transition(TokeniserState.Data);
+        tb.markInsertionMode();
+        tb.transition(Data);
+    }
+}
+```
+
+Lassistant
+ ```java
+private static void handleRcdata(Token.StartTag startTag, HtmlTreeBuilder tb) {
+    if ("noframes".equals(startTag.tag()) || "style".equals(startTag.tag()) || "title".equals(startTag.tag())) { // only process these three tags
+        tb.insert(startTag);
+        tb.tokenizer.transition(TokeniserState.Rcdata); // should be Tokenizer not Tokeniser
+        tb.markInsertionMode();
+        tb.transition(Text);
+    } else { // others tags treat as normal
+        tb.insert(startTag);
+        tb.tokenizer.transition(TokenizerState.Data); // should be Tokenizer not Tokeniser
+        tb.markInsertionMode();
+        tb.transition(Data);
+    }
+}
+```
+
+assistant
+ ```java
+private static void rcdataEnd(HtmlTreeBuilder tb) {
+    if (!tb.isFormattingElementInStack("script")) {
+        tb.outOfRcdata(); // add outOfRcdata() method
+        return;
+    }
+    tb.pop(); // remove the script from the stack
+    tb.processEndTagToken(new Token.EndTag("script"));
+    tb.clearStackToBeforeInsertionMode();
+}
+```
+
+每股收益assistant
+ ```java
+private static void rawtextEnd(HtmlTreeBuilder tb) {
+    if (!"noscript".equals(tb.currentElement().tag())) {
+        tb.outOfRawtext(); // add outOfRawtext() method
+        return;
+    }
+    tb.pop(); // remove the noscript from the stack
+    tb.processEndTagToken(new Token.EndTag("noscript"));
+    tb.clearStackToBeforeInsertionMode();
+}
+```
+
+
+assistant
+ ```java
+private static void noFrames(HtmlTreeBuilder treeBuilder) {
+    Document doc = treeBuilder.getDocument();
+    Element head = doc.head();
+    Node body = null;
+
+    while (treeBuilder.hasNext()) {
+        Token token = treeBuilder.nextToken();
+
+        if (token.type == TokenType.Doctype) { // skip Doctype
+            continue;
+        }
+
+        if (token.type == TokenType.EndDocument) {
+            break;
+        }
+
+        if (token.type == TokenType.StartTag && ((Token.StartTag)token).tag().equalsIgnoreCase("body")) {
+            body = treeBuilder.insert(treeBuilder.copyCurrentNode());
+        } else {
+            treeBuilder.insert(treeBuilder.copyCurrentNode());
+        }
+
+        if (token.type == TokenType.EndTag && ((Token.EndTag)token).tag().equalsIgnoreCase("head")) {
+            break;
+        }
+    }
+
+    forEachChild(body, new NodeVisitor() {
+        public void visit(Node node) {
+            treeBuilder.insert(node);
+        }
+    });
+
+    treeBuilder.pop();
+}
+```
+
+
+证人证言assistant
+ ```java
+@Override protected boolean canContainBlockOrInline(String tagName) {
+    return !"noframes".equals(tagName) && !"title".equals(tagName);
+}
+```
+
+
+被告人保assistant
+ ```java
+private static void processNoScriptToken(Token token, HtmlTreeBuilder builder) {
+    if (token.type != TokenType.StartTag || !((Token.StartTag)token).tag().equals("noscript")) {
+        builder.insert(token);
+        builder.advance();
+    } else {
+        builder.push(new Element(Tag.valueOf("noscript"), ""));
+    }
+}
+```
+
+
+出庭作证assistant
+ ```java
+private static void processNoFramesContentToken(Token token, HtmlTreeBuilder builder) {
+    if (token instanceof Token.Text) {
+        builder.insert(new TextNode(((Token.Text)token).getWholeText()));
+    } else if (token instanceof Token.StartTag && ((Token.StartTag)token).tag().equals("iframe")) {
+        builder.insert(new Element(Tag.valueOf("iframe"), ""));
+    } else {
+        builder.insert(builder.processToken(token));
+    }
+}
+```
+
+
+

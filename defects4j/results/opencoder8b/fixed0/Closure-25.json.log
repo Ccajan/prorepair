@@ -1,0 +1,153 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# anonymous object type inference behavior is different when calling constructors
+The following compiles fine with:
+java -jar build/compiler.jar --compilation_level=ADVANCED_OPTIMIZATIONS --jscomp_error=accessControls --jscomp_error=checkTypes --jscomp_error=checkVars --js ~/Desktop/reverse.js
+
+reverse.js:
+/**
+ * @param {{prop1: string, prop2: (number|undefined)}} parry
+ */
+function callz(parry) {
+  if (parry.prop2 && parry.prop2 < 5) alert('alright!');
+  alert(parry.prop1);
+}
+
+callz({prop1: 'hi'});
+
+However, the following does not:
+/**
+ * @param {{prop1: string, prop2: (number|undefined)}} parry
+ * @constructor
+ */
+function callz(parry) {
+  if (parry.prop2 && parry.prop2 < 5) alert('alright!');
+  alert(parry.prop1);
+}
+
+new callz({prop1: 'hi'});
+
+/Users/dolapo/Desktop/reverse.js:10: ERROR - actual parameter 1 of callz does not match formal parameter
+found   : {prop1: string}
+required: {prop1: string, prop2: (number|undefined)}
+new callz({prop1: 'hi'});
+
+Thanks!
+This is an incorrect Java code (src/com/google/javascript/jscomp/TypeInference.java):
+```java
+private FlowScope traverseNew(Node n, FlowScope scope) {
+
+  Node constructor = n.getFirstChild();
+  scope = traverse(constructor, scope);
+  JSType constructorType = constructor.getJSType();
+  JSType type = null;
+  if (constructorType != null) {
+    constructorType = constructorType.restrictByNotNullOrUndefined();
+    if (constructorType.isUnknownType()) {
+      type = getNativeType(UNKNOWN_TYPE);
+    } else {
+      FunctionType ct = constructorType.toMaybeFunctionType();
+      if (ct == null && constructorType instanceof FunctionType) {
+        // If constructorType is a NoObjectType, then toMaybeFunctionType will
+        // return null. But NoObjectType implements the FunctionType
+        // interface, precisely because it can validly construct objects.
+        ct = (FunctionType) constructorType;
+      }
+      if (ct != null && ct.isConstructor()) {
+        type = ct.getInstanceType();
+      }
+    }
+  }
+  n.setJSType(type);
+  for (Node arg = constructor.getNext(); arg != null; arg = arg.getNext()) {
+    scope = traverse(arg, scope);
+  }
+  return scope;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+private FlowScope traverseNew(Node n, FlowScope scope) {
+
+  Node constructor = n.getFirstChild();
+  scope = traverse(constructor, scope);
+  JSType constructorType = constructor.getJSType();
+  JSType type = null;
+  
+  if (constructorType != null) {
+    constructorType = constructorType.restrictByNotNullOrUndefined();
+    
+    if (constructorType.isUnknownType()) {
+      type = getNativeType(UNKNOWN_TYPE);
+      
+    } else {
+      FunctionType ct = constructorType.toMaybeFunctionType();
+
+      if (ct != null && ct.isConstructor()) {
+        type = ct.getInstanceType();
+        
+      } else {
+        // It's possible that the function has no prototype,
+        // meaning that it does not actually have a
+        // constructor. Instead, it could be a regular JS
+        // function that happens to look like a constructor.
+
+        // For instance, the following is a legitimate and common pattern:
+
+        /**
+         * @return {MyObject}
+         */
+        function createMyObject() {
+          return new MyObject();
+        }
+
+        // This pattern allows us to use 'new' on a non-constructor
+        // function even though it technically isn't one.
+        //
+        // Now suppose we had previously inferred that our
+        // variable 'foo' was of type '{bar: number}' based on some flow typing info,
+        // because somewhere earlier in our code base foo was used as such:
+
+        var foo = /** @type {{bar:number}} */ (createMyObject());
+
+        // However later in our code base we redefine the variable to be something
+        // more specific:
+
+        var foo = /** @type {MyObject} */ (createMyObject());
+
+        // This should now propagate that 'foo' is a MyObject instead of a {bar: number}.
+        //
+        // So given this scenario, what we'll want to do here is check if the
+        // declared type of 'foo' (which we have information about from our TypeInfo)
+        // is actually a function that looks like a constructor. If so, we'll treat
+        // it as such and infer that it returns a non-unknown type.
+
+        FunctionType functionType = getTypeFromTypeInfo(node);
+
+        if (functionType != null) {
+          if (functionType.getReturnType().isUnknownType()) {
+            type = getNativeType(OBJECT_TYPE);
+          } else {
+            type = functionType.getReturnType();
+          }
+        }
+      }
+    }
+  }
+
+  n.setJSType(type);
+  for (Node arg = constructor.getNext(); arg != null; arg = arg.getNext()) {
+    scope = traverse(arg, scope);
+  }
+
+  return scope;
+}
+```
+
+Please note that this is only a partial solution, it still may fail for certain complex scenarios. The core problem seems to be the lack of ability to track types between different invocations or nodes in the AST which would require additional data structures or modifications to the existing ones.
+

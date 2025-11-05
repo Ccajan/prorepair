@@ -1,0 +1,165 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Cleaning html containing the cid identifier breaks images
+Ok, so in mail type HTML the following is common
+
+The item after CID: can be almost anything (US-ASCII I think) and of any length. It corresponds to an image linked elsewhere in MIME say like this
+--mimebounday
+Content-ID:
+Content-Type: image/jpeg.....
+(snip)
+So, to mark a long story somewhat shorter, I use Jsoup's sanitizer extensively. However, I need these CID references to be preserved post sanitization. addProtocols does not work because the items are not valid URLs. As a result
+the above becomes . Which for my purposes is not good :)
+This is an incorrect Java code (src/main/java/org/jsoup/safety/Whitelist.java):
+```java
+private boolean testValidProtocol(Element el, Attribute attr, Set<Protocol> protocols) {
+    // try to resolve relative urls to abs, and optionally update the attribute so output html has abs.
+    // rels without a baseuri get removed
+    String value = el.absUrl(attr.getKey());
+    if (!preserveRelativeLinks)
+        attr.setValue(value);
+    
+    for (Protocol protocol : protocols) {
+        String prot = protocol.toString() + ":";
+        if (value.toLowerCase().startsWith(prot)) {
+            return true;
+        }
+    }
+    return false;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+private boolean testValidProtocol(Element el, Attribute attr, Set<Protocol> protocols) {
+    // try to resolve relative urls to abs, and optionally update the attribute so output html has abs.
+    // rels without a baseuri get removed
+    
+    String value = attr.getValue(); // Change here
+    if (!preserveRelativeLinks)
+        attr.setValue(value);
+    
+    for (Protocol protocol : protocols) {
+        String prot = protocol.toString() + ":";
+        if (value.toLowerCase().startsWith(prot)) {
+            return true;
+        }
+    }
+    return false;
+}
+```
+
+eassistant
+```java
+import org.jsoup.Jsoup;
+import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Element;
+import org.jsoup.parser.Tag;
+import org.junit.Test;
+
+public class WhitelistTest {
+
+  @Test public void testCid() throws Exception {
+    Document doc = Jsoup.parse(
+      "<html>" +
+      " <body>" +
+      "   <img src=\"cid:test@foo.com\">" +
+      " </body>" +
+      "</html>"
+    );
+    Tag tag = new Tag("div", "", "");
+    Element e = doc.body().appendElement(tag);
+    e.attr("src","cid:12345");
+
+    Whitelist w = new Whitelist();
+    Document clean = Jsoup.clean(doc, w.asString());
+
+    System.out.println(clean.html());
+  }
+}
+```
+
+assistant
+```java
+package org.jsoup.safety;
+
+import static org.jsoup.parser.Attributes.*;
+import static org.jsoup.parser.Token.*;
+
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.EnumSet;
+import java.util.Set;
+import org.jsoup.Jsoup;
+import org.jsoup.nodes.Attribute;
+import org.jsoup.nodes.Attributes;
+import org.jsoup.nodes.Document.OutputSettings;
+import org.jsoup.nodes.Element;
+import org.jsoup.nodes.Node;
+import org.jsoup.parser.Parser;
+import org.jsoup.parser.Token;
+import org.jsoup.parser.XmlTreeBuilder;
+import org.jsoup.parser.TreeBuilder.InsertMode;
+import org.junit.Assert;
+import org.junit.Test;
+
+public class WhitelistTest {
+
+  private static final Set<Protocol> NONE_PROTOCOLS =
+      Collections.emptySet();
+
+  static enum Protocol {
+    Http,
+    Imap
+  }
+
+  @Test public void testRelativeLinksNotRemovedWithBaseUri() throws Exception {
+    String html =
+        "<a href='bar'>baz</a><img src='/foo/bar.jpg'>";
+    Document document = Jsoup.parse(html).baseUri("http://example.com/");
+    Whitelist whitelist = new Whitelist();
+    whitelist.addTagsToPreset("a", "img");
+    Document sanitizedDocument = Jsoup.clean(document, whitelist.asString(), document.baseUri(), OutputSettings.immutable());
+    Assert.assertEquals("<a href=\"http://example.com/bar\">baz</a>\n<img src=\"http://example.com/foo/bar.jpg\">\n", Jsoup.clean(sanitizedDocument.outerHtml()));
+  }
+
+  @Test public void testProtocolValidation() throws Exception {
+    String html =
+        "<img src=\"cid:test@foo.com\" /><img src=\"file:///etc/passwd\" />";
+    Document doc = Jsoup.parse(html);
+
+    Whitelist w = new Whitelist();
+    Element e = doc.body().getElementsByTag("img").first();
+    e.attributes().remove("src");
+    e.attr("src", "cid:12345");
+
+    String unsafeSrc = e.attributes().get("src");
+    Assert.assertFalse(w.testValidProtocol(e, new Attribute("src", unsafeSrc), NONE_PROTOCOLS));
+    unsafeSrc = "/etc/passwd";
+    Assert.assertFalse(w.testValidProtocol(e.clone(), new Attribute("src", unsafeSrc), NONE_PROTOCOLS));
+
+    w.addAllowedProtocol("img", "cid");
+    Assert.assertTrue(w.testValidProtocol(e, new Attribute("src", unsafeSrc), EnumSet.of(Protocol.cid)));
+  }
+
+  @Test public void testEmptyWhitelistDoesntMessUpParse() {
+    String html = "<p>abc<img/><b>def<a href=\"asd\"></a></b>";
+    Document cleanDoc = Jsoup.clean(Jsoup.parse(html), Whitelist.none().toString());
+    Assert.assertEquals("<p>abc<img/><b>def</b>", cleanDoc.body().html());
+  }
+
+  @Test public void testEmbeddedObject() throws Exception {
+    StringBuilder html = new StringBuilder();
+    for (int i = 0; i < 50000; i++) {
+      html.append('<').append('o').append(i).append('>').append("</object>");
+    }
+    Document parse = Jsoup.parse(html.toString());
+    Document cleanDoc = Jsoup.clean(parse, Whitelist.basicWithImages().toString());
+    for (Node n : cleanDoc.select("object")) {
+      Assert.assertNull(n.nodeName());
+    }
+    Assert.assertEquals(2 * 50000, cleanDoc.outerHtml

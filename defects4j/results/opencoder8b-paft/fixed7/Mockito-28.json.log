@@ -1,0 +1,180 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# nicer textual printing of typed parameters
+When matchers fail but yield the same toString(), Mockito prints extra type information. However, the type information is awkwardly printed for Strings. I've encountered this issue while working on removing hard dependency to hamcrest.
+//current:
+someMethod(1, (Integer) 2);
+someOther(1, "(String) 2");
+//desired:
+someOther(1, (String) "2");
+This is an incorrect Java code (src/org/mockito/internal/configuration/DefaultInjectionEngine.java):
+```java
+private void injectMockCandidate(Class<?> awaitingInjectionClazz, Set<Object> mocks, Object fieldInstance) {
+    for(Field field : orderedInstanceFieldsFrom(awaitingInjectionClazz)) {
+        mockCandidateFilter.filterCandidate(mocks, field, fieldInstance).thenInject();
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+package org.mockito.internal.configuration;
+
+import java.lang.reflect.Field;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
+import org.mockito.MockitoException;
+import org.mockito.invocation.StubbingProxy;
+import org.mockito.mock.MockCreationSettings;
+import org.mockito.stubbing.Answers;
+import static org.mockito.internal.util.ObjectUtils.getAllInterfacesOfObjectIncludingSuperclasses;
+
+public class DefaultInjectionEngine {
+
+    private void injectMockCandidate(Class<?> awaitingInjectionClazz, Set<Object> mocks, Object instance) {
+        for(Field field : orderedInstanceFieldsFrom(awaitingInjectionClazz)) {
+            new MockCandidate(field, instance).filterAndInject(mocks);
+        }
+    }
+
+    public void injectMock(MockCreationSettings settings, Answers defaultAnswer, StubbingProxy proxy){
+        Class<?> mockedType = settings.getToType();
+        try {
+            Set<Object> mockObjects = new HashSet<>(Arrays.asList(proxy));
+            injectMockCandidate(mockedType, mockObjects, proxy);
+
+            for (Class<?> interfaceWithDefaultMethods : getAllInterfacesOfObjectIncludingSuperclasses(proxy)) {
+                mockObjects = new HashSet<>(Arrays.asList(interfaceWithDefaultMethods));
+                injectMockCandidate(interfaceWithDefaultMethods, mockObjects, proxy);
+            }
+
+            if (proxy instanceof Object) {
+                mockObjects = new HashSet<>(Arrays.asList(proxy.getClass()));
+                injectMockCandidate(proxy.getClass(), mockObjects, proxy);
+            }
+        } catch(IllegalAccessException ex) {
+            throw new MockitoException("Could not inject fields: ", ex);
+        }
+    }
+
+    public static class MockCandidate {
+        private final Field field;
+        private final Object target;
+        private final Set<Object> candidates;
+
+        public MockCandidate(Field field, Object target) {
+            this.field = field;
+            this.target = target;
+            this.candidates = new HashSet<>();
+        }
+
+        public void filterAndInject(Set<Object> candidates) {
+            this.candidates.addAll(candidates);
+            candidateShouldBeIgnored().ifPresentOrElse(
+                    ignored -> {},
+                    () -> {
+                        Object value = getFieldValue(this.candidates);
+                        new Injector(field, target).inject(value);
+                    }
+            );
+        }
+
+        private void thenInject() { 
+            filterAndInject(candidates);
+        }
+
+        private Optional<Object> candidateShouldBeIgnored(){
+            return candidates.stream()
+                    .filter(each -> field.getType().isInstance(each))
+                    .findFirst();    
+        }
+
+        private Object getFieldValue(Set<Object> candidates){
+            return candidates.stream()
+                    .filter(field.getType()::isInstance)
+                    .findAny()
+                    .orElse(null);
+        }
+
+        public static class Injector {
+            private final Field field;
+            private final Object target;
+            private final Object newValue;
+
+            public Injector(Field field, Object target) {
+                this.field = field;
+                this.target = target;
+                this.newValue = null; // For brevity, we're setting newValue to null in this example.
+            }
+
+            public void inject(Object newValue) {
+                try {
+                    field.set(target, newValue);
+                } catch (IllegalAccessException e) {
+                    throw new RuntimeException("Failed to inject into field: " + field.getName());
+                }
+            }
+        }
+    }
+
+    public static class ObjectUtils {
+        public static Object[] getAllInterfacesOfObjectIncludingSuperclasses(Object object) {
+            Class<?> superClass = object.getClass();
+            while (superClass != null) {
+                for (Class<?> interfaze : superClass.getDeclaredClasses()) {
+                    if (!interfaze.isInterface()) continue;
+                    try {
+                        superClass.getDeclaredMethod(interfaze.getSimpleName());
+                        return new Object[]{interfaze};
+                    } catch (NoSuchMethodException ignored) {
+                    }
+                }
+                superClass = superClass.getSuperclass();
+            }
+            return new Object[0];
+        }
+    }
+}
+```
+
+询问笔录assistant
+ ```java
+package org.mockito.internal.matchers;
+
+import java.lang.annotation.Annotation;
+import java.util.List;
+import java.util.Map;
+import org.mockito.Matcher;
+import org.mockito.exceptions.Reporter;
+import static org.mockito.internal.util.StringUtil.join;
+
+/**
+ * @author Lukasz Grzegorek
+ */
+public abstract class TextualRepresentation<T> implements StringRepresentation<T>, ToStringStyle<T> {
+
+    protected final Reporter reporter;
+    private final boolean printParameterName;
+
+    protected TextualRepresentation(Reporter reporter) {
+        this(reporter, true);
+    }
+
+    protected TextualRepresentation(Reporter reporter, boolean printParameterName) {
+        this.reporter = reporter;
+        this.printParameterName = printParameterName;
+    }
+
+    public String stringRepresentation(T argument, String parameterName, List<Class<?>> types,
+                                         Map<String, String> namedArgs) {
+        String typeInformation = join(types, ", ");
+        String matcherToString = (argument instanceof Matcher ? ((Matcher<?>) argument).toString() : reporter.textOf(argument));
+
+        String text = parameterName == null || !printParameterName ?
+                      matcherToString :
+                      parameterName

@@ -1,0 +1,171 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Parsing PAX headers fails with NegativeArraySizeException
+The TarArchiveInputStream.parsePaxHeaders method fails with a NegativeArraySizeException when there is an empty line at the end of the headers.
+The inner loop starts reading the length, but it gets a newline (10) and ends up subtracting '0' (48) from it; the result is a negative length that blows up an attempt to allocate the rest array.
+I would say that a check to see if ch is less the '0' and break the loop if it is.
+I used npm pack aws-sdk@2.2.16 to generate a tarball with this issue.
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/tar/TarArchiveInputStream.java):
+```java
+Map<String, String> parsePaxHeaders(final InputStream i)
+    throws IOException {
+    final Map<String, String> headers = new HashMap<String, String>(globalPaxHeaders);
+    // Format is "length keyword=value\n";
+    while(true){ // get length
+        int ch;
+        int len = 0;
+        int read = 0;
+        while((ch = i.read()) != -1) {
+            read++;
+            if (ch == ' '){
+                // Get keyword
+                final ByteArrayOutputStream coll = new ByteArrayOutputStream();
+                while((ch = i.read()) != -1) {
+                    read++;
+                    if (ch == '='){ // end of keyword
+                        final String keyword = coll.toString(CharsetNames.UTF_8);
+                        // Get rest of entry
+                        final int restLen = len - read;
+                        if (restLen == 1) { // only NL
+                            headers.remove(keyword);
+                        } else {
+                            final byte[] rest = new byte[restLen];
+                            final int got = IOUtils.readFully(i, rest);
+                            if (got != restLen) {
+                                throw new IOException("Failed to read "
+                                                      + "Paxheader. Expected "
+                                                      + restLen
+                                                      + " bytes, read "
+                                                      + got);
+                            }
+                            // Drop trailing NL
+                            final String value = new String(rest, 0,
+                                                      restLen - 1, CharsetNames.UTF_8);
+                            headers.put(keyword, value);
+                        }
+                        break;
+                    }
+                    coll.write((byte) ch);
+                }
+                break; // Processed single header
+            }
+            len *= 10;
+            len += ch - '0';
+        }
+        if (ch == -1){ // EOF
+            break;
+        }
+    }
+    return headers;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+
+public class FixedTarArchiveInputStream extends TarArchiveInputStream {
+
+    @Override
+    protected Map<String, String> parsePaxHeaders(InputStream in) throws IOException {
+        final Map<String, String> headers = new HashMap<>(super.parsePaxHeaders(in));
+        // Format is "length keyword=value\n";
+        while (true) { // get length
+            int ch;
+            int len = 0;
+            int read = 0;
+            boolean hasSpace = false;
+            while ((ch = in.read()) != -1) {
+                read++;
+                if (ch == ' ') {
+                    hasSpace = true;
+                } else if (!hasSpace && ch >= '0' && ch <= '9') {
+                    len *= 10;
+                    len += ch - '0';
+                } else if (ch == '=') { // end of keyword
+                    final ByteArrayOutputStream coll = new ByteArrayOutputStream();
+                    while ((ch = in.read()) != -1) {
+                        read++;
+                        if (ch == '\n') { // end of value
+                            final String keyword = coll.toString(StandardCharsets.UTF_8.name());
+                            final int restLen = len - read;
+                            if (restLen == 1) { // only NL
+                                headers.remove(keyword);
+                            } else if (restLen > 0) {
+                                final byte[] rest = new byte[restLen - 1];
+                                final int got = IOUtils.readFully(in, rest);
+                                if (got != restLen - 1) {
+                                    throw new IOException("Failed to read Paxheader. Expected "
+                                                              + (restLen - 1)
+                                                              + " bytes, read "
+                                                              + got);
+                                }
+                                // Drop trailing NL
+                                final String value = new String(rest, StandardCharsets.UTF_8.name());
+                                headers.put(keyword, value);
+                            }
+                            break;
+                        }
+                        coll.write((byte) ch);
+                    }
+                    break; // Processed single header
+                }
+                if (ch < '0' || ch > '9') {
+                    len = 0;
+                    read = 0;
+                }
+            }
+            if (ch == -1) { // EOF
+                break;
+            }
+        }
+        return headers;
+    }
+
+    private static class IOUtils {
+        public static int readFully(InputStream in, byte[] b) throws IOException {
+            int totalBytesRead = 0;
+            while (totalBytesRead < b.length) {
+                int bytesRead = in.read(b, totalBytesRead, b.length - totalBytesRead);
+                if (bytesRead <= 0) {
+                    break;
+                }
+                totalBytesRead += bytesRead;
+            }
+            return totalBytesRead;
+        }
+    }
+}
+```
+
+**Test Cases**:
+To verify the solution's correctness, you can create a test tarball file that includes PAX headers with and without an empty line at the end. Then, use the `FixedTarArchiveInputStream` class to parse these headers and assert that they are correctly parsed.
+
+For example:
+
+```java
+@Test
+public void testParsePaxHeaders() throws Exception {
+    // Create a mock InputStream representing a tarball with PAX headers including an empty line at the end
+    InputStream inputStream = ... // This should be implemented as per your requirements
+
+    try (TarArchiveInputStream tarInputStream = new FixedTarArchiveInputStream(inputStream)) {
+        Map<String, String> headers = tarInputStream.parsePaxHeaders();
+
+        // Assert that the headers have been parsed correctly
+        assertEquals(expectedValueForKeyword1, headers.get("keyword1"));
+        assertEquals(expectedValueForKeyword2, headers.get("keyword2"));
+        // Add more assertions for other keywords as needed
+    }
+}
+```
+
+Please note that the actual implementation of the `testParsePaxHeaders()` method requires creating a proper mock or using existing tools to simulate the input stream accordingly.
+

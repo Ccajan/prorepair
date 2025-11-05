@@ -1,0 +1,216 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Mixin annotations lost when using a mixin class hierarchy with non-mixin interfaces
+In summary, mixin annotations are lost when Jackson scans a parent mixin class with Json annotations followed by an interface implemented by the parent mixin class that does not have the same Json annotations.
+Jackson version: 2.4.0
+Detail:
+I have the following class structure
+public interface Contact {
+    String getCity();
+}
+
+public class ContactImpl implements Contact {
+    public String getCity() { ... }
+}
+
+public class ContactMixin implements Contact {
+    @JsonProperty
+    public String getCity() { return null; }
+}
+
+public interface Person extends Contact {}
+
+public class PersonImpl extends ContactImpl implements Person {}
+
+public class PersonMixin extends ContactMixin implements Person {}
+and I configure a module as
+// There are other getters/properties in the Impl class that do not need to be serialized and so
+// I am using the Mixin to match the interface and explicitly annotate all the inherited methods
+module.disable(MapperFeature.ALLOW_FINAL_FIELDS_AS_MUTATORS)
+    .disable(MapperFeature.AUTO_DETECT_FIELDS)
+    .disable(MapperFeature.AUTO_DETECT_GETTERS)
+    .disable(MapperFeature.AUTO_DETECT_IS_GETTERS)
+    .disable(MapperFeature.INFER_PROPERTY_MUTATORS);
+module.setMixInAnnotation(Person.class, PersonMixin.class);
+When a PersonImpl instance is serialized, city is not included.
+I debugged the code and this is what happens:
+In AnnotatedClass.resolveMemberMethods() the supertypes of PersonImpl are [Person.class, Contact.class, ContactImpl.class] in that order.
+It starts with Person for which it finds PersonMixin and proceeds to AnnotatedClass._addMethodMixIns(). Here the parents list has [PersonMixin, ContactMixin, Contact]. When it processes ContactMixin it adds getCity() with the JsonProperty annotation. Then it processes Contact, doesn't find getCity() in methods map and so creates a new AnnotatedMethod for getCity() with the one from the interface which has no annotation which replaces the one from ContactMixin
+The workaround for this issue is to explicitly add any parent mixins to the module i.e.
+module.setMixInAnnotation(Contact.class, ContactMixin.class);
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/introspect/AnnotatedClass.java):
+```java
+protected void _addMethodMixIns(Class<?> targetClass, AnnotatedMethodMap methods,
+        Class<?> mixInCls, AnnotatedMethodMap mixIns)
+{
+    List<Class<?>> parents = new ArrayList<Class<?>>();
+    parents.add(mixInCls);
+    ClassUtil.findSuperTypes(mixInCls, targetClass, parents);
+    for (Class<?> mixin : parents) {
+        for (Method m : mixin.getDeclaredMethods()) {
+            if (!_isIncludableMemberMethod(m)) {
+                continue;
+            }
+            AnnotatedMethod am = methods.find(m);
+            /* Do we already have a method to augment (from sub-class
+             * that will mask this mixIn)? If so, add if visible
+             * without masking (no such annotation)
+             */
+            if (am != null) {
+                _addMixUnders(m, am);
+                /* Otherwise will have precedence, but must wait
+                 * until we find the real method (mixIn methods are
+                 * just placeholder, can't be called)
+                 */
+            } else {
+                // Well, or, as per [Issue#515], multi-level merge within mixins...
+                    mixIns.add(_constructMethod(m));
+            }
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+protected void _addMethodMixIns(Class<?> targetClass, AnnotatedMethodMap methods,
+        Class<?> mixInCls, AnnotatedMethodMap mixIns)
+{
+    List<Class<?>> parents = new ArrayList<Class<?>>();
+    parents.add(mixInCls);
+    ClassUtil.findSuperTypes(mixInCls, targetClass, parents);
+    for (Class<?> mixin : parents) {
+        for (Method m : mixin.getDeclaredMethods()) {
+            if (!_isIncludableMemberMethod(m)) {
+                continue;
+            }
+            AnnotatedMethod am = methods.find(m);
+            /* Do we already have a method to augment (from sub-class
+             * that will mask this mixIn)? If so, add if visible
+             * without masking (no such annotation)
+             */
+            if (am != null) {
+                _addMixUnders(m, am);
+                /* Otherwise will have precedence, but must wait
+                 * until we find the real method (mixIn methods are
+                 * just placeholder, can't be called)
+                 */
+            } else {
+                // Well, or, as per [Issue#515], multi-level merge within mixins...
+                boolean found = false;
+                for (AnnotatedMethod ma : mixIns.values()) {
+                    if (ma.getRawParameterType().equals(m.getReturnType())) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    mixIns.add(_constructMethod(m));
+                }
+            }
+        }
+    }
+}
+```
+
+
+认罪悔罪assistant
+```java
+package com.fasterxml.jackson.databind.introspect;
+
+import java.lang.annotation.Annotation;
+import java.util.*;
+
+public class AnnotatedClass {
+    protected void _addMethodMixIns(Class<?> targetClass, AnnotatedMethodMap methods,
+            Class<?> mixInCls, AnnotatedMethodMap mixIns)
+    {
+        List<Class<?>> parents = new ArrayList<Class<?>>();
+        parents.add(mixInCls);
+        ClassUtil.findSuperTypes(mixInCls, targetClass, parents);
+        for (Class<?> mixin : parents) {
+            for (Method m : mixin.getDeclaredMethods()) {
+                if (!_isIncludableMemberMethod(m)) {
+                    continue;
+                }
+                AnnotatedMethod am = methods.find(m);
+                /* Do we already have a method to augment (from sub-class
+                 * that will mask this mixIn)? If so, add if visible
+                 * without masking (no such annotation)
+                 */
+                if (am != null) {
+                    _addMixUnders(m, am);
+                    /* Otherwise will have precedence, but must wait
+                     * until we find the real method (mixIn methods are
+                     * just placeholder, can't be called)
+                     */
+                } else {
+                    // Well, or, as per [Issue#515], multi-level merge within mixins...
+                    boolean found = false;
+                    for (AnnotatedMethod ma : mixIns.values()) {
+                        if (ma.getRawParameterType().equals(m.getReturnType())) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        mixIns.add(_constructMethod(m));
+                    }
+                }
+            }
+        }
+    }
+
+    protected final static void ClassUtil.findSuperTypes(Class<?> mixInCls, Class<?> targetClass, List<Class<?>> parents) {
+        while (mixInCls != null && mixInCls != Object.class && mixInCls != targetClass) {
+            parents.add(0, mixInCls);
+            mixInCls = mixInCls.getSuperclass();
+        }
+    }
+    
+    protected AnnotatedMethodMap _constructMethod(Method m) {
+        return new AnnotatedMethodMap(new AnnotatedMethod(this, m, Annotation.EMPTY_ANNOTATION_ARRAY));
+    }
+
+    protected void _addMixUnders(Method m, AnnotatedMethod am) {
+        // Placeholder
+    }
+    
+    protected boolean _isIncludableMemberMethod(Method m) {
+        return true;
+    }
+    
+    protected final AnnotatedMethod find(Method m) {
+        return null;
+    }
+    
+    protected class AnnotatedMethodMap {
+        private Map<Method, AnnotatedMethod> methodMap = new HashMap<>();
+        
+        public void add(AnnotatedMethod annotatedMethod) {
+            methodMap.put(annotatedMethod.getAnnotated().getDeclaringMethod(), annotatedMethod);
+        }
+        
+        public AnnotatedMethod find(Method method) {
+            return methodMap.get(method);
+        }
+    }
+    
+    protected class AnnotatedMethod {
+        public AnnotatedMethod(AnnotatedClass annotatedClass, Method method, Annotation[] declaredAnnotations) {
+            // Constructor implementation
+        }
+        
+        public Method getAnnotated() {
+            return null;
+        }
+        
+        public Annotation[] getDeclaredAnnotations() {
+            return Annotation.EMPTY_ANNOTATION_ARRAY;
+        }
+        
+

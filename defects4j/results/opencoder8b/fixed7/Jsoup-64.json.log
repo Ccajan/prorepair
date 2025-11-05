@@ -1,0 +1,94 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Incorrect handling of self-closing tags noframes, style and title cause remainder of document to be html-escaped
+Given the input:
+<html>
+<head>
+	<style />   <!-- < - - this is the culprit -->
+</head>
+<body>
+	<p>Whatever</p>
+</body>
+</html>
+JSoup 1.8.2 and also http://try.jsoup.org/~lJwWpjXYUSTBeBZhdEnS3Mt56g4 will produce:
+    <html>
+     <head> 
+      <style></style>
+     </head>
+     <body>
+       &lt;/head&gt; &lt;body&gt; &lt;p&gt;Whatever&lt;/p&gt; &lt;/body&gt; &lt;/html&gt;
+     </body>
+    </html>
+With <title/> instead of <style/>, the result is different but still wrong (http://try.jsoup.org/~BZ3uoMki-r904fZxUOWJgLJO7r8 ):
+<html>
+ <head> 
+  <title></title>
+ </head>
+ <body>
+   &lt;/head&gt;  
+  <p>Whatever</p>  
+ </body>
+</html>
+That weirdness was fixed for <script> with Issue #305: http://try.jsoup.org/~3Ms6TQCrrdaA_uPgxgURYYvwFAg
+<html>
+ <head> 
+  <script></script> 
+ </head> 
+ <body> 
+  <p>Whatever</p>  
+ </body>
+</html>
+Looking at the source, it seems only the HtmlTreeBuilderState handling for <noframes>, <style> and <title> in the methods handleRawText and handleRcData doesn't get along with the self-closing tags.
+Any other tagname I've checked (and I tried to cover all branches of that case StartTag switch) results in a good parse similar to the <script> case, which is what I'd expect.
+Thanks for looking into this!
+This is an incorrect Java code (src/main/java/org/jsoup/parser/HtmlTreeBuilderState.java):
+```java
+private static void handleRawtext(Token.StartTag startTag, HtmlTreeBuilder tb) {
+    tb.insert(startTag);
+    tb.tokeniser.transition(TokeniserState.Rawtext);
+    tb.markInsertionMode();
+    tb.transition(Text);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+private static void handleRawtext(Token.StartTag startTag, HtmlTreeBuilder tb) {
+    if (!isKnownTag(startTag.tagName())) {
+        // insert start tag as raw text token here
+        tb.currentNode = new Token.TextStartTag(startTag.tagName(), startTag.baseUri());
+        tb.processingInstructionHandlers.add(new TagClosureHandler());
+    } else {
+        tb.insert(startTag);
+        tb.tokeniser.transition(TokeniserState.Rawtext);
+        tb.markInsertionMode();
+        tb.transition(Text);
+    }
+}
+
+// Additional method to check if tag is known or not
+private static boolean isKnownTag(String tagName) {
+    return "noframes".equals(tagName) || "style".equals(tagName) || "title".equals(tagName);
+}
+
+// Handler class to close tag after insertion
+class TagClosureHandler implements ProcessingInstructionHandler {
+    @Override
+    public void process(ProcessingInstruction pi, HtmlTreeBuilder tb) {
+        tb.insert(pi.data()); // inserts data of PI as Text nodes
+        tb.insert(new Token.EndTag(tb.currentNode.asStartTag().tagName())); // end tag automatically inserted
+        tb.clearStackToCloseCurrentNode();
+    }
+}
+```
+
+In the corrected code, we first check if the tag is one of the self-closing tags (`noframes`, `style`, `title`). If it is, we treat it as a raw text node rather than an HTML tag. We then create a `Token.TextStartTag` instance to represent the start tag within the raw text state and register a `ProcessingInstructionHandler` to manage closing the tag properly once the start tag has been inserted.
+
+The `TagClosureHandler` simply takes the data from the processing instruction (which should contain the content of the tag), converts it into text tokens, and then closes the tag by inserting an appropriate end tag token before clearing the stack up to and including the current node.
+
+Please note that this solution assumes that the `currentNode` field in the `HtmlTreeBuilder` is used to store the current start tag during raw text parsing and can be accessed later through `tb.currentNode`. This might need adjustments based on the actual implementation details of the Jsoup library.
+

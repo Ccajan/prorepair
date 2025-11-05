@@ -1,0 +1,244 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Prototypes declared with quotes produce a JSC_USED_GLOBAL_THIS warning.
+Compiling the following code (in advanced optimizations with VERBOSE
+warning levels):
+
+/** @constructor */
+function MyClass() {}
+MyClass.prototype["MyMethod"] = function(a) {
+  this.a = a;
+}
+window["MyClass"] = MyClass;
+
+Results in the following warning: "dangerous use of the global this
+object." This notation is convenient to declare a prototype that is purely
+used for export purposes. The warning can be suppressed by using an @this
+notation.
+
+Given the following externs:
+
+/**@interface */
+function MyParent() {}
+/** @param {*} a */
+MyParent.prototype.MyMethod = function(a) {}
+
+And the following code:
+
+/**
+* @constructor
+* @implements {MyParent}
+*/
+function MyClass() {}
+MyClass.prototype["MyMethod"] = function(a) {
+  this.a2 = a;
+}
+window["MyClass"] = MyClass;
+
+The compiler also produces the waring: "property MyMethod on interface
+MyParent is not implemented by type MyClass".
+This is an incorrect Java code (src/com/google/javascript/jscomp/CheckGlobalThis.java):
+```java
+public boolean shouldTraverse(NodeTraversal t, Node n, Node parent) {
+
+  if (n.getType() == Token.FUNCTION) {
+    // Don't traverse functions that are constructors or have the @this
+    // or @override annotation.
+    JSDocInfo jsDoc = getFunctionJsDocInfo(n);
+    if (jsDoc != null &&
+        (jsDoc.isConstructor() ||
+         jsDoc.hasThisType() ||
+         jsDoc.isOverride())) {
+      return false;
+    }
+
+    // Don't traverse functions unless they would normally
+    // be able to have a @this annotation associated with them. e.g.,
+    // var a = function() { }; // or
+    // function a() {} // or
+    // a.x = function() {};
+    int pType = parent.getType();
+    if (!(pType == Token.BLOCK ||
+          pType == Token.SCRIPT ||
+          pType == Token.NAME ||
+          pType == Token.ASSIGN)) {
+      return false;
+    }
+  }
+
+  if (parent != null && parent.getType() == Token.ASSIGN) {
+    Node lhs = parent.getFirstChild();
+    Node rhs = lhs.getNext();
+    
+    if (n == lhs) {
+      // Always traverse the left side of the assignment. To handle
+      // nested assignments properly (e.g., (a = this).property = c;),
+      // assignLhsChild should not be overridden.
+      if (assignLhsChild == null) {
+        assignLhsChild = lhs;
+      }
+    } else {
+      // Only traverse the right side if it's not an assignment to a prototype
+      // property or subproperty.
+        if (lhs.getType() == Token.GETPROP &&
+            lhs.getLastChild().getString().equals("prototype")) {
+          return false;
+        }
+        if (lhs.getQualifiedName() != null && lhs.getQualifiedName().contains(".prototype.")) {
+          return false;
+        }
+    }
+  }
+
+  return true;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import com.google.common.base.Splitter;
+import com.google.common.collect.Iterables;
+import java.util.Iterator;
+
+public class CheckGlobalThis extends AbstractCheck implements CompilerPass {
+
+  private static final DiagnosticType<JSError> ERROR_DIAGNOSTIC_TYPE =
+      DiagnosticType.error(
+          "JSC_USE_OF_GLOBAL_THIS",
+          "Dangerous use of the global 'this' object.");
+
+  /**
+   * Returns true iff the given node represents a call to the given global
+   * function. If it does, and the function has no arguments, we assume
+   * that this indicates a use of 'global'. So don't report it as a
+   * dangerous case.
+   */
+  private static boolean mayBeCallingGlobalNode(NodeTraversal t, Node n,
+                                                 String name) {
+    if (!t.getScope().isDeclared(name)) {
+      return false;
+    }
+
+    for (int i = 0; i < n.getChildCount(); i++) {
+      Node arg = n.getChild(i);
+      if (!NodeUtil.isNullOrUndefined(arg)
+          || t.getCompiler().hasSideEffects(arg)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  public void process(Node externs, Node root) {
+    new NodeTraversal(null, getContext(), new NodeTraversalCallback() {
+      @Override
+      public boolean shouldTraverse(NodeTraversal t, Node n, Node parent) {
+        if (n.getType() == Token.FUNCTION) {
+          // Don't traverse functions that are constructors or have the @this
+          // or @override annotation.
+          JSDocInfo jsDoc = getFunctionJsDocInfo(n);
+          if (jsDoc != null &&
+              (jsDoc.isConstructor() ||
+               jsDoc.hasThisType() ||
+               jsDoc.isOverride())) {
+            return false;
+          }
+
+          // Don't traverse functions unless they would normally
+          // be able to have a @this annotation associated with them. e.g.,
+          // var a = function() { }; // or
+          // function a() {} // or
+          // a.x = function() {};
+          int pType = parent.getType();
+          if (!(pType == Token.BLOCK ||
+                pType == Token.SCRIPT ||
+                pType == Token.NAME ||
+                pType == Token.ASSIGN)) {
+            return false;
+          }
+        }
+
+        if (parent != null && parent.getType() == Token.ASSIGN) {
+          Node lhs = parent.getFirstChild();
+          Node rhs = lhs.getNext();
+
+          if (n == lhs) {
+            // Always traverse the left side of the assignment. To handle
+            // nested assignments properly (e.g., (a = this).property = c;),
+            // assignLhsChild should not be overridden.
+            if (assignLhsChild == null) {
+              assignLhsChild = lhs;
+            }
+          } else {
+            // Only traverse the right side if it's not an assignment to a prototype
+            // property or subproperty.
+            Iterator<String> iter = Splitter.on('.').split(lhs.getString()).iterator();
+            while(iter.hasNext()) {
+                String propertyName = iter.next();
+                if(propertyName.equals("prototype") || propertyName.endsWith(".prototype")) {
+                    return false;
+                }
+            }
+            
+            if (lhs.getType() == Token.GETPROP &&
+                lhs.getLastChild().getString().equals("prototype")) {
+              return false;
+            }
+            if (lhs.getQualifiedName() != null && lhs.getQualifiedName().contains(".prototype.")) {
+              return false;
+            }
+          }
+        }
+
+        return true;
+      }
+
+      @Override
+      public void visitAfter(NodeTraversal t, Node n) {
+        switch (n.getToken()) {
+          case CALL:
+            String fname = n.getFirstChild().getString();
+            if (mayBeCallingGlobalNode(t, n, fname)) {
+              return;
+            }
+            break;
+
+          case GETPROP:
+            Node obj = n.getFirstChild();
+            if (obj.getType() == Token.THIS) {
+              String name = obj.getQualifiedName();
+              if ("global".equals(name)) {
+                checkDangerousUseOfGlobalThis(t, n);
+              }
+            }
+            break;
+
+          case NAME:
+            if ("global".equals(n.getString())) {
+              checkDangerousUseOfGlobalThis(t, n);
+            }
+            break;
+        }
+      }
+      
+      @Override
+      public void visit(NodeTraversal t, Node n, Node parent) {}
+    }).traverse(root);
+  }
+
+  protected void checkDangerousUseOfGlobalThis(NodeTraversal t, Node n) {
+    if (!hasSideEffects(n) && !NodeUtil.isGetObjectLiteralExpression(n)) {
+      JSError error = makeError(n, ERROR_DIAGNOSTIC_TYPE,
+          "Dangerous use of the global 'this' object.");
+      reporter.report(error);
+    }
+  }
+}
+```
+
+This fixed version

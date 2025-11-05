@@ -1,0 +1,189 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Serializing and Deserializing Locale.ROOT
+Serializing and Deserializing Locale objects seems to work just fine, until you try on the Root Locale.
+It writes it out as an empty string and when it reads it in, the value is null
+@Test
+    public void testLocaleDeserialization() throws IOException {
+        ObjectMapper objectMapper = new ObjectMapper();
+        Locale root = Locale.ROOT;
+        String json = objectMapper.writeValueAsString(root);
+        System.out.printf("Root Locale: '%s'", json);
+        Locale actual = objectMapper.readValue(json, Locale.class);
+        Assert.assertEquals(root, actual);
+    }
+
+Here is the output:
+Root Locale: '""'
+java.lang.AssertionError:
+Expected :
+Actual   :null
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/deser/std/FromStringDeserializer.java):
+```java
+protected Object _deserializeFromEmptyString() throws IOException {
+    // As per [databind#398], URI requires special handling
+    if (_kind == STD_URI) {
+        return URI.create("");
+    }
+    // As per [databind#1123], Locale too
+    return super._deserializeFromEmptyString();
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import com.fasterxml.jackson.annotation.JsonAutoDetect;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import java.io.IOException;
+import java.util.Locale;
+
+import static com.fasterxml.jackson.annotation.JsonAutoDetect.Visibility.ANY;
+
+public class JacksonTest {
+
+    @JsonAutoDetect(fieldVisibility = ANY)
+    private static class LocaleRange implements Comparable<LocaleRange> {
+        private Locale lowerBound;
+        private Locale upperBound;
+
+        public LocaleRange(Locale l1, Locale l2) {
+            this.lowerBound = l1;
+            this.upperBound = l2;
+        }
+
+        public int compareTo(LocaleRange other) {
+            int result = 0;
+            result = this.lowerBound.toString().compareTo(other.lowerBound.toString());
+            if (result == 0) {
+                result = this.upperBound.toString().compareTo(other.upperBound.toString());
+            }
+            return result;
+        }
+
+        @Override
+        public String toString() {
+            return "lowerBound='" + lowerBound + '\'' +
+                    ", upperBound='" + upperBound + '\'';
+        }
+    }
+
+    @Test
+    public void testLocaleSerialization() throws IOException {
+        ObjectMapper objectMapper = new ObjectMapper();
+
+        LocaleRange localeRange1 = new LocaleRange(new Locale("en", "US"), new Locale("fr"));
+        String localeRange1AsString = objectMapper.writeValueAsString(localeRange1);
+        System.out.println(localeRange1AsString);
+
+        LocaleRange localeRange2 = new LocaleRange(new Locale("en", "GB"), new Locale("de"));
+        String localeRange2AsString = objectMapper.writeValueAsString(localeRange2);
+        System.out.println(localeRange2AsString);
+
+        LocaleRange readLocaleRange1 = objectMapper.readValue(localeRange1AsString, LocaleRange.class);
+        LocaleRange readLocaleRange2 = objectMapper.readValue(localeRange2AsString, LocaleRange.class);
+
+        Assertions.assertNotEquals(readLocaleRange1.compareTo(localeRange2), 0);
+        Assertions.assertEquals(readLocaleRange2.compareTo(localeRange1), 0);
+    }
+}
+```
+
+原审法院assistant
+```java
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.databind.JsonSerializer;
+import com.fasterxml.jackson.databind.SerializerProvider;
+import org.apache.commons.lang3.StringUtils;
+
+import java.io.IOException;
+
+public class LocaleSerializer extends JsonSerializer<Locale> {
+    @Override
+    public void serialize(Locale value, JsonGenerator jgen, SerializerProvider provider) throws IOException {
+        jgen.writeString(value.toString());
+    }
+
+    @Override
+    public Class<Locale> handledType() {
+        return Locale.class;
+    }
+}
+```
+
+Jassistant
+```java
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.databind.DeserializationContext;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.deser.std.StdScalarDeserializer;
+
+import java.io.IOException;
+
+class FromStringDeserializer extends StdScalarDeserializer<Object> {
+    protected FromStringDeserializer(Class<?> vc) {
+        super(vc);
+    }
+
+    @Override
+    public Object deserialize(JsonParser p, DeserializationContext ctxt) throws IOException {
+        JsonNode tree = p.getCodec().readTree(p);
+        String text = tree.asText();
+        if (tree.isContainerNode()) { // need to be differentiable from text 'null' or JSON null token
+            throw ctxt.mappingException(String.format("Unsupported serialization format: %s", text));
+        } else if ("null".equals(text)) { // standard JSON representation of null
+            return null;
+        } else if (StringUtils.isEmpty(text.trim())) {
+            return Locale.ROOT; // special case, for example, `{"locale":" "}`
+        }
+        return super.deserialize(p, ctxt); // default processing
+    }
+}
+```
+
+assistant
+```java
+import com.fasterxml.jackson.databind.module.SimpleModule;
+
+// Create an instance of ObjectMapper
+ObjectMapper mapper = new ObjectMapper();
+
+// Create a SimpleModule
+SimpleModule module = new SimpleModule();
+
+// Register the custom serializer
+module.addSerializer(new LocaleSerializer());
+
+// Add the module to the mapper
+mapper.registerModule(module);
+```
+
+
+出具欠条assistant
+```java
+import com.fasterxml.jackson.databind.exc.InvalidFormatException;
+import com.fasterxml.jackson.databind.node.TextNode;
+import com.fasterxml.jackson.databind.type.TypeFactory;
+import org.junit.Assert;
+import org.junit.Test;
+
+public class TestNullValueInJdk8Optional {
+    private final ObjectMapper MAPPER = new ObjectMapper();
+    
+    @Test(expected=InvalidFormatException.class)
+    public void testDeserialize_null_value() throws Exception {
+        TextNode node = new TextNode("null");
+        TypeFactory typeFactory = TypeFactory.defaultInstance();
+        Assert.assertEquals(
+            MAPPER.getDeserializationConfig()
+                .getDefaultDeserializationConstructors().get(node.getNodeType())
+                .constructFromNonString(typeFactory.constructType(ExampleOptional.class),
+                        null, node, "test"),
+            MAPPER.convertValue(null, ExampleOptional.class));            
+    }
+
+    public static class ExampleOptional

@@ -1,0 +1,173 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# INVALID_CHARACTER_ERR when converting Document to W3C
+A recent ClearQuest version has an HTML generation bug, which is ignored by both Chrome and Internet Explorer. Jsoup.parse is also successful:
+org.jsoup.nodes.Document doc = Jsoup.parse("<html><head></head><body style=\"color: red\" \"></body></html>");
+(Please note the single quotation mark at the end of the body start tag.)
+But trying to convert this to a W3C document fails:
+new W3CDom().fromJsoup(doc);
+Exception in thread "main" org.w3c.dom.DOMException: INVALID_CHARACTER_ERR: An invalid or illegal XML character is specified. 
+    at org.apache.xerces.dom.CoreDocumentImpl.createAttribute(Unknown Source)
+    at org.apache.xerces.dom.ElementImpl.setAttribute(Unknown Source)
+    at org.jsoup.helper.W3CDom$W3CBuilder.copyAttributes(W3CDom.java:124)
+    at org.jsoup.helper.W3CDom$W3CBuilder.head(W3CDom.java:92)
+    at org.jsoup.select.NodeTraversor.traverse(NodeTraversor.java:31)
+    at org.jsoup.helper.W3CDom.convert(W3CDom.java:66)
+    at org.jsoup.helper.W3CDom.fromJsoup(W3CDom.java:46)
+
+Perhaps copyAttributes() should ignore invalid attributes, or catch exactly this error, and ignore it, or W3CDom could have flags to ignore such errors...
+This is an incorrect Java code (src/main/java/org/jsoup/helper/W3CDom.java):
+```java
+private void copyAttributes(org.jsoup.nodes.Node source, Element el) {
+    for (Attribute attribute : source.attributes()) {
+        // valid xml attribute names are: ^[a-zA-Z_:][-a-zA-Z0-9_:.]
+        String key = attribute.getKey().replaceAll("[^-a-zA-Z0-9_:.]", "");
+            el.setAttribute(key, attribute.getValue());
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+private void copyAttributes(org.jsoup.nodes.Node source, Element el) {
+    for (Attribute attribute : source.attributes()) {
+        // valid xml attribute names are: ^[a-zA-Z_:][-a-zA-Z0-9_:.]
+        if (!attribute.getKey().matches("^[a-zA-Z_:][-a-zA-Z0-9_:.]*$")) {
+            continue;
+        }
+        try {
+            el.setAttribute(attribute.getKey(), attribute.getValue());
+        } catch (DOMException e) {
+            // Ignore DOMException with code NODERANGE_ERR
+            if (e.code != DOMException.NODERANGE_ERR) {
+                throw e; // Rethrow other exceptions
+            }
+        }
+    }
+}
+```
+
+assistant
+
+ ```java
+import com.github.jsdom.jsdom.JSDOM;
+import com.github.jsdom.jsdom.impl.Window;
+import org.jsoup.Jsoup;
+import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Element;
+import org.junit.Test;
+import org.w3c.dom.DocumentFragment;
+
+public class TestJsoupW3cDom {
+
+    @Test
+    public void testW3CDom() throws Exception {
+        String html = "<html><head></head><body style=\"color: red\"></body></html>";
+        Document doc = Jsoup.parse(html);
+
+        JSDOM jsdom = new JSDOM("");
+        Window window = jsdom.getWindow();
+        DocumentFragment fragment = window.document.createDocumentFragment();
+
+        org.w3c.dom.Document w3cdoc = new W3CDom().fromJsoup(doc);
+        appendChildNode(w3cdoc, fragment, doc.child(0));
+        appendChildNode(w3cdoc, fragment, doc.body());
+
+        System.out.println(fragment.getChildNodes().getLength());
+    }
+
+    private void appendChildNode(org.w3c.dom.Document w3cdoc, DocumentFragment frag, Element element) {
+        Node node = w3cdoc.importNode(element, true);
+        frag.appendChild(node);
+    }
+}
+
+```
+
+
+减刑建议assistant
+```java
+package com.github.jsdom.jsdom;
+
+import com.github.jsdom.jsdom.impl.Window;
+import org.jsoup.Jsoup;
+import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Element;
+import org.junit.Assert;
+import org.junit.Test;
+import org.w3c.dom.DocumentFragment;
+
+import javax.annotation.Nullable;
+import java.util.regex.Pattern;
+
+/**
+ * Tests the {@link com.github.jsdom.jsdom.JSDOM} class.
+ */
+public class JSDOMTest {
+
+    private static final Pattern VALID_ATTR_NAME =
+            Pattern.compile("^[a-zA-Z_:][-a-zA-Z0-9_:.]*$");
+
+    @Test public void importNode() {
+        String inputHTML = "<html><body>Hello <b>world</b></body></html>";
+        Document doc = Jsoup.parse(inputHTML);
+        JSDOM jsdom = new JSDOM("");
+        Window window = jsdom.getWindow();
+        DocumentFragment fragment = window.document.createDocumentFragment();
+
+        org.w3c.dom.Document w3cDoc = new W3CDom().fromJsoup(doc);
+        Assert.assertEquals(1, w3cDoc.getElementsByTagName("html").getLength());
+        Assert.assertEquals(1, w3cDoc.getElementsByTagName("body").getLength());
+        Element world = doc.body().child(1);
+        appendChildNode(w3cDoc, fragment, world);
+        Assert.assertEquals(1, fragment.getChildNodes().getLength());
+        Assert.assertTrue(fragment.getChildNodes().item(0).hasChildNodes());
+        assertTextNodeEquals("world", fragment.getChildNodes().item(0).getFirstChild());
+    }
+
+    private void appendChildNode(org.w3c.dom.Document w3cDoc, DocumentFragment frag, Element element) {
+        Node node = w3cDoc.importNode(element, true);
+        frag.appendChild(node);
+    }
+
+    private void assertTextNodeEquals(String text, Node node) {
+        if (node.getNodeType() == Node.TEXT_NODE) {
+            Assert.assertEquals(text, node.getTextContent());
+        }
+    }
+
+    @Nullable
+    private String filterValidAttributeName(@Nullable String name) {
+        return VALID_ATTR_NAME.matcher(name).find() ? name : null;
+    }
+}
+```
+
+
+Xassistant
+```java
+import org.jsoup.Jsoup;
+import org.jsoup.nodes.Document;
+import org.jsoup.parser.Parser;
+import org.jsoup.safety.Safelist;
+import org.jsoup.select.Evaluator;
+import org.jsoup.select.NodeFilter;
+import org.jsoup.select.NodeVisitor;
+import org.w3c.dom.*;
+import javax.xml.parsers.*;
+
+public class W3CDom {
+
+    static class SafeAttrFilter extends FilterWrapper {
+        public SafeAttrFilter(DocumentOutputSettings settings) {
+            super(new AttrFilter(settings));
+        }
+
+        private static class AttrFilter implements NodeFilter {
+            protected final DocumentOutputSettings settings;
+            public AttrFilter(DocumentOutputSettings settings) {
+               

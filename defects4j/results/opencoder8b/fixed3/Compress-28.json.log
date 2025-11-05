@@ -1,0 +1,125 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# TarArchiveInputStream silently finished when unexpected EOF occured
+I just found the following test case didn't raise an IOException as it used to be for a tar trimmed on purpose 
+@Test
+  public void testCorruptedBzip2() throws IOException {
+    String archivePath = PathUtil.join(testdataDir, "test.tar.bz2");
+    TarArchiveInputStream input = null;
+    input = new TarArchiveInputStream(new BZip2CompressorInputStream(
+        GoogleFile.SYSTEM.newInputStream(archivePath), true));
+    ArchiveEntry nextMatchedEntry = input.getNextEntry();
+    while (nextMatchedEntry != null) 
+{
+      logger.infofmt("Extracting %s", nextMatchedEntry.getName());
+      String outputPath = PathUtil.join("/tmp/", nextMatchedEntry.getName());
+      OutputStream out = new FileOutputStream(outputPath);
+      ByteStreams.copy(input, out);
+      out.close();
+      nextMatchedEntry = input.getNextEntry();
+    }
+  }
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/tar/TarArchiveInputStream.java):
+```java
+public int read(byte[] buf, int offset, int numToRead) throws IOException {
+	int totalRead = 0;
+
+    if (hasHitEOF || entryOffset >= entrySize) {
+        return -1;
+    }
+
+    if (currEntry == null) {
+        throw new IllegalStateException("No current tar entry");
+    }
+
+    numToRead = Math.min(numToRead, available());
+    
+    totalRead = is.read(buf, offset, numToRead);
+    count(totalRead);
+    
+    if (totalRead == -1) {
+        hasHitEOF = true;
+    } else {
+        entryOffset += totalRead;
+    }
+
+    return totalRead;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public int read(byte[] buf, int offset, int numToRead) throws IOException {
+    int totalRead = 0;
+
+    if (!hasHitEOF && entryOffset < entrySize) {
+        numToRead = Math.min(numToRead, available());
+
+        totalRead = is.read(buf, offset, numToRead);
+
+        if (totalRead > 0) {
+            count(totalRead);
+            entryOffset += totalRead;
+        } else {
+            hasHitEOF = true;
+        }
+    }
+
+    if (hasHitEOF || entryOffset >= entrySize) {
+        currEntry = getNextTarEntry(is);
+        
+        if (currEntry != null) {
+            entrySize = currEntry.getSize();
+            entryOffset = 0;
+        } else {
+            hasHitEOF = true;
+        }
+    }
+
+    return totalRead > 0 ? totalRead : -1;
+}
+
+private ArchiveEntry getNextTarEntry(ZipAwareInputStream is) throws IOException {
+    byte[] blockBuf = new byte[1024];
+    long firstBlockPosition = is.getFilePointer();
+
+    // Read the header data from the stream and fill the fields of entry.
+    byte[] rawHeaderData = new byte[TarFormatConstants.TAR_HEADER_BYTE_COUNT];
+    is.readFully(rawHeaderData);
+    int bytesReadFromRawHeader = 0;
+    
+    do {
+        int numberOfBytesToReadInBlock = TarFormatConstants.BLOCK_SIZE;
+        if ((firstBlockPosition + TarFormatConstants.BLOCK_SIZE * 3L) <= is.length()) {
+            numberOfBytesToReadInBlock -= 512;
+        }
+        int result = is.read(blockBuf, 0, numberOfBytesToReadInBlock);
+        if (result < 0) {
+            break;
+        }
+        if (bytesReadFromRawHeader < TarFormatConstants.TAR_HEADER_BYTE_COUNT) {
+            System.arraycopy(blockBuf, 0, rawHeaderData,
+                    bytesReadFromRawHeader, result);
+            bytesReadFromRawHeader += result;
+        }
+    } while (bytesReadFromRawHeader < TarFormatConstants.TAR_HEADER_BYTE_COUNT);
+   
+    // Parse the header data to create the ArchiveEntry object.
+    try {
+        TarArchiveEntry tarArchiveEntry =
+                TarUtils.parseTarHeader(null, rawHeaderData, 0);
+        if (tarArchiveEntry != null) {
+            tarArchiveEntry.setSize(TarUtils.calculatePAXExtendedValue(tarArchiveEntry));
+        }
+        return tarArchiveEntry;
+    } catch (final IllegalArgumentException iae) {
+        // handle parsing exception or corrupted TAR file here.
+    }
+    return null;
+}
+```
+

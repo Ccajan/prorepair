@@ -1,0 +1,126 @@
+[
+  {
+    "patch_code": "public int writeValue() {\n    // Most likely, object:\n    if (_type == TYPE_OBJECT) {\n        _gotName = false;\n        ++_index;\n        return STATUS_OK_AFTER_COLON;\n    }\n\n    // Ok, array?\n    if (_type == TYPE_ARRAY) {\n        int ix = _index;\n        ++_index;\n        return (ix < 0) ? STATUS_OK_AS_IS : STATUS_OK_AFTER_COMMA;\n    }\n    \n    // Nope, root context\n    // No commas within root context, but need space\n    ++_index;\n    return (_index <= 0) ? STATUS_OK_AS_IS : STATUS_OK_AFTER_SPACE;\n}",
+    "patch_status": "TRIGGER_ERROR",
+    "failing_tests": {
+      "TRIGGER": [
+        "com.fasterxml.jackson.core.json.GeneratorFailTest::testFailOnWritingStringNotFieldNameBytes"
+      ],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "JacksonCore-7",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "package com.fasterxml.jackson.core.json;\n\nimport java.io.IOException;\n\npublic class JsonWriteContext {\n\n    public static final int TYPE_OBJECT = 1;\n    public static final int TYPE_ARRAY = 2;\n\n    private int _type;\n    private boolean _gotName;\n    private int _index;\n\n    public JsonWriteContext(int type) {\n        _type = type;\n        _gotName = false;\n        _index = -1;\n    }\n\n    public int writeValue(String name) throws IOException {\n        if (!_gotName && _type == TYPE_OBJECT) {\n            throw new IllegalStateException(\"writeValue() with field name, when one was expected\");\n        }\n        _gotName = true;\n        return writeValue();\n    }\n\n    public int writeValue() {\n        if (!_gotName && _type == TYPE_OBJECT) {\n            throw new IllegalStateException(\"Attempted call to write value with no field name when one was expected.\");\n        }\n        _gotName = false;\n        switch (_type) {\n            case TYPE_OBJECT: \n                ++_index;\n                return STATUS_OK_AFTER_COLON;\n            case TYPE_ARRAY: \n                int status = (_index >= 0) ? STATUS_OK_AFTER_COMMA : STATUS_OK_AS_IS;\n                ++_index;\n                return status;\n            default: \n                throw new IllegalStateException(\"Internal error: invalid context for writeValue()\");\n        }\n    }\n\n    public void clear() {\n        _gotName = false;\n        _index = -1;\n    }\n\n    public int writeFieldName(String fieldName) throws IOException {\n        _gotName = true;\n        return writeValue();\n    }\n\n    public boolean inObject() {\n        return _type == TYPE_OBJECT;\n    }\n\n    public boolean inArray() {\n        return _type == TYPE_ARRAY;\n    }\n\n    public int writeEndObject() throws IOException {\n        if (!_gotName && _index >= 0) {\n            --_index;\n            return STATUS_OK_CLOSED;\n        }\n        throw new IllegalStateException(\"writeEndObject called without matching startObject\");\n    }\n\n    public int writeEndArray() throws IOException {\n        if (_index >= 0) {\n            --_index;\n            return STATUS_OK_CLOSED;\n        }\n        throw new IllegalStateException(\"writeEndArray called without matching startArray\");\n    }\n\n    public void setParent(final JsonWriteContext parent) {\n        // Implementation omitted for brevity\n    }\n\n    public JsonWriteContext getParent() {\n        // Implementation omitted for brevity\n        return null;\n    }\n\n    public static int STATUS_OK_AFTER_COLON = 1;\n    public static int STATUS_OK_AFTER_COMMA = 2;\n    public static int STATUS_OK_AFTER_SPACE = 3;\n    public static int STATUS_OK_CLOSED = 4;\n}\n\nclass TestJsonGenerator {\n    public static void main(String[] args) {\n        try {\n            JsonWriteContext context = new JsonWriteContext(JsonWriteContext.TYPE_ARRAY);\n            System.out.println(context.writeValue());\n            System.out.println(context.writeString(\"value\")); // This should throw an exception or handle correctly\n            System.out.println(context.writeEndArray());\n        } catch (IOException e) {\n            e.printStackTrace();\n        }\n    }\n}",
+    "patch_status": "UNCOMPILABLE",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "JacksonCore-7",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "package com.fasterxml.jackson.core.json;\n\nimport java.io.IOException;\nimport java.io.Writer;\n\nimport com.fasterxml.jackson.core.JsonGenerationException;\nimport com.fasterxml.jackson.core.JsonGenerator.Feature;\nimport com.fasterxml.jackson.core.StreamReadCapability;\nimport com.fasterxml.jackson.core.util.TextBuffer;\n\n/**\n * Contextual state information for generator that is using JSON\n * format.\n */\nfinal public class JsonWriteContext\n{\n    protected static final int STATUS_OK_AFTER_COLON = -1;\n    protected static final int STATUS_EXPECT_NAME = 2;\n    \n    /*\n    /**********************************************************\n    /* Configuration and state\n    /**********************************************************\n     */\n\n    protected int _type; // one of \"TYPE_*\"\n\n    protected int _index;\n\n    protected boolean _gotName;\n\n    /**\n     * Last token emitted.\n     * Needed because some sequences (like [n]ull) do NOT require comma after value,\n     * but will generate extra comma when one was just written.\n     */\n    protected char _lastCommaToken = ',';\n\n    /**\n     * Method called to handle end-of-array situation: what to do depends on\n     * whether caller is expecting field name or element.\n     */\n    public int writeEndArray(int status) throws IOException\n    {\n        if (!_gotName) { \n            // If no field name was seen, expect field name next time\n            _gotName = true;\n            _lastCommaToken = ',';\n            return STATUS_EXPECT_NAME;\n        }\n        switch (status) {\n        case STATUS_OK_AFTER_COMMA:\n            return STATUS_OK_AFTER_COLON;\n        default:\n            // Other cases can be handled here too...\n            break;\n        }\n        return status;\n    }\n    \n    public void writeString(String text) throws IOException, JsonGenerationException\n    {\n        if (!_gotName) { \n            _gotName = true;\n        } else {\n            if (!this.inArray()) {\n                reportProblem(\"writeString() without startArray()\");\n            }\n        }\n        \n        writer().write('\"');\n        if (text != null) {\n            TextBuffer tb = _outputBuffer;\n            if (tb.hasContent()) {\n                throw new JsonGenerationException(\"Codec.encodeString() not implemented\", getCurrentLocation());\n            }\n            _outputTail.write(text);\n        }\n        writer().write('\"');\n        _lastCommaToken = ',';\n    }\n    \n    \n    protected Writer _writer;\n    protected TextBuffer _outputBuffer;\n    protected TextBuffer _outputTail;\n\n    public Writer writer() {\n        if (_writer == null) {\n            throw new IllegalStateException();\n        }\n        return _writer;\n    }\n}",
+    "patch_status": "UNCOMPILABLE",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "JacksonCore-7",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "public int writeValue() throws IOException {\n    // Most likely, object:\n    if (_type == TYPE_OBJECT) {\n        _gotName = false;\n        ++_index;\n        return STATUS_OK_AFTER_COLON;\n    }\n\n    // Ok, array?\n    if (_type == TYPE_ARRAY) {\n        int ix = _index;\n        ++_index;\n        return (ix >= 0) ? STATUS_OK_AFTER_COMMA : STATUS_EXPECT_NAME;\n    }\n    \n    // Nope, root context\n    // No commas within root context, but need space\n    ++_index;\n    return (_index <= 0) ? STATUS_OK_AS_IS : STATUS_OK_AFTER_SPACE;\n}\n\npublic void writeFieldName(String name) throws IOException {\n    if (!_inArray && !_gotName) { \n        serializeAsField(name); \n        _gotName = true;\n    } else {\n        throw new IllegalStateException(\"writeFieldName() for untyped generator\");\n    }\n}\n\npublic void writeString(String value) throws IOException {\n    if (!_inArray && _gotName) {\n        serializeAsString();\n    } else {\n        throw new IllegalStateException(\"writeString() for untyped generator\");\n    }\n}",
+    "patch_status": "UNCOMPILABLE",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "JacksonCore-7",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "public int writeValue() throws IOException {\n    // Most likely, object:\n    if (_type == TYPE_OBJECT) {\n        _gotName = false;\n        if (_parsingContext.inRoot()) {\n            _writer.write(' ');\n        } else {\n            _writer.append(',');   \n        }\n        ++_index;\n        return STATUS_OK_AFTER_COLON;\n    }\n\n    // Ok, array?\n    if (_type == TYPE_ARRAY) {\n        int ix = _index;\n        ++_index;\n        if (_parsingContext.inRoot()) {\n            _writer.write(' ');\n        } else {\n            _writer.append(',');   \n        }\n        return (ix >= 0) ? STATUS_OK_AFTER_COMMA : STATUS_OK_AFTER_SPACE;\n    }\n    \n    // Nope, root context\n    // No commas within root context, but need space\n    ++_index;\n    return (_index == 0) ? STATUS_OK_AS_IS : STATUS_OK_AFTER_SPACE;\n}",
+    "patch_status": "UNCOMPILABLE",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "JacksonCore-7",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "public int writeValue() throws IOException {\n    // Most likely, object:\n    if (_type == TYPE_OBJECT) {\n        _gotName = false;\n        ++_index;\n        return STATUS_OK_AFTER_COLON;\n    }\n\n    // Ok, array?\n    if (_type == TYPE_ARRAY) {\n        int ix = _index;\n        ++_index;\n        switch (ix) {\n            case -1: // first item in array\n                return STATUS_OK_AS_IS;\n            case 0: // second item in array with one element before\n                return STATUS_OK_AFTER_COMMA;\n            default: // more than two items in array\n                return STATUS_OK_AFTER_COMMA;\n        }\n    }\n    \n    // Nope, root context\n    // No commas within root context, but need space\n    ++_index;\n    return (_index == 0) ? STATUS_OK_AS_IS : STATUS_OK_AFTER_SPACE;\n}\n\npublic void writeFieldName(String name) throws IOException {\n    if (!_gotName) {\n        // ok, let's get started!\n        _currentName = name;\n        _gotName = true;\n        return;\n    } else {\n        // what's wrong here? shouldn't be able to write field name twice!\n        // Let's throw an Exception instead to signal invalid usage.\n        throw new IllegalStateException(\"Can't write field name, expecting value\");\n    }\n}\n\npublic void writeString(String text) throws IOException {\n    if (!_gotName) {\n        // what's wrong here? Shouldn't be able to write string without a name\n        // Let's throw an Exception instead to signal invalid usage.\n        throw new IllegalStateException(\"Can't write string, expecting field name\");\n    } else {\n        super.writeFieldNames(_generator, _quoteChar);\n        _generator.writeString(text);\n        super._writeContextUpdateStatus(this);\n        _currentName = null;\n        _gotName = false;\n    }\n}",
+    "patch_status": "UNCOMPILABLE",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "JacksonCore-7",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "public void writeString(String value) throws IOException {\n    if (!_gotName) {\n      _reportError(\"Can not use JSON String without name\");\n    }\n    super.writeString(value);\n}\n\npublic int writeValue() {\n    // Most likely, object:\n    if (_type == TYPE_OBJECT) {\n        _gotName = false;\n        ++_index;\n        return STATUS_OK_AFTER_COLON;\n    }\n\n    // Ok, array?\n    if (_type == TYPE_ARRAY) {\n        int ix = _index;\n        ++_index;\n        return (ix < 0) ? STATUS_OK_AS_IS : STATUS_OK_AFTER_COMMA;\n    }\n    \n    // Nope, root context\n    // No commas within root context, but need space\n    ++_index;\n    return (_index == 0) ? STATUS_OK_AS_IS : STATUS_OK_AFTER_SPACE;\n}",
+    "patch_status": "UNCOMPILABLE",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "JacksonCore-7",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "import com.fasterxml.jackson.core.JsonGenerator;\n\npublic class JsonWriteContext {\n    private static final int STATUS_OK_AFTER_COLON = 1;\n    private static final int STATUS_OK_AFTER_COMMA = 2;\n    private static final int STATUS_OK_AS_IS = 3;\n    private static final int STATUS_OK_AFTER_SPACE = 4;\n    \n    protected int _type;\n    protected boolean _gotName;\n    protected int _index;\n    \n    public JsonWriteContext(int type) {\n        _type = type;\n        _index = -1;\n        _gotName = true;\n    }\n    \n    public void clear() {\n        _index = -1;\n        _gotName = true;\n    }\n    \n    public int writeFieldName(String name) throws JsonGenerationException {\n        if (!_gotName) {\n            throw new JsonGenerationException(\"writeFieldName() called before name\");\n        }\n        _gotName = false;\n        ++_index;\n        return STATUS_OK_AFTER_COLON;\n    }\n    \n    public int writeValue() throws JsonGenerationException {\n        if (!_gotName && _type != TYPE_ROOT) {\n            throw new JsonGenerationException(\"writeValue() called after name\");\n        }\n        _gotName = false;\n        if (_type == TYPE_ROOT) {\n            return (_index >= 0) ? STATUS_OK_AFTER_COMMA : STATUS_OK_AS_IS;\n        } else if (_index >= 0) {\n            return STATUS_OK_AFTER_COMMA;\n        } else {\n            return STATUS_OK_AFTER_SPACE;\n        }\n    }\n    \n    public int writeString(String value) throws JsonGenerationException {\n        if (!_gotName) {\n            throw new JsonGenerationException(\"writeString() called before name\");\n        }\n        _gotName = false;\n        ++_index;\n        return STATUS_OK_AFTER_COMMA;\n    }\n    \n    // Other write methods...\n}\n\n// Test cases to verify the solution correctness\nclass TestJsonWriteContext {\n    public static void main(String[] args) {\n        JsonWriteContext rootCtx = new JsonWriteContext(JsonWriteContext.TYPE_ROOT);\n        assert(rootCtx.writeValue() == JsonWriteContext.STATUS_OK_AS_IS);\n\n        try {\n            rootCtx.writeString(\"value\");\n        } catch (Exception e) {\n            System.out.println(e.getMessage());\n        }\n\n        try {\n            rootCtx.writeFieldName(\"key\");\n            rootCtx.writeString(\"value\");\n        } catch (Exception e) {\n            System.out.println(e.getMessage());\n        }\n\n        JsonWriteContext objCtx = new JsonWriteContext(JsonWriteContext.TYPE_OBJECT);\n        assert(objCtx.writeValue() == JsonWriteContext.STATUS_OK_AFTER_COLON);\n        assert(objCtx.writeFieldName(\"key\") == JsonWriteContext.STATUS_OK_AFTER_COLON);\n        \n        JsonWriteContext arrCtx = new JsonWriteContext(JsonWriteContext.TYPE_ARRAY);\n        assert(arrCtx.writeValue() == JsonWriteContext.STATUS_OK_AFTER_COMMA);\n        assert(arrCtx.writeString(\"value\") == JsonWriteContext.STATUS_OK_AFTER_COMMA);\n    }\n}",
+    "patch_status": "UNCOMPILABLE",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "JacksonCore-7",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "public int writeValue(String valueToWrite) {\n    // Most likely, object:\n    if (_type == TYPE_OBJECT) {\n        _gotName = false;\n        ++_index;\n        return STATUS_OK_AFTER_COLON;\n    }\n\n    // Ok, array?\n    if (_type == TYPE_ARRAY) {\n        int ix = _index;\n        ++_index;\n        return (ix < 0) ? STATUS_OK_AS_IS : STATUS_OK_AFTER_COMMA;\n    }\n    \n    // Nope, root context\n    // No commas within root context, but need space\n    ++_index;\n    return (_index == 0) ? STATUS_OK_AS_IS : STATUS_OK_AFTER_SPACE;\n}",
+    "patch_status": "TRIGGER_ERROR",
+    "failing_tests": {
+      "TRIGGER": [
+        "com.fasterxml.jackson.core.json.GeneratorFailTest::testFailOnWritingStringNotFieldNameBytes"
+      ],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "JacksonCore-7",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "public void writeString(String value) throws JsonGenerationException {\n    if (!_gotName) {\n        reportError(\"Can not write string since no field name was requested\");\n        throw new JsonGenerationException(\"Unexpected call to writeString()\", null);\n    }\n    super.writeString(value);\n}\n\npublic int writeValue() {\n    // Most likely, object:\n    if (_type == TYPE_OBJECT) {\n        if (!_gotName) {\n            reportError(\"Can not write value since no field name was requested\");\n            throw new JsonGenerationException(\"Unexpected call to writeValue()\", null);\n        }\n        _gotName = false;\n        ++_index;\n        return STATUS_OK_AFTER_COLON;\n    }\n\n    // Ok, array?\n    if (_type == TYPE_ARRAY) {\n        int ix = _index;\n        ++_index;\n        if (ix < 0) {\n            reportError(\"Can not write value since no field name was requested\");\n            throw new JsonGenerationException(\"Unexpected call to writeValue()\", null);\n        }\n        return STATUS_OK_AFTER_COMMA;\n    }\n    \n    // Nope, root context\n    // No commas within root context, but need space\n    ++_index;\n    if (_index <= 0) {\n        reportError(\"Can not write value since no field name was requested\");\n        throw new JsonGenerationException(\"Unexpected call to writeValue()\", null);\n    }\n    return STATUS_OK_AS_IS;\n}",
+    "patch_status": "UNCOMPILABLE",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "JacksonCore-7",
+    "diff_stats": null
+  }
+]

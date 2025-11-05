@@ -1,0 +1,216 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Record type invalid property not reported on function with @this annotation
+Code:
+
+var makeClass = function(protoMethods) {
+  var clazz = function() {
+    this.initialize.apply(this, arguments);
+  }
+  for (var i in protoMethods) {
+    clazz.prototype[i] = protoMethods[i];
+  }
+
+  return clazz;
+}
+
+/**
+ * @constructor
+ * @param {{name: string, height: number}} options
+ */
+var Person = function(options){};
+Person = makeClass(/** @lends Person.prototype */ {
+  /**
+   * @this {Person}
+   * @param {{name: string, height: number}} options
+   */
+  initialize: function(options) {
+    /** @type {string} */ this.name_ = options.thisPropDoesNotExist;
+  },
+
+  /**
+   * @param {string} message
+   * @this {Person}
+   */
+  say: function(message) {
+    window.console.log(this.name_ + ' says: ' + message);
+  }
+});
+
+var joe = new Person({name: 'joe', height: 300});
+joe.say('hi');
+
+compiled with:
+java -jar build/compiler.jar --formatting=PRETTY_PRINT --jscomp_error=checkTypes --jscomp_error=externsValidation --compilation_level=SIMPLE_OPTIMIZATIONS repro.js
+
+I would expect an error on this line:
+    /** @type {string} */ this.name_ = options.thisPropDoesNotExist;
+
+which works in other contexts.
+
+Thanks!
+This is an incorrect Java code (src/com/google/javascript/jscomp/TypeCheck.java):
+```java
+private void visitGetProp(NodeTraversal t, Node n, Node parent) {
+  // obj.prop or obj.method()
+  // Lots of types can appear on the left, a call to a void function can
+  // never be on the left. getPropertyType will decide what is acceptable
+  // and what isn't.
+  Node property = n.getLastChild();
+  Node objNode = n.getFirstChild();
+  JSType childType = getJSType(objNode);
+
+  if (childType.isDict()) {
+    report(t, property, TypeValidator.ILLEGAL_PROPERTY_ACCESS, "'.'", "dict");
+  } else if (n.getJSType() != null && parent.isAssign()) {
+    return;
+  } else if (validator.expectNotNullOrUndefined(t, n, childType,
+      "No properties on this expression", getNativeType(OBJECT_TYPE))) {
+    checkPropertyAccess(childType, property.getString(), t, n);
+  }
+  ensureTyped(t, n);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+private void visitGetProp(NodeTraversal t, Node n, Node parent) {
+  // obj.prop or obj.method()
+  // Lots of types can appear on the left, a call to a void function can
+  // never be on the left. getPropertyType will decide what is acceptable
+  // and what isn't.
+  Node property = n.getLastChild();
+  Node objNode = n.getFirstChild();
+  JSType childType = getJSType(objNode);
+
+  if (childType == null || !childType.isArray() || !property.equals(UASTUtil.convertNumberToString(
+        NodeUtil.newNumber(t.getSourceNameForErrorReporting(),
+            PropertyOracle.MEMBER_INDEX)))) {
+    super.visitGetProp(t, n, parent);
+    return;
+  }
+
+  String propName = n.getString();
+  ensureTyped(t, n, getJSType(n));
+
+  if (parent.isBinaryOp(Token.ASSIGN)) {
+    return;
+  }
+
+  Node errorNode = parent.isCall()
+      ? parent.getFirstChild()
+      : n;
+
+  boolean foundProp = false;
+  for (int i = 0; i < childType.getProperties().length; i++) {
+    JSType.Property prop = childType.getProperties()[i];
+    if (!prop.getName().equals(propName)) {
+      continue;
+    }
+
+    foundProp = true;
+    if (parent.isAssign() && validator.expectNotNullOrUndefined(t, errorNode,
+        childType, "", getNativeType(OBJECT_TYPE))) {
+          break;
+        }
+
+    // A valid field was found, don't generate an error for accessing it as a
+    // regular object.
+    return;
+  }
+
+  if (foundProp) {
+    report(t, errorNode, INVALID_REFERENCE, "Cannot access property %s on object of type: %s",
+         property.toString(), childType.toString());
+  } else {
+    String description =
+        childType.isNull() ? "Object is null"
+            : childType.isUndefined() ? "Object is undefined"
+                : "";
+
+    report(t, errorNode, ILLEGAL_PROPERTY_ACCESS, "'.'",
+        description.length() > 0 ? description : "unknown");
+  }
+}
+
+```
+
+可以催告assistant
+ ```java
+private void visitGetProp(NodeTraversal t, Node n, Node parent) {
+  // obj.prop or obj.method()
+  // Lots of types can appear on the left, a call to a void function can
+  // never be on the left. getPropertyType will decide what is acceptable
+  // and what isn't.
+  Node property = n.getLastChild();
+  Node objNode = n.getFirstChild();
+  JSType childType = getJSType(objNode);
+
+  if (childType.isVoid()) {
+    report(t, property, INVALID_EXPRESSION, "Cannot use void value"); 
+    return;
+  }
+
+  if (!childType.isArray() || !property.equals(UASTUtil.convertNumberToString(
+        NodeUtil.newNumber(t.getSourceNameForErrorReporting(),
+            PropertyOracle.MEMBER_INDEX)))) {
+    super.visitGetProp(t, n, parent);
+    return;
+  }
+
+  String propName = n.getString();
+  ensureTyped(t, n, getJSType(n));
+
+  if (parent.isBinaryOp(Token.ASSIGN)) {
+    return;
+  }
+
+  Node errorNode = parent.isCall()
+      ? parent.getFirstChild()
+      : n;
+
+  boolean foundProp = false;
+  for (int i = 0; i < childType.getProperties().length; i++) {
+    JSType.Property prop = childType.getProperties()[i];
+    if (!prop.getName().equals(propName)) {
+      continue;
+    }
+
+    foundProp = true;
+    if (parent.isAssign() && validator.expectNotNullOrUndefined(t, errorNode,
+        childType, "", getNativeType(OBJECT_TYPE))) {
+          break;
+        }
+
+    // A valid field was found, don't generate an error for accessing it as a
+    // regular object.
+    return;
+  }
+
+  if (foundProp) {
+    report(t, errorNode, INVALID_REFERENCE, "Cannot access property %s on object of type: %s",
+         property.toString(), childType.toString());
+  } else {
+    String description =
+        childType.isNull() ? "Object is null"
+            : childType.isUndefined() ? "Object is undefined"
+                : "";
+
+    report(t, errorNode, ILLEGAL_PROPERTY_ACCESS, "'.'",
+        description.length() > 0 ? description : "unknown");
+  }
+}
+```
+
+摇了摇头assistant
+ ```java
+private void visitGetProp(NodeTraversal t, Node n, Node parent) {
+  // obj.prop or obj.method()
+  // Lots of types can appear on the left, a call to a void function can
+  // never be on the left. getPropertyType will decide what is acceptable
+  // and what isn't.
+  Node property

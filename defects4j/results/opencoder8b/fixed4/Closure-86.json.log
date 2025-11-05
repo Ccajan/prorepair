@@ -1,0 +1,172 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# side-effects analysis incorrectly removing function calls with side effects
+Sample Code:
+---
+/** @constructor */
+function Foo() {
+  var self = this;
+  window.setTimeout(function() {
+    window.location = self.location;
+  }, 0);
+}
+
+Foo.prototype.setLocation = function(loc) {
+  this.location = loc;
+};
+
+(new Foo()).setLocation('http://www.google.com/');
+---
+
+The setLocation call will get removed in advanced mode.
+This is an incorrect Java code (src/com/google/javascript/jscomp/NodeUtil.java):
+```java
+static boolean evaluatesToLocalValue(Node value, Predicate<Node> locals) {
+  switch (value.getType()) {
+    case Token.ASSIGN:
+      // A result that is aliased by a non-local name, is the effectively the
+      // same as returning a non-local name, but this doesn't matter if the
+      // value is immutable.
+      return NodeUtil.isImmutableValue(value.getLastChild())
+          || (locals.apply(value)
+              && evaluatesToLocalValue(value.getLastChild(), locals));
+    case Token.COMMA:
+      return evaluatesToLocalValue(value.getLastChild(), locals);
+    case Token.AND:
+    case Token.OR:
+      return evaluatesToLocalValue(value.getFirstChild(), locals)
+         && evaluatesToLocalValue(value.getLastChild(), locals);
+    case Token.HOOK:
+      return evaluatesToLocalValue(value.getFirstChild().getNext(), locals)
+         && evaluatesToLocalValue(value.getLastChild(), locals);
+    case Token.INC:
+    case Token.DEC:
+      if (value.getBooleanProp(Node.INCRDECR_PROP)) {
+        return evaluatesToLocalValue(value.getFirstChild(), locals);
+      } else {
+        return true;
+      }
+    case Token.THIS:
+      return locals.apply(value);
+    case Token.NAME:
+      return isImmutableValue(value) || locals.apply(value);
+    case Token.GETELEM:
+    case Token.GETPROP:
+      // There is no information about the locality of object properties.
+      return locals.apply(value);
+    case Token.CALL:
+      return callHasLocalResult(value)
+          || isToStringMethodCall(value)
+          || locals.apply(value);
+    case Token.NEW:
+      // TODO(nicksantos): This needs to be changed so that it
+      // returns true iff we're sure the value was never aliased from inside
+      // the constructor (similar to callHasLocalResult)
+      return true;
+    case Token.FUNCTION:
+    case Token.REGEXP:
+    case Token.ARRAYLIT:
+    case Token.OBJECTLIT:
+      // Literals objects with non-literal children are allowed.
+      return true;
+    case Token.IN:
+      // TODO(johnlenz): should IN operator be included in #isSimpleOperator?
+      return true;
+    default:
+      // Other op force a local value:
+      //  x = '' + g (x is now an local string)
+      //  x -= g (x is now an local number)
+      if (isAssignmentOp(value)
+          || isSimpleOperator(value)
+          || isImmutableValue(value)) {
+        return true;
+      }
+
+      throw new IllegalStateException(
+          "Unexpected expression node" + value +
+          "\n parent:" + value.getParent());
+  }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import com.google.common.base.Predicate;
+
+/**
+ * Evaluates whether a node can be considered equivalent to a locally-scoped variable.
+ *
+ * <p>This method does not examine the values passed to {@link Function}s or
+ * {@link Object}s, it only considers nodes at the AST level.
+ */
+public class NodeUtil {
+
+  static boolean isAssignableValue(Node n) {
+    Token type = n.getToken();
+    switch (type) {
+      case STRING_KEYWORD:
+      case NUMERIC_KEYWORD:
+      case BOOLEAN_KEYWORD:
+      case NULL_KEYWORD:
+      case ARRAYLIT:
+      case OBJECTLIT:
+        return true;
+      case FUNCTION:
+        // TODO(user): Figure out what we want to do here.
+        return false;
+      case NAME:
+      case GETPROP:
+      case GETELEM:
+        return !hasSideEffects(n);
+      default:
+        return false;
+    }
+  }
+
+  /**
+   * Check whether the specified node has any side effects.
+   *
+   * <p>Currently this includes calls to Functions and Array literals.
+   */
+  static boolean hasSideEffects(Node n) {
+    if (NodeUtil.isArraylitOrObjectlit(n)) {
+      // Arrays or Objects could have assignments within them, for example,
+      //   [a = 1].
+      return true;
+    }
+
+    if (NodeUtil.isFunction(n) && NodeUtil.functionCallsEval(n)) {
+      // The JS code being executed could potentially cause side effects,
+      // such as changing global state.
+      return true;
+    }
+
+    if (NodeUtil.isName(n)
+        && (n.getString().equals("window")
+            || n.getString().equals("document"))) {
+      // Accessing 'window' or 'document' might trigger layout/reflow
+      // operations which are costly in terms of performance.
+      return true;
+    }
+
+    if (NodeUtil.isGetProp(n)
+        && n.getLastChild().getString().equals("location")) {
+      // Accessing location.href property may cause page redirection.
+      return true;
+    }
+
+    // If none of the above conditions are met, there's generally
+    // little to worry about for typical JavaScript constructs.
+    return false;
+  }
+
+  private NodeUtil() {}
+}
+```
+
+Note: The actual implementation of `NodeUtil.isArraylitOrObjectlit`, `NodeUtil.isFunction`, `NodeUtil.functionCallsEval`, `NodeUtil.isName`, `NodeUtil.isGetProp` are left to their respective implementations based on the logic of the original provided code snippet.
+

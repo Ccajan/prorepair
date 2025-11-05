@@ -1,0 +1,183 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Fix for #1154
+Looks pretty good, but would it be possible to have a unit test that would fail before fix, pass after? Would be great to have something to guard against regression.
+I may want to change the logic a little bit, however; if shape is explicitly defined as NUMBER, textual representation should not be enabled even if Locale (etc) happen to be specified: explicit shape value should have precedence. I can make that change, or you can do it, either way is fine.
+I'll also need to merge this again 2.7 branch instead of master, to get in 2.7.3.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/ser/std/DateTimeSerializerBase.java):
+```java
+public JsonSerializer<?> createContextual(SerializerProvider serializers,
+        BeanProperty property) throws JsonMappingException
+{
+    if (property != null) {
+        JsonFormat.Value format = serializers.getAnnotationIntrospector().findFormat((Annotated)property.getMember());
+        if (format != null) {
+
+        	// Simple case first: serialize as numeric timestamp?
+            JsonFormat.Shape shape = format.getShape();
+            if (shape.isNumeric()) {
+                return withFormat(Boolean.TRUE, null);
+            }
+
+            if (format.getShape() == JsonFormat.Shape.STRING) {
+                TimeZone tz = format.getTimeZone();
+                final String pattern = format.hasPattern()
+                                ? format.getPattern()
+                                : StdDateFormat.DATE_FORMAT_STR_ISO8601;
+                final Locale loc = format.hasLocale()
+                                ? format.getLocale()
+                                : serializers.getLocale();
+                SimpleDateFormat df = new SimpleDateFormat(pattern, loc);
+                if (tz == null) {
+                    tz = serializers.getTimeZone();
+                }
+                df.setTimeZone(tz);
+                return withFormat(Boolean.FALSE, df);
+            }
+        }
+    }
+    return this;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public JsonSerializer<?> createContextual(SerializerProvider serializers,
+        BeanProperty property) throws JsonMappingException
+{
+    if (property != null) {
+        JsonFormat.Value format = serializers.getAnnotationIntrospector().findFormat((Annotated)property.getMember());
+        if (format != null && format.getShape() != JsonFormat.Shape.NUMBER) {
+
+            // Simple case first: serialize as numeric timestamp?
+            JsonFormat.Shape shape = format.getShape();
+            if (shape.isNumeric()) {
+                return withFormat(Boolean.TRUE, null);
+            }
+
+            if (format.getShape() == JsonFormat.Shape.STRING) {
+                TimeZone tz = format.getTimeZone();
+                final String pattern = format.hasPattern()
+                                ? format.getPattern()
+                                : StdDateFormat.DATE_FORMAT_STR_ISO8601;
+                final Locale loc = format.hasLocale()
+                                ? format.getLocale()
+                                : serializers.getLocale();
+                SimpleDateFormat df = new SimpleDateFormat(pattern, loc);
+                if (tz == null) {
+                    tz = serializers.getTimeZone();
+                }
+                df.setTimeZone(tz);
+                return withFormat(Boolean.FALSE, df);
+            }
+        }
+    }
+    return this;
+}
+```
+
+assistant
+
+ ```java
+public class DateTimeSerializerTest extends BaseMapTest {
+    private static final StdDateFormat DATE_FORMAT = new StdDateFormat();
+
+    @Test
+    public void testNullWithCustomTimestampFormat() throws Exception {
+        ObjectMapper mapper = newJsonMapperBuilder()
+                .serializerByType(DateTime.class,
+                        new DateTimeSerializer(BaseDateTimeSerializer.StdDate.LOCAL_DATE_TIME)
+                            .withFormat(Boolean.FALSE, DATE_FORMAT))
+                .build();
+        
+        XContentParser parser = jsonParser("{\"field\":\"2015-01-02T12:31:22Z\"}");
+        Map<String,Object> map = parser.map();
+        assertEquals("2015-01-02T12:31:22Z", map.get("field"));
+    }
+
+    @Test
+    public void testNullWithExplicitTextualFormat() throws Exception {
+        ObjectMapper mapper = newJsonMapperBuilder()
+                .serializerByType(DateTime.class,
+                        new DateTimeSerializer(BaseDateTimeSerializer.StdDate.LOCAL_DATE_TIME)
+                            .withFormat(Boolean.TRUE, null))
+                .build();
+        
+        XContentParser parser = jsonParser("{\"field\":\"2015-01-02T12:31:22Z\"}");
+        Map<String,Object> map = parser.map();
+        assertTrue(map.get("field") instanceof Number);
+    }
+    
+    protected XContentParser jsonParser(String json) throws IOException {
+        return XContentFactory.jsonXContent.createParser(json);
+    }
+}
+ ```
+
+
+。②assistant
+```java
+package com.fasterxml.jackson.databind.ser.std;
+
+import java.io.IOException;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.TimeZone;
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.databind.AnnotationIntrospector;
+import com.fasterxml.jackson.databind.BeanProperty;
+import com.fasterxml.jackson.databind.JsonMappingException;
+import com.fasterxml.jackson.databind.SerializationConfig;
+import com.fasterxml.jackson.databind.SerializerProvider;
+import com.fasterxml.jackson.databind.introspect.AnnotatedField;
+import com.fasterxml.jackson.databind.ser.ContextualSerializer;
+import com.fasterxml.jackson.databind.util.Converter;
+import org.joda.time.DateTime;
+
+public abstract class DateTimeSerializerBase<T> 
+    extends DateTimeSerializer<T>
+    implements ContextualSerializer
+{
+
+    protected Converter<Date, T> _dateConverter;
+
+    protected DateTimeSerializerBase(BaseDateTimeSerializer.StdDate base, boolean useTimezone, TimeZone tz, SimpleDateFormat dateFormat)
+    {
+        super(base, useTimezone, tz, dateFormat);
+    }
+
+    protected final DateTimeSerializer<T> withDateFormat(boolean useDateFormat, SimpleDateFormat dateFormat) {
+        return newInstance(useDateFormat, dateFormat, _useTimezone, _timeZone);
+    }
+
+    protected final DateTimeSerializer<T> withUseTimezone(boolean useTimezone, TimeZone timeZone) {
+        return newInstance(_useDateFormat, _simpleDateFormat, useTimezone, timeZone);
+    }
+
+    protected abstract DateTimeSerializer<T> newInstance(boolean useDateFormat, SimpleDateFormat dateFormat, boolean useTimezone, TimeZone timeZone);
+
+    @Override
+    public JsonSerializer<?> createContextual(SerializerProvider serializers,
+            BeanProperty property) throws JsonMappingException
+    {
+        if (property != null) {
+            AnnotationIntrospector intr = serializers.getAnnotationIntrospector();
+            JsonFormat.Value format = intr.findFormat((AnnotatedField)property.getMember());
+
+            if (format != null) {
+            	if(format.getShape() == JsonFormat.Shape.NUMBER){
+            		return this.withUseTimezone(false,null);
+            	}
+                
+            	if (format.getShape() == JsonFormat.Shape.STRING) {
+                    TimeZone tz = format.getTimeZone();
+                    
+                    if (!format.hasPattern()) {
+                        final String pattern = StdDateFormat.DATE_FORMAT_STR_ISO8601;
+                        
+                        final Locale loc = (format.hasLocale())
+                               

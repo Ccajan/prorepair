@@ -1,0 +1,151 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# createArchiveInputStream detects text files less than 100 bytes as tar archives
+The fix for COMPRESS-117 which modified ArchiveStreamFactory().createArchiveInputStream(inputstream) results in short text files (empirically seems to be those <= 100 bytes) being detected as tar archives which obviously is not desirable if one wants to know whether or not the files are archives.
+I'm not an expert on compressed archives but perhaps the heuristic that if a stream is interpretable as a tar file without an exception being thrown should only be applied on archives greater than 100 bytes?
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/ArchiveStreamFactory.java):
+```java
+public ArchiveInputStream createArchiveInputStream(final InputStream in)
+        throws ArchiveException {
+    if (in == null) {
+        throw new IllegalArgumentException("Stream must not be null.");
+    }
+
+    if (!in.markSupported()) {
+        throw new IllegalArgumentException("Mark is not supported.");
+    }
+
+    final byte[] signature = new byte[12];
+    in.mark(signature.length);
+    try {
+        int signatureLength = in.read(signature);
+        in.reset();
+        if (ZipArchiveInputStream.matches(signature, signatureLength)) {
+            return new ZipArchiveInputStream(in);
+        } else if (JarArchiveInputStream.matches(signature, signatureLength)) {
+            return new JarArchiveInputStream(in);
+        } else if (ArArchiveInputStream.matches(signature, signatureLength)) {
+            return new ArArchiveInputStream(in);
+        } else if (CpioArchiveInputStream.matches(signature, signatureLength)) {
+            return new CpioArchiveInputStream(in);
+        }
+
+        // Dump needs a bigger buffer to check the signature;
+        final byte[] dumpsig = new byte[32];
+        in.mark(dumpsig.length);
+        signatureLength = in.read(dumpsig);
+        in.reset();
+        if (DumpArchiveInputStream.matches(dumpsig, signatureLength)) {
+            return new DumpArchiveInputStream(in);
+        }
+
+        // Tar needs an even bigger buffer to check the signature; read the first block
+        final byte[] tarheader = new byte[512];
+        in.mark(tarheader.length);
+        signatureLength = in.read(tarheader);
+        in.reset();
+        if (TarArchiveInputStream.matches(tarheader, signatureLength)) {
+            return new TarArchiveInputStream(in);
+        }
+        // COMPRESS-117 - improve auto-recognition
+        try {
+            TarArchiveInputStream tais = new TarArchiveInputStream(new ByteArrayInputStream(tarheader));
+            tais.getNextEntry();
+            return new TarArchiveInputStream(in);
+        } catch (Exception e) { // NOPMD
+            // can generate IllegalArgumentException as well as IOException
+            // autodetection, simply not a TAR
+            // ignored
+        }
+    } catch (IOException e) {
+        throw new ArchiveException("Could not use reset and mark operations.", e);
+    }
+
+    throw new ArchiveException("No Archiver found for the stream signature");
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public ArchiveInputStream createArchiveInputStream(final InputStream in)
+        throws ArchiveException {
+    if (in == null) {
+        throw new IllegalArgumentException("Stream must not be null.");
+    }
+
+    if (!in.markSupported()) {
+        throw new IllegalArgumentException("Mark is not supported.");
+    }
+
+    final byte[] signature = new byte[12];
+    in.mark(signature.length);
+
+    boolean isTextFileLessThan100Bytes = false;
+
+    try {
+        int signatureLength = in.read(signature);
+        in.reset();
+
+        if (signatureLength <= 0 || signatureLength > signature.length) {
+            throw new IOException("Invalid signature length: " + signatureLength);
+        }
+
+        if (isAllAsciiChars(signature, signatureLength)) {
+            isTextFileLessThan100Bytes = true;
+        }
+
+        if (!isTextFileLessThan100Bytes || signatureLength >= 5 && isAsciiString(signature, 0, "BZh")) {
+            if (ZipArchiveInputStream.matches(signature, signatureLength)) {
+                return new ZipArchiveInputStream(in);
+            } else if (JarArchiveInputStream.matches(signature, signatureLength)) {
+                return new JarArchiveInputStream(in);
+            } else if (ArArchiveInputStream.matches(signature, signatureLength)) {
+                return new ArArchiveInputStream(in);
+            } else if (CpioArchiveInputStream.matches(signature, signatureLength)) {
+                return new CpioArchiveInputStream(in);
+            } else if (TarArchiveInputStream.matches(signature, signatureLength)) {
+                return new TarArchiveInputStream(in);
+            }
+        }
+    } catch (IOException e) {
+        throw new ArchiveException("Could not use reset and mark operations.", e);
+    }
+
+    if (isTextFileLessThan100Bytes) {
+        throw new ArchiveException("No Archiver found for the stream signature");
+    }
+
+    return new TarArchiveInputStream(in); // fallback for text files
+}
+
+private boolean isAllAsciiChars(byte[] bytes, int length) {
+    for (int i = 0; i < length; ++i) {
+        if ((bytes[i] & 0x80) != 0) {
+            return false; // Non-ASCII character found
+        }
+    }
+    return true;
+}
+
+private boolean isAsciiString(byte[] bytes, int offset, String str) {
+    int len = Math.min(str.length(), bytes.length - offset);
+    for (int i = 0; i < len; ++i) {
+        if (str.charAt(i) != bytes[offset + i]) {
+            return false; // Mismatch found
+        }
+    }
+    return true;
+}
+```
+
+In this corrected version of the code:
+1. We added a check to determine if the input is likely a text file based on ASCII characters. 
+2. If it's a text file and it contains ASCII strings such as 'BZh' indicating a bzip2 archive, we allow TarArchiveInputStream to be considered. 
+3. The fallback is to assume it's a text file and proceed with creating a TarArchiveInputStream.
+
+However, please note that while this logic helps in some cases, the determination of whether a file is a text file will always have limitations, especially when dealing with binary files or other non-text content.
+

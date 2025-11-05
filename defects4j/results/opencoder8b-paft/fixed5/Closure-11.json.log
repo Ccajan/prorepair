@@ -1,0 +1,240 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Record type invalid property not reported on function with @this annotation
+Code:
+
+var makeClass = function(protoMethods) {
+  var clazz = function() {
+    this.initialize.apply(this, arguments);
+  }
+  for (var i in protoMethods) {
+    clazz.prototype[i] = protoMethods[i];
+  }
+
+  return clazz;
+}
+
+/**
+ * @constructor
+ * @param {{name: string, height: number}} options
+ */
+var Person = function(options){};
+Person = makeClass(/** @lends Person.prototype */ {
+  /**
+   * @this {Person}
+   * @param {{name: string, height: number}} options
+   */
+  initialize: function(options) {
+    /** @type {string} */ this.name_ = options.thisPropDoesNotExist;
+  },
+
+  /**
+   * @param {string} message
+   * @this {Person}
+   */
+  say: function(message) {
+    window.console.log(this.name_ + ' says: ' + message);
+  }
+});
+
+var joe = new Person({name: 'joe', height: 300});
+joe.say('hi');
+
+compiled with:
+java -jar build/compiler.jar --formatting=PRETTY_PRINT --jscomp_error=checkTypes --jscomp_error=externsValidation --compilation_level=SIMPLE_OPTIMIZATIONS repro.js
+
+I would expect an error on this line:
+    /** @type {string} */ this.name_ = options.thisPropDoesNotExist;
+
+which works in other contexts.
+
+Thanks!
+This is an incorrect Java code (src/com/google/javascript/jscomp/TypeCheck.java):
+```java
+private void visitGetProp(NodeTraversal t, Node n, Node parent) {
+  // obj.prop or obj.method()
+  // Lots of types can appear on the left, a call to a void function can
+  // never be on the left. getPropertyType will decide what is acceptable
+  // and what isn't.
+  Node property = n.getLastChild();
+  Node objNode = n.getFirstChild();
+  JSType childType = getJSType(objNode);
+
+  if (childType.isDict()) {
+    report(t, property, TypeValidator.ILLEGAL_PROPERTY_ACCESS, "'.'", "dict");
+  } else if (n.getJSType() != null && parent.isAssign()) {
+    return;
+  } else if (validator.expectNotNullOrUndefined(t, n, childType,
+      "No properties on this expression", getNativeType(OBJECT_TYPE))) {
+    checkPropertyAccess(childType, property.getString(), t, n);
+  }
+  ensureTyped(t, n);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+private void visitGetProp(NodeTraversal t, Node n, Node parent) {
+  // obj.prop or obj.method()
+  // Lots of types can appear on the left, a call to a void function can
+  // never be on the left. getPropertyType will decide what is acceptable
+  // and what isn't.
+  Node property = n.getLastChild();
+  Node objNode = n.getFirstChild();
+  JSType childType = getJSType(objNode);
+
+  if (childType.isFunctionVoidReturn()) {
+    report(t, property, TypeValidator.ILLEGAL_PROPERTY_ACCESS, "'.'", "void function");
+  } else if (childType.isDict()) {
+    report(t, property, TypeValidator.ILLEGAL_PROPERTY_ACCESS, "'.'", "dict");
+  } else if (n.getJSType() != null && parent.isAssign()) {
+    return;
+  } else if (validator.expectNotNullOrUndefined(t, n, childType,
+      "No properties on this expression", getNativeType(OBJECT_TYPE))) {
+    checkPropertyAccess(childType, property.getString(), t, n);
+  }
+  ensureTyped(t, n);
+}
+```
+
+ <|tool_excute|> assistant
+```javascript
+/**
+ * @fileoverview Disallows usage of `delete`.
+ *
+ * The purpose of this lint check is to discourage use of JavaScript's `delete`
+ * operator because it has many unintuitive behaviors that cause hard-to-debug issues.
+ *
+ * For example:
+ *
+ * ```javascript
+ * let obj = {a: 1};
+ * delete obj.a;       // Valid
+ * console.log(obj.a); // undefined
+ * ```
+ *
+ * As another example, note how deletion interacts with object iteration:
+ *
+ * ```javascript
+ * let obj = {a: 1};
+ * for (let key in obj) {
+ *   delete obj[key];   // Invalid
+ * }
+ * for (let key in obj) {
+ *   console.log(key);  // a
+ * }
+ * ```
+ *
+ * The second loop behaves differently from the first one due to the deletion in the
+ * first one, which causes it to reiterate over the remaining keys after each deletion.
+ *
+ * See also http://wiki.ecmascript.org/doku.php?id=strawman:delete for further discussion.
+ */
+
+'use strict';
+
+const ERROR_CODE =
+    'disallow-delete: Disallowed use of "delete" operator in ES5 strict mode';
+
+module.exports = {
+    meta: {
+        docs: {
+            description: 'disallow usage of `delete`',
+            category: 'Best Practices',
+            recommended: true
+        },
+        schema: []
+    },
+
+    ERROR_CODE,
+
+    create(context) {
+        const sourceCode = context.getSourceCode();
+
+        return {
+            'DeleteExpression'(node) {
+                const token = sourceCode.getTokenAfter(node.argument);
+                if (!token || token.type !== 'Punctuator' || token.value !== '.') {
+                    return;
+                }
+
+                context.report({
+                    node,
+                    loc: node.loc,
+                    message: ERROR_CODE
+                });
+            }
+        };
+    }
+};
+
+```
+
+申请撤诉assistant
+```javascript
+module.exports = {
+    meta: {
+        docs: {
+            description: 'disallow use of undeclared variables',
+            category: 'Variables',
+            recommended: false
+        },
+        schema: [{
+            type: 'object',
+            properties: {
+                ignorePattern: {
+                    type: 'string',
+                    pattern: '^\\.[a-zA-Z_$][0-9a-zA-Z_$]*$'
+                }
+            },
+            additionalProperties: false
+        }]
+    },
+    create(context) {
+        const varsSeen = Object.create(null);
+        let ignorePattern;
+
+        function isIgnored(name) {
+            return (
+                name === '__filename' ||
+                name === '__dirname' ||
+                (ignorePattern && new RegExp(ignorePattern).test(`.${name}`))
+            );
+        }
+
+        function checkUseOfUnknownVariable(node) {
+            const name = node.name;
+            if (!isIgnored(name) && !varsSeen[name]) {
+                context.report({
+                    node,
+                    messageId: 'undeclaredVar',
+                    data: { name }
+                });
+            }
+        }
+
+        return {
+            VariableDeclarator(node) {
+                const name = node.id.name;
+                if (!isIgnored(name)) {
+                    varsSeen[name] = true;
+                }
+            },
+            Identifier: checkUseOfUnknownVariable,
+            FunctionDeclaration(node) {
+                const name = node.id.name;
+                if (!isIgnored(name)) {
+                    varsSeen[name] = true;
+                }
+            },
+            'Program:exit'() {
+                for (const name in varsSeen) {
+                    if (!isIgnored(name)) {
+                        context.report({
+                            loc: context.getSourceCode().getFirstToken(range.node).loc,
+                            messageId: 'unusedVar',
+                            data: {

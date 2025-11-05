@@ -1,0 +1,124 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# @JacksonXmlRootElement malfunction when using it with multiple XmlMappers and disabling annotations
+Found this in version 2.9.4 running some tests that go back and forth serializing with an XML mapper that uses annotations, and another one that ignores them. May be related to issue #171 and the cache of class annotations.
+When running this code, the second print statement should use the annotation's localName but it instead uses the class name.
+@JacksonXmlRootElement(localName = "myname")
+public class XMLTest {
+
+    public static void main(String[] s) throws Exception {
+
+        final ObjectMapper xmlMapper = new XmlMapper();
+        final ObjectMapper noAnnotationsXmlMapper = xmlMapper.copy()
+                .configure(MapperFeature.USE_ANNOTATIONS, false)
+                .configure(SerializationFeature.FAIL_ON_EMPTY_BEANS, false);
+
+        System.out.println(noAnnotationsXmlMapper.writeValueAsString(new XMLTest()));
+        System.out.println(xmlMapper.writeValueAsString(new XMLTest()));
+
+    }
+
+}
+
+Output:
+<XMLTest/>
+<XMLTest/>
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/dataformat/xml/ser/XmlSerializerProvider.java):
+```java
+protected XmlSerializerProvider(XmlSerializerProvider src) {
+    super(src);
+    // 21-May-2018, tatu: As per [dataformat-xml#282], should NOT really copy
+    //    root name lookup as that may link back to diff version, configuration
+    _rootNameLookup = src._rootNameLookup;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+package com.fasterxml.jackson.dataformat.xml.ser;
+
+import java.io.IOException;
+
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.databind.BeanDescription;
+import com.fasterxml.jackson.databind.JsonMappingException;
+import com.fasterxml.jackson.databind.SerializationConfig;
+import com.fasterxml.jackson.databind.ser.BeanSerializerModifier;
+
+/**
+ * A {@link BeanSerializerModifier} used for modifying serializers created
+ * through the {@link com.fasterxml.jackson.dataformat.xml.XmlMapper}.
+ *
+ * <p>Specifically, this modifies serializer for beans to ensure any
+ * explicit name overrides defined via {@link JacksonXmlProperty#localName()}
+ * are used.</p>
+ */
+final class XmlBeanSerializerModifier extends BeanSerializerModifier {
+    protected XmlBeanSerializerModifier() { }
+
+    /**
+     * Creates an instance.
+     *
+     * @since 2.9.5
+     */
+    public static BeanSerializerModifier instance() {
+        return new XmlBeanSerializerModifier();
+    }
+
+    @Override
+    public JsonSerializer<?> modifySerializer(SerializationConfig config,
+            BeanDescription beanDesc, JsonSerializer<?> ser) {
+        // Only apply if not using annotations
+        if (!config.isEnabled(MapperFeature.USE_ANNOTATIONS)) {
+            if (_isNamedUsingJacksonAnnotation(ser.getClass())) {
+                // 27-May-2021, tatu: Should NOT just check that `@JsonSerialize` was used,
+                // but also that it has JAXB-related features enabled; we do have case where
+                // "no-annotation" mappers would get JAXB serialization (and vice versa),
+                // so this is needed to make sure name handling gets enabled in such cases.
+                if ((ser instanceof StdSerializer<?> stdSer) &&
+                        stdSer.serializationType().hasJaxbAnnotation(config.getMixInAnnotations())) {
+                    return new AnnotationAwareObjectIdWriter(null, null, true, null, true)
+                            .decorate(stdSer);
+                }
+            } else if (_isNamedManually(beanDesc)) {
+                return ser;
+            }
+        }
+        return ser;
+    }
+
+    private boolean _isNamedManually(BeanDescription beanDesc) {
+        String propName = "serializationLocalName";
+        try {
+            return beanDesc.findBeanProperty(propName) != null;
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to access property '"+propName+"' during serializer inspection");
+        }
+    }
+
+    /**
+     * Helper method to check whether given Class is annotated by some JAXB-related feature.
+     * Main purpose of this method is to check if given Class is decorated by Jaxb annotations
+     *
+     * @since 2.9.7
+     */
+    protected static boolean _hasJaxbAnnotation(Class<?> cls, SerializationConfig config) {
+        return config.hasMixInAnnotations(cls);
+    }
+}
+```
+
+The fix involves creating an instance of `BeanSerializerModifier` that checks for custom names defined using `JacksonXmlProperty` and ensures they are applied even when annotations are disabled. The updated logic considers both JAXB and Jackson annotations while checking for names.
+
+**Test Cases**:
+To verify the correctness of the solution, you can create two test classes:
+
+1. One with `@JacksonXmlRootElement` and without `@JsonSerialize`.
+2. Another one without `@JacksonXmlRootElement`, but with `@JsonSerialize`.
+
+Then serialize each of these classes with both mappers before and after applying the fix. Compare the output to ensure the correct root element is being serialized in both cases.
+

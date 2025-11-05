@@ -1,0 +1,211 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Bug in Element.insertChildren()
+When using org.jsoup.nodes.Element.insertChildren(int, Collection<? extends Node>) to move (more than one!) child-elements from one parent-element to the same parent, but different index then it produces wrong results.
+The problem is that the first Element's 'move' leaves the siblingIndex unchanged and then the second 'move' removes a wrong element and produces some crap. Maybe calling reindexChildren() inside the loop in addChildren() fixes this.
+Version 1.8.3.
+Workaround: call remove() on the elements before passing them to insertChildren()
+Easy Test Case:
+    @Test
+    public void mustCorrectlyMoveChildrenInsideOneParentElement() {
+
+        Document doc = new Document( "" );
+        Element body = doc.appendElement( "body" );
+        body.appendElement( "div1" );
+        body.appendElement( "div2" );
+        Element div3 = body.appendElement( "div3" );
+        Element div4 = body.appendElement( "div4" );
+
+        ArrayList<Element> toMove = new ArrayList<Element>() {
+            {
+                add( div3 );
+                add( div4 );
+            }
+        };
+
+        body.insertChildren( 0, toMove );
+
+        String result = doc.toString().replaceAll( "\\s+", "" );
+        assertEquals( "<body><div3></div3><div4></div4><div1></div1><div2></div2></body>", result );
+
+    }
+This is an incorrect Java code (src/main/java/org/jsoup/nodes/Node.java):
+```java
+protected void addChildren(int index, Node... children) {
+    Validate.noNullElements(children);
+    ensureChildNodes();
+    for (int i = children.length - 1; i >= 0; i--) {
+        Node in = children[i];
+        reparentChild(in);
+        childNodes.add(index, in);
+    }
+    reindexChildren(index);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+protected void addChildren(int index, Node... children) {
+    Validate.noNullElements(children);
+    ensureChildNodes();
+    for (int i = 0; i < children.length; i++) {
+        Node in = children[i];
+        reparentChild(in);
+        childNodes.add(index + i, in);
+    }
+    reindexChildren(index);
+}
+```
+
+assistant
+ ```java
+import static com.google.common.base.Preconditions.*;
+import static org.jsoup.helper.StringUtil.*;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+
+import org.jsoup.Jsoup;
+import org.jsoup.internal.Validate;
+import org.jsoup.nodes.DocumentFragment;
+import org.jsoup.nodes.Node;
+import org.jsoup.select.NodeFilter;
+
+public class Element extends ParentNode {
+
+    private static final long serialVersionUID = 8502834169864082L;
+    
+    protected List<Node> childNodes = Collections.emptyList();
+
+    public Document appendChild(Node child) {
+        return ((Element) super.appendChild(child)).getOwnerDocument();
+    }
+
+    public boolean hasChildNodes() {
+        return !childNodes.isEmpty();
+    }
+
+    public int getSiblingIndex() {
+        if (!hasParent())
+            return -1;
+        int siblingsBefore = 0;
+        for (Node node = previousSibling(); node != null; node = node.previousSibling()) {
+            siblingsBefore++;
+        }
+        return siblingsBefore;
+    }
+
+    @Override
+    public String toString() {
+        StringBuilder sb = new StringBuilder("<").append(nodeName());
+        if (hasAttributes()) {
+            sb.append(' ');
+            AttributeMap attributes = attrs.copy();
+            while (attributes.hasAttributes()) {
+                String key = attributes.keyIterator().next();
+                sb.append(key).append("=\"").append(attributes.get(key).escapedValue()).append('"');
+                attributes.removeAttribute(key);
+                if (attributes.hasAttributes())
+                    sb.append(" ");
+            }
+        }
+        sb.append('>');
+        if (childNodeSize() > 0) {
+            for (Node c : childNodes) {
+                if (c instanceof DocumentFragment)
+                    continue;
+                sb.append(c.outerHtml());
+            }
+            sb.append("</").append(nodeName()).append('>');
+        } else {
+            sb.append("/>");
+        }
+        return sb.toString();
+    }
+
+    public Element empty() {
+        setOwnText("");
+        return this;
+    }
+
+    public String baseUri() {
+        return ownerDocument().baseUri();
+    }
+
+    public String nodeName() {
+        return tag().normalName();
+    }
+
+    public Document getOwnerDocument() {
+        return (Document) super.ownerDocument();
+    }
+
+    public Element wrap(String html) {
+        DocumentFragment fragment = Jsoup.parseBodyFragment(html);
+        Node lastOriginal = childNodes.get(childNodeSize() - 1);
+        Node firstWrapped = fragment.childNode(0);
+        Node lastWrapped = fragment.childNode(fragment.childNodeSize() - 1);
+        
+        replaceWith(fragment);
+        
+        firstWrapped.setSiblingIndex(lastOriginal.siblingIndex()); // important!
+        lastWrapped.setSiblingIndex(firstWrapped.siblingIndex() + 1); // important!
+
+        return this;
+    }
+
+    public Element prependChild(Node child) {
+        return insertChildren(0, child);
+    }
+
+    public Element after(Node... siblings) {
+        checkNotAddedTo(siblings);
+        Node parent = parent();
+        if (parent != null) {
+            Validate.isTrue(parent.childNodeSize() >= childNodeSize(), "New siblings being added do not match existing size of Element");
+            for (int i = 0; i < childNodeSize(); i++) {
+                parent.insertBefore(this, siblings[i]);
+            }
+            for (Node sibling : siblings) {
+                appendChild(sibling);
+            }
+        } else {
+            throw new IllegalStateException("Cannot insert into nonexistent parent.");
+        }
+        return this;
+    }
+
+    public boolean hasParent() {
+        return parent() != null;
+    }
+
+    public Element before(Node... siblings) {
+        checkNotAddedTo(siblings);
+        Node parent = parent();
+        if (parent != null) {
+            Validate.isTrue(parent.childNodeSize() >= childNodeSize(), "New siblings being added do not match existing size of Element");
+            for (int i = 0; i < childNodeSize(); i++) {
+                parent.insertBefore(siblings[i], this);
+            }
+            for (Node sibling : siblings) {
+                appendChild(sibling);
+            }
+        } else {
+            throw new IllegalStateException("Cannot insert into nonexistent parent.");
+        }
+        return this;
+    }
+
+    public Element wrapInner(String startTag, String endTag) {
+        DocumentFragment fragment = Jsoup.parseBodyFragment(startTag + outerHtml() + endTag);
+        Node first = fragment.childNode(0);
+        if (first == null) {
+            throw new IllegalArgumentException("Unable to parse startTag: " + startTag);
+        }
+       

@@ -1,0 +1,130 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# EnumMap keys not using enum's `@JsonProperty` values unlike Enum values
+Based on these issues:
+https://github.com/FasterXML/jackson-databind/issues/677
+https://github.com/FasterXML/jackson-databind/issues/1148
+https://github.com/FasterXML/jackson-annotations/issues/96
+
+I implemented @JsonProperty for my enum constants and they show up nicely when they are property values. But I also have an EnumMap which uses the enum, and it's generated JSON uses the original enum names for the keys and not the JsonProperty values.
+
+Using 2.8.1 (in spring boot 4.3.2)
+
+Thanks!
+
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/ser/std/StdKeySerializers.java):
+```java
+@SuppressWarnings("unchecked")
+    public static JsonSerializer<Object> getFallbackKeySerializer(SerializationConfig config,
+            Class<?> rawKeyType)
+    {
+        if (rawKeyType != null) {
+            // 29-Sep-2015, tatu: Odd case here, of `Enum`, which we may get for `EnumMap`; not sure
+            //   if that is a bug or feature. Regardless, it seems to require dynamic handling
+            //   (compared to getting actual fully typed Enum).
+            //  Note that this might even work from the earlier point, but let's play it safe for now
+            // 11-Aug-2016, tatu: Turns out we get this if `EnumMap` is the root value because
+            //    then there is no static type
+            if (rawKeyType == Enum.class) {
+                return new Dynamic();
+            }
+            if (rawKeyType.isEnum()) {
+                return new Default(Default.TYPE_ENUM, rawKeyType);
+            }
+        }
+        return DEFAULT_KEY_SERIALIZER;
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+package com.fasterxml.jackson.databind.ser.std;
+
+import java.io.IOException;
+import java.util.EnumMap;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.databind.SerializerProvider;
+
+public class StdKeySerializers {
+
+    private StdKeySerializers() {}
+
+    /**
+     * Get fallback key serializer. This may be used in cases where keys cannot use type information due to various reasons.
+     */
+    @SuppressWarnings("unchecked")
+    public static JsonSerializer<Object> getFallbackKeySerializer(
+            SerializationConfig config, Class<?> rawKeyType) {
+        if (rawKeyType != null) {
+            // Custom handling for Enum and its subtypes
+            if (isEnum(rawKeyType)) {
+                return new EnumSerializer();
+            }
+            // Custom handling for EnumMap since Jackson's default serialization does not take into account @JsonProperty annotations.
+            if (EnumMap.class.isAssignableFrom(rawKeyType)) {
+                return new EnumMapSerializer();
+            }
+        }
+        return DEFAULT_KEY_SERIALIZER;
+    }
+
+    private static boolean isEnum(Class<?> clazz) {
+        return Enum.class.isAssignableFrom(clazz);
+    }
+
+    static class EnumSerializer extends StdSerializer<Enum<?>> {
+        protected EnumSerializer() {
+            super(Enum.class);
+        }
+
+        @Override
+        public void serialize(Enum<?> value, JsonGenerator jgen, SerializerProvider provider)
+                throws IOException {
+            String propertyName = findPropertyName(value);
+            jgen.writeString(propertyName);
+        }
+
+        private String findPropertyName(Enum<?> enumValue) {
+            JsonProperty annotation = enumValue.getDeclaringClass().getAnnotation(JsonProperty.class);
+            if (annotation != null) {
+                String[] propertyNames = annotation.value();
+                if (propertyNames.length > enumValue.ordinal()) {
+                    return propertyNames[enumValue.ordinal()];
+                }
+            }
+            return enumValue.name(); // Fallback to the name of the enum constant
+        }
+    }
+
+    static class EnumMapSerializer extends StdSerializer<EnumMap<?, ?>> {
+        protected EnumMapSerializer() {
+            super(EnumMap.class);
+        }
+
+        @Override
+        public void serialize(EnumMap<?, ?> value, JsonGenerator jgen, SerializerProvider provider)
+                throws IOException {
+            // Instead of using the enum constant name as key, use the @JsonProperty annotated value.
+            jgen.writeStartObject();
+            for (Enum<?> key : value.keySet()) {
+                String keyString = key.toString();
+                JsonProperty jsonProperty = key.getDeclaringClass().getAnnotation(JsonProperty.class);
+                if (jsonProperty != null && jsonProperty.value().length > key.ordinal()) {
+                    keyString = jsonProperty.value()[key.ordinal()];
+                }
+                jgen.writeFieldName(keyString);
+                provider.defaultSerializeFieldContents(value, jgen);
+            }
+            jgen.writeEndObject();
+        }
+    }
+}
+```
+
+The provided code adds custom serializers (`EnumSerializer` and `EnumMapSerializer`) to handle the cases where Enums and EnumMaps need special treatment when generating JSON output. The `EnumSerializer` ensures that the serialized key is determined by looking at any `@JsonProperty` annotations on the enum constant. The `EnumMapSerializer` similarly processes keys within EnumMaps, utilizing the `@JsonProperty` annotations for customization if present.
+

@@ -1,0 +1,149 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# StringCollectionDeserializer fails with custom collection
+Seeing this with Jackson 2.9.8.
+We have a custom collection implementation, which is wired to use its "immutable" version for deserialization. The rationale is that we don't want accidental modifications to the data structures that come from the wire, so they all are forced to be immutable.
+After upgrade from 2.6.3 to 2.9.8, the deserialization started breaking with the message:
+
+Cannot construct instance of XXX (although at least one Creator exists): no default no-arguments constructor found
+
+This happens ONLY when you deserialize a custom collection of strings as a property of the other object. Deserializing the custom collection of strings directly works fine, and so does the deserialization of custom collection of non-strings. I believe either the StringCollectionDeserializer should not be invoked for custom collections, or perhaps it does not handle the delegation as expected.
+Please see comments for repro and workaround.
+Thanks!
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/deser/std/StringCollectionDeserializer.java):
+```java
+public JsonDeserializer<?> createContextual(DeserializationContext ctxt,
+        BeanProperty property) throws JsonMappingException
+{
+    // May need to resolve types for delegate-based creators:
+    JsonDeserializer<Object> delegate = null;
+    if (_valueInstantiator != null) {
+        // [databind#2324]: check both array-delegating and delegating
+        AnnotatedWithParams delegateCreator = _valueInstantiator.getDelegateCreator();
+        if (delegateCreator != null) {
+            JavaType delegateType = _valueInstantiator.getDelegateType(ctxt.getConfig());
+            delegate = findDeserializer(ctxt, delegateType, property);
+        }
+    }
+    JsonDeserializer<?> valueDeser = _valueDeserializer;
+    final JavaType valueType = _containerType.getContentType();
+    if (valueDeser == null) {
+        // [databind#125]: May have a content converter
+        valueDeser = findConvertingContentDeserializer(ctxt, property, valueDeser);
+        if (valueDeser == null) {
+        // And we may also need to get deserializer for String
+            valueDeser = ctxt.findContextualValueDeserializer(valueType, property);
+        }
+    } else { // if directly assigned, probably not yet contextual, so:
+        valueDeser = ctxt.handleSecondaryContextualization(valueDeser, property, valueType);
+    }
+    // 11-Dec-2015, tatu: Should we pass basic `Collection.class`, or more refined? Mostly
+    //   comes down to "List vs Collection" I suppose... for now, pass Collection
+    Boolean unwrapSingle = findFormatFeature(ctxt, property, Collection.class,
+            JsonFormat.Feature.ACCEPT_SINGLE_VALUE_AS_ARRAY);
+    NullValueProvider nuller = findContentNullProvider(ctxt, property, valueDeser);
+    if (isDefaultDeserializer(valueDeser)) {
+        valueDeser = null;
+    }
+    return withResolved(delegate, valueDeser, nuller, unwrapSingle);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+// CustomCollectionDeserializer.java
+package com.fasterxml.jackson.databind.deser.std;
+
+import java.util.Collections;
+import com.fasterxml.jackson.annotation.JsonFormat;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.JsonToken;
+import com.fasterxml.jackson.databind.*;
+import com.fasterxml.jackson.databind.annotation.JacksonStdImpl;
+import com.fasterxml.jackson.databind.deser.Deserializers;
+
+@JacksonStdImpl
+public class CustomCollectionDeserializer<T extends CustomCollection<String>> extends StdDeserializer<T> {
+
+    protected static final ThreadLocal<DeserializationContext> CURRENT_CTX = new ThreadLocal<>();
+
+    public CustomCollectionDeserializer() {
+        super(CustomCollection.class); 
+    }
+
+    @Override
+    public T deserialize(JsonParser p, DeserializationContext ctxt) throws IOException {
+        if (p.hasToken(JsonToken.VALUE_STRING)) {
+            String value = p.getValueAsString();
+            T customCollection = createCustomCollectionInstance(ctxt);
+            customCollection.add(value);
+            return customCollection;
+        }
+        
+        if (p.isExpectedStartArrayToken()) {
+            T customCollection = createCustomCollectionInstance(ctxt);
+            while (!p.nextToken().equals(JsonToken.END_ARRAY)) {
+                customCollection.add(p.getValueAsString());
+            }
+            return customCollection;
+        }
+    
+        throw ctxt.mappingException(getValueTypeDesc());
+    }
+
+    private T createCustomCollectionInstance(DeserializationContext ctxt) {
+        try {
+            BeanDescription beanDesc = ctxt.getBeanDescription(CustomCollection.class);
+            AnnotatedConstructor ctor = beanDesc.findConstructors()[0];
+            InvocationArgs args = InvocationArgs.empty();
+            return (T) beanDesc.instantiateFromObjectUsing(ctxt, ctor, args, null).getValue();
+        } catch (Exception e) {
+            throw new IllegalArgumentException("Failed to create an instance of CustomCollection", e);
+        }
+    }
+}
+
+// CustomCollection.java
+package com.example.collection;
+
+import java.util.Collection;
+import java.util.HashSet;
+
+public interface CustomCollection<E> extends Collection<E> {
+    void add(E element);
+    // Other methods omitted for brevity
+}
+
+// Test case
+package com.example.test;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.example.collection.CustomCollection;
+import com.example.jackson.CustomCollectionDeserializer;
+
+public class DeserializationTest {
+    public static void main(String[] args) throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        mapper.disable(SerializationFeature.FAIL_ON_EMPTY_BEANS);
+
+        // Register our custom deserializer
+        DeserializationConfig config = mapper.getDeserializationConfig();
+        config.registerModule(new SimpleModule().addDeserializer(CustomCollection.class, new CustomCollectionDeserializer()));
+
+        // Example JSON input
+        String jsonInput = "[\"element1\", \"element2\"]";
+        CustomCollection<String> collection = mapper.readValue(jsonInput, CustomCollection.class);
+
+        System.out.println(collection.size()); // Should print out 2
+    }
+}
+```
+
+In the above solution, we've added a `deserialize()` method in the `CustomCollectionDeserializer` class that can parse a string and array representations of the custom collection. We've also created a simple `CustomCollection` interface with a single `add()` method for adding elements. Finally, we've provided a test case that demonstrates how to register the custom deserializer and deserialize JSON into a `CustomCollection`.
+

@@ -1,0 +1,167 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Add support for writing byte[] via JsonGenerator.writeEmbeddedObject()
+(note: should be safe for patch, that is, 2.8.3)
+Default implementation of 2.8-added writeEmbeddedObject() throws exception (unsupported operation) for all values, since JSON does not have any native object types.
+This is different from handling of writeObject(), which tries to either delegate to ObjectCodec (if one registered), or even encode "simple" values.
+However: since support for binary data is already handled in some cases using VALUE_EMBEDDED_OBJECT, it would actually make sense to handle case of byte[] (and, if feasible, perhaps ByteBuffer for extra points), and also ensure null can be written.
+This is likely necessary to support FasterXML/jackson-databind#1361 and should in general make system more robust.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/core/JsonGenerator.java):
+```java
+public void writeEmbeddedObject(Object object) throws IOException {
+    // 01-Sep-2016, tatu: As per [core#318], handle small number of cases
+    throw new JsonGenerationException("No native support for writing embedded objects",
+            this);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import com.fasterxml.jackson.core.JsonEncoding;
+import com.fasterxml.jackson.core.JsonFactory;
+import com.fasterxml.jackson.core.JsonGenerator;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.Base64;
+
+public class Main {
+
+    public static void main(String[] args) throws IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        JsonFactory factory = new JsonFactory();
+        try (JsonGenerator generator = factory.createGenerator(baos)) {
+            writeByte(generator);
+        }
+        String result = Base64.getEncoder().encodeToString(baos.toByteArray());
+        System.out.println(result); // prints encoded string
+    }
+
+    private static void writeByte(JsonGenerator generator) throws IOException {
+        generator.writeStartObject();
+        generator.writeFieldName("bytes");
+        byte[] bytes = {1, 2, 3, 4};
+        generator.writeBinary(bytes, 0, bytes.length);
+        generator.writeEndObject();
+    }
+
+    private static void writeEmbeddedObject(JsonGenerator generator) throws IOException {
+        generator.writeStartObject();
+        generator.writeFieldName("embeddedObject");
+        byte[] bytes = {1, 2, 3, 4};
+        generator.writeEmbeddedObject(bytes, 0, bytes.length);
+        generator.writeEndObject();
+    }
+
+    private static void writeNull(JsonGenerator generator) throws IOException {
+        generator.writeStartObject();
+        generator.writeFieldName("nullField");
+        generator.writeNull();
+        generator.writeEndObject();
+    }
+}
+```
+
+
+assistant
+```java
+package com.fasterxml.jackson.core;
+
+import java.io.OutputStream;
+import java.io.Writer;
+import java.io.IOException;
+import com.fasterxml.jackson.databind.JsonSerializer;
+import com.fasterxml.jackson.databind.SerializerProvider;
+import com.fasterxml.jackson.databind.ser.std.StdSerializer;
+import com.fasterxml.jackson.core.io.NumberOutput;
+import java.lang.reflect.Array;
+import java.util.Collection;
+import java.math.BigDecimal;
+import java.math.BigInteger;
+import org.codehaus.jackson.map.exc.InvalidFormatException;
+
+/**
+ * Helper class used to write textual output as part of generation process.
+ */
+public class JsonWriteable implements Writeable
+{
+    protected final StringBuilder _buffer;
+    
+    public JsonWriteable(int initialSize) {
+        _buffer = new StringBuilder(initialSize);
+    }
+    
+    @Override
+    public void write(Writer w, SerializerProvider provider) throws IOException 
+    {
+        w.write(_buffer.toString());
+    }
+}
+
+// Test cases
+class Test {
+    public static void main(String[] args) throws Exception {
+        JsonGenerator generator = getMockedJsonGenerator();
+        byte[] bytes = {1, 2, 3, 4};
+
+        generator.writeStartObject(); // Start writing an object
+        generator.writeStringField("string", "test"); // Write a field with a string value
+        generator.writeNumberField("number", 123); // Write a field with a numeric value
+        generator.writeBooleanField("boolean", true); // Write a field with a boolean value
+        generator.writeArrayFieldStart("array"); // Start writing an array field
+        generator.writeNumber(1);
+        generator.writeNumber(2);
+        generator.writeNumber(3);
+        generator.writeEndArray(); // End of array field
+        generator.writeRawValue("{\"raw\": \"value\"}"); // Write a raw JSON value
+        generator.writeFieldName("binary"); // Write a field name for a binary value
+        generator.writeBinary(bytes, 0, bytes.length); // Write a binary value
+        generator.writeEndObject(); // End of object
+        
+        String expected = "{\"string\":\"test\",\"number\":123,\"boolean\":true,\"array\":[1,2,3],"
+                + "\"binary\":\"AQID\"}";
+        
+        assertEquals(expected, generator.getJsonWriteable()._buffer.toString());
+    }
+    
+    private static JsonGenerator getMockedJsonGenerator() throws Exception {
+        return new JsonGenerator() {
+            private final JsonWriteable jsonWriteable = new JsonWriteable(256);
+
+            public void close() {}
+
+            public void flush() throws IOException {}
+
+            public void writeBinary(byte[] bytes, int offset, int len) throws IOException {
+                String base64Encoded = new String(Base64.getEncoder().encode(bytes));
+                jsonWriteable._buffer.append("\"").append(base64Encoded).append("\"");
+            }
+
+            public void writeFieldName(String name) throws IOException {
+                jsonWriteable._buffer.append("\"").append(name).append("\":");
+            }
+
+            public void writeString(String text) throws IOException {
+                jsonWriteable._buffer.append("\"").append(text).append("\"");
+            }
+
+            public void writeStartObject() throws IOException {
+                jsonWriteable._buffer.append("{");
+            }
+
+            public void writeEndObject() throws IOException {
+                jsonWriteable._buffer.append("}");
+            }
+
+            public void writeStartArray() throws IOException {
+                jsonWriteable._buffer.append("[");
+            }
+
+            public void writeEndArray() throws IOException {
+                jsonWriteable._buffer.append("]");
+

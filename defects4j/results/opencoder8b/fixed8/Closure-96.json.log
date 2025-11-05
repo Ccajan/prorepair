@@ -1,0 +1,134 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Missing type-checks for var_args notation
+What steps will reproduce the problem?
+1. Compile this:
+//-------------------------------------
+// ==ClosureCompiler==
+// @compilation_level SIMPLE_OPTIMIZATIONS
+// @warning_level VERBOSE
+// @output_file_name default.js
+// @formatting pretty_print
+// ==/ClosureCompiler==
+
+/**
+* @param {...string} var_args
+*/
+function foo(var_args) {
+    return arguments.length;
+}
+
+foo('hello'); // no warning - ok
+foo(123); // warning - ok
+foo('hello', 123); // no warning! error.
+//-------------------------------------
+
+What is the expected output? What do you see instead?
+Should get a type-mismatch warning for the second parameter in the third foo() call.
+
+What version of the product are you using? On what operating system?
+Both online compiler and the 20100616 release.
+
+Please provide any additional information below.
+Seems like the type-checker treats 'var_args' as a single param and thus fails to type check the subsequent parameters.
+
+// Fredrik
+This is an incorrect Java code (src/com/google/javascript/jscomp/TypeCheck.java):
+```java
+private void visitParameterList(NodeTraversal t, Node call,
+    FunctionType functionType) {
+  Iterator<Node> arguments = call.children().iterator();
+  arguments.next(); // skip the function name
+
+  Iterator<Node> parameters = functionType.getParameters().iterator();
+  int ordinal = 0;
+  Node parameter = null;
+  Node argument = null;
+  while (arguments.hasNext() &&
+         parameters.hasNext()) {
+    // If there are no parameters left in the list, then the while loop
+    // above implies that this must be a var_args function.
+      parameter = parameters.next();
+    argument = arguments.next();
+    ordinal++;
+
+    validator.expectArgumentMatchesParameter(t, argument,
+        getJSType(argument), getJSType(parameter), call, ordinal);
+  }
+
+  int numArgs = call.getChildCount() - 1;
+  int minArgs = functionType.getMinArguments();
+  int maxArgs = functionType.getMaxArguments();
+  if (minArgs > numArgs || maxArgs < numArgs) {
+    report(t, call, WRONG_ARGUMENT_COUNT,
+            validator.getReadableJSTypeName(call.getFirstChild(), false),
+            String.valueOf(numArgs), String.valueOf(minArgs),
+            maxArgs != Integer.MAX_VALUE ?
+            " and no more than " + maxArgs + " argument(s)" : "");
+  }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+private void visitParameterList(NodeTraversal t, Node call,
+    FunctionType functionType) {
+  boolean isVarArgs = false;
+
+  Iterator<Node> arguments = call.children().iterator();
+  arguments.next(); // skip the function name
+
+  Iterator<Node> parameters = functionType.getParameters().iterator();
+
+  while (arguments.hasNext() && parameters.hasNext()) {
+    Node parameter = parameters.next();
+    Node argument = arguments.next();
+
+    // If this parameter has spread operator (...), it means function has variable number of arguments.
+    if (parameter.getToken() == Token.ELLIPSIS) {
+      isVarArgs = true;
+      break;
+    }
+
+    JSType argType = getJSType(argument);
+    JSType paramType = getJSType(parameter);
+
+    if (!argType.isSubtype(paramType)) {
+      report(t, argument, TYPE_CHECK,
+          "argument " + argument.getSourceId() + " not assignable to parameter " +
+              parameter.getSourceId());
+    }
+  }
+
+  // Handle spread operator only when all parameters were checked and there was no match with spread operator.
+  if (!isVarArgs && arguments.hasNext()) {
+    Node lastParameter = parameters.previous();
+    if (lastParameter.getToken() != Token.ELLIPSIS) {
+      report(t, arguments.next(),
+          WRONG_ARGUMENT_COUNT,
+          "too many arguments passed into: ",
+          call.getFirstChild().getString());
+    } else {
+      // Continue processing additional arguments after spread operator.
+      for (Node extraArg : arguments) {
+        // If we have any extra non-undefined arguments here, they are type errors.
+        report(t, extraArg, UNDEFINED_VARIABLE,
+            "Unexpected extra argument (" + extraArg.getString() + ") given to function.");
+      }
+    }
+  }
+}
+```
+
+In the modified code:
+1. The `visitParameterList()` method now has an extra flag `isVarArgs`. This flag gets set whenever a spread operator is detected on the last parameter, indicating a variadic function.
+2. We're checking each argument against each parameter until either exhaust the iterators or we detect a spread operator. If there's no spread operator among the checked parameters, but arguments still remain, this indicates too many arguments were passed to the function.
+3. When `isVarArgs` flag is found, we continue processing additional arguments, assuming that these should not lead to warnings because they can be freely ignored or accepted as `undefined`.
+4. Otherwise, if any additional non-undefined arguments are encountered, we report those as type errors.
+
+Note: This solution assumes that `getJSType(node)` already checks whether the node satisfies certain type constraints in a function definition context and reports errors accordingly.
+

@@ -1,0 +1,121 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Record type invalid property not reported on function with @this annotation
+Code:
+
+var makeClass = function(protoMethods) {
+  var clazz = function() {
+    this.initialize.apply(this, arguments);
+  }
+  for (var i in protoMethods) {
+    clazz.prototype[i] = protoMethods[i];
+  }
+
+  return clazz;
+}
+
+/**
+ * @constructor
+ * @param {{name: string, height: number}} options
+ */
+var Person = function(options){};
+Person = makeClass(/** @lends Person.prototype */ {
+  /**
+   * @this {Person}
+   * @param {{name: string, height: number}} options
+   */
+  initialize: function(options) {
+    /** @type {string} */ this.name_ = options.thisPropDoesNotExist;
+  },
+
+  /**
+   * @param {string} message
+   * @this {Person}
+   */
+  say: function(message) {
+    window.console.log(this.name_ + ' says: ' + message);
+  }
+});
+
+var joe = new Person({name: 'joe', height: 300});
+joe.say('hi');
+
+compiled with:
+java -jar build/compiler.jar --formatting=PRETTY_PRINT --jscomp_error=checkTypes --jscomp_error=externsValidation --compilation_level=SIMPLE_OPTIMIZATIONS repro.js
+
+I would expect an error on this line:
+    /** @type {string} */ this.name_ = options.thisPropDoesNotExist;
+
+which works in other contexts.
+
+Thanks!
+This is an incorrect Java code (src/com/google/javascript/jscomp/TypeCheck.java):
+```java
+private void visitGetProp(NodeTraversal t, Node n, Node parent) {
+  // obj.prop or obj.method()
+  // Lots of types can appear on the left, a call to a void function can
+  // never be on the left. getPropertyType will decide what is acceptable
+  // and what isn't.
+  Node property = n.getLastChild();
+  Node objNode = n.getFirstChild();
+  JSType childType = getJSType(objNode);
+
+  if (childType.isDict()) {
+    report(t, property, TypeValidator.ILLEGAL_PROPERTY_ACCESS, "'.'", "dict");
+  } else if (n.getJSType() != null && parent.isAssign()) {
+    return;
+  } else if (validator.expectNotNullOrUndefined(t, n, childType,
+      "No properties on this expression", getNativeType(OBJECT_TYPE))) {
+    checkPropertyAccess(childType, property.getString(), t, n);
+  }
+  ensureTyped(t, n);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+private void visitGetProp(NodeTraversal t, Node n, Node parent) {
+  // obj.prop or obj.method()
+  // Lots of types can appear on the left, a call to a void function can
+  // never be on the left. getPropertyType will decide what is acceptable
+  // and what isn't.
+
+  Node property = n.getLastChild();
+  Node objNode = n.getFirstChild();
+  
+  if (n.getParent().isFunctionCall()) {
+    return;
+  }
+
+  JSType childType = getJSType(objNode);
+
+  if (childType.isUnknownType()) {
+    report(t, property, TypeValidator.ILLEGAL_PROPERTY_ACCESS, "'.'", "unknown type");
+  } else if (parent.isAssign()) {
+    return;
+  } else if (!canBeNull(childType)) {
+    report(t, property, TypeValidator.NULL_DOT, "Null object used ('.' operator)");
+  } 
+
+  if (n.getJSType() != null && !childType.hasProperty(property.getString())) {
+    validator.report(t, n, Property.Undefined, property.getString());
+  } else if (childType != null) {
+    checkPropertyAccess(childType, property.getString(), t, n);
+  }
+}
+
+// ... rest of the method ...
+```
+
+The changes I made include adding a check when the parent node is a function call. This checks to see if there's a call to any void functions as those cannot be on the left hand side of a '.' operation. 
+
+For nodes that aren't assigned, we simply ignore them as they're either on the right-hand-side or used somewhere else. 
+
+Additionally, the `childType.hasProperty(property.getString())` function now ensures that the property exists before reporting an undefined property. We also check if it's a valid property name before checking its accessability which was missing previously. Finally, it adds a warning for assigning values to null objects, something that JavaScript doesn't normally allow but could happen due to type inference errors or coercion rules. 
+
+Remember, this is just one potential solution. Depending upon your requirement, other conditions may need to be handled too.
+

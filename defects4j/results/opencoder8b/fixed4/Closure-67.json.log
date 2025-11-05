@@ -1,0 +1,134 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Advanced compilations renames a function and then deletes it, leaving a reference to a renamed but non-existent function
+If we provide the below code to advanced:
+
+function A() {
+this._x = 1;
+}
+
+A.prototype['func1'] = // done to save public reference to func1
+A.prototype.func1 = function() {
+  this._x = 2;
+  this.func2();
+}
+
+A.prototype.func2 = function() {
+  this._x = 3;
+  this.func3();
+}
+
+window['A'] = A;
+
+We get the output:
+
+function a() {
+  this.a = 1
+}
+a.prototype.func1 = a.prototype.b = function() {
+  this.a = 2;
+  this.c() // Problem!
+};
+window.A = a;
+
+So the compiler emits no errors, and renames 'func2' to 'c' but ends up throwing away the definition of that function!
+
+The problem arises when I use:
+
+A.prototype['func1'] = // done to save public reference to func1
+A.prototype.func1 = function() {
+...
+}
+
+The ['func1'] line is apparently enough to save the reference correctly, but also has the side effect of causing the function innards to do the wrong thing.
+
+I can of course instead write it as:
+
+A.prototype['func1'] = A.prototype.func1;
+A.prototype.func1 = function() {
+  this._x = 2;
+  this.func2();
+}
+
+In which case Advanced will compile correctly and the results will also be valid.
+
+function a() {
+  this.a = 1
+}
+a.prototype.func1 = a.prototype.b;
+a.prototype.b = function() {
+  this.a = 2;
+  this.a = 3 // func2, correctly minified
+};
+window.A = a;
+
+For now I can just use the expected way of declaring that func1 export, but since the compiler returns with no errors or warnings and creates a function with no definition, it seems worth reporting.
+This is an incorrect Java code (src/com/google/javascript/jscomp/AnalyzePrototypeProperties.java):
+```java
+private boolean isPrototypePropertyAssign(Node assign) {
+  Node n = assign.getFirstChild();
+  if (n != null && NodeUtil.isVarOrSimpleAssignLhs(n, assign)
+      && n.getType() == Token.GETPROP
+      ) {
+    // We want to exclude the assignment itself from the usage list
+    boolean isChainedProperty =
+        n.getFirstChild().getType() == Token.GETPROP;
+
+    if (isChainedProperty) {
+      Node child = n.getFirstChild().getFirstChild().getNext();
+
+      if (child.getType() == Token.STRING &&
+          child.getString().equals("prototype")) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+private boolean isPrototypePropertyAssign(Node assign) {
+  Node n = assign.getFirstChild();
+  if (n != null && NodeUtil.isVarOrSimpleAssignLhs(n, assign)
+      && n.getType() == Token.GETPROP
+      ) {
+    // We want to exclude the assignment itself from the usage list
+    boolean isChainedProperty =
+        n.getFirstChild().getType() == Token.GETPROP;
+
+    if (isChainedProperty) {
+      Node grandChild = n.getFirstChild().getFirstChild().getNext();
+      
+      if (grandChild.getType() == Token.STRING &&
+          "prototype".equals(grandChild.getString())) {
+        
+        // Check if there is an actual property name defined after 'prototype'
+        Node nextSibling = grandChild.getNext();
+        while (nextSibling != null && nextSibling.getType() == Token.STRING) {
+          if (!NodeUtil.isValidIdentifier(nextSibling.getString()) ||
+              CompilerPass.getExportedNameForScopeMember(nextSibling.getString()).isEmpty()) {
+            // If we find any invalid identifier or exported name, don't treat it as prototype property assign
+            return false;
+          }
+          
+          nextSibling = nextSibling.getNext();
+        }
+        
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+```
+
+The fix checks for additional string nodes after "prototype" node in the chained GETPROP nodes. This would ensure that the code considers properties only named 'prototype'. The fix will ensure that if someone does not use valid JS identifiers after 'prototype', the compiler throws an error, preventing the loss of reference and functionality.
+

@@ -1,0 +1,109 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# EnumMap keys not using enum's `@JsonProperty` values unlike Enum values
+Based on these issues:
+https://github.com/FasterXML/jackson-databind/issues/677
+https://github.com/FasterXML/jackson-databind/issues/1148
+https://github.com/FasterXML/jackson-annotations/issues/96
+
+I implemented @JsonProperty for my enum constants and they show up nicely when they are property values. But I also have an EnumMap which uses the enum, and it's generated JSON uses the original enum names for the keys and not the JsonProperty values.
+
+Using 2.8.1 (in spring boot 4.3.2)
+
+Thanks!
+
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/ser/std/StdKeySerializers.java):
+```java
+@SuppressWarnings("unchecked")
+    public static JsonSerializer<Object> getFallbackKeySerializer(SerializationConfig config,
+            Class<?> rawKeyType)
+    {
+        if (rawKeyType != null) {
+            // 29-Sep-2015, tatu: Odd case here, of `Enum`, which we may get for `EnumMap`; not sure
+            //   if that is a bug or feature. Regardless, it seems to require dynamic handling
+            //   (compared to getting actual fully typed Enum).
+            //  Note that this might even work from the earlier point, but let's play it safe for now
+            // 11-Aug-2016, tatu: Turns out we get this if `EnumMap` is the root value because
+            //    then there is no static type
+            if (rawKeyType == Enum.class) {
+                return new Dynamic();
+            }
+            if (rawKeyType.isEnum()) {
+                return new Default(Default.TYPE_ENUM, rawKeyType);
+            }
+        }
+        return DEFAULT_KEY_SERIALIZER;
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+@SuppressWarnings("unchecked")
+public static JsonSerializer<Object> getFallbackKeySerializer(SerializationConfig config,
+        Class<?> rawKeyType)
+{
+    if (rawKeyType != null) {
+        // 29-Sep-2015, tatu: Odd case here, of `Enum`, which we may get for `EnumMap`; not sure
+        //   if that is a bug or feature. Regardless, it seems to require dynamic handling
+        //   (compared to getting actual fully typed Enum).
+        //  Note that this might even work from the earlier point, but let's play it safe for now
+        // 11-Aug-2016, tatu: Turns out we get this if `EnumMap` is the root value because
+        //    then there is no static type
+        if (rawKeyType == Enum.class) {
+            return new Dynamic();
+        }
+        if (rawKeyType.isEnum()) {
+            // Check if the enum has @JsonProperty annotation
+            for (Field field : rawKeyType.getFields()) {
+                if (field.isAnnotationPresent(JsonProperty.class)) {
+                    return new DefaultForEnum(rawKeyType); 
+                }
+            }
+            // If no @JsonProperty is found, fall back to default behavior
+            return new Default(Default.TYPE_ENUM, rawKeyType);
+        }
+    }
+    return DEFAULT_KEY_SERIALIZER;
+}
+
+private static class DefaultForEnum extends Default {
+    protected final Map<String, Enum<?>> _enumLookup = new HashMap<>();
+
+    public DefaultForEnum(Class<?> keyClass) {
+        super(Default.TYPE_ENUM, keyClass);
+
+        // Populate the lookup map with enum constant name as key
+        for (Field field : keyClass.getDeclaredFields()) {
+            JsonProperty jsonProp = field.getAnnotation(JsonProperty.class);
+            String propertyName = (jsonProp != null) ? jsonProp.value() : field.getName();
+            try {
+                Enum<?> constant = (Enum<?>) keyClass.getField(field.getName()).get(null);
+                _enumLookup.put(propertyName, constant);
+            } catch (Exception e) {
+                throw new IllegalArgumentException("Unable to initialize serialization for " + keyClass.getName(), e);
+            }
+        }
+    }
+
+    @Override
+    public void serialize(Object key, JsonGenerator jgen, SerializerProvider provider) throws IOException {
+        Enum<?> enumKey = (Enum<?>) key;
+        String enumName = enumKey.name();
+        
+        // Replace enum name with corresponding JsonProperty value if available
+        JsonProperty jsonProp = enumKey.getClass().getDeclaredField(enumName).getAnnotation(JsonProperty.class);
+        if (jsonProp != null && !_enumLookup.isEmpty()) {
+            enumName = _enumLookup.get(jsonProp.value()) == null ? enumName : jsonProp.value();
+        }
+        
+        jgen.writeFieldName(enumName);
+    }
+}
+```
+
+In the above fix, we have added a check in the `DefaultForEnum` serializer class that looks for a `@JsonProperty` annotation on the enum constants. If found, it serializes the enum key as the annotated value instead of its name.
+

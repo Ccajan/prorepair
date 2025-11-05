@@ -1,0 +1,128 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# CPIO reports unexpected EOF
+When unpacking an CPIO archive (made with the compress classes or even made with OSX cpio comandline tool) an EOF exception is thrown.
+Here is the testcode:
+        final File input = getFile("cmdcreated.cpio");
+        final InputStream in = new FileInputStream(input);
+        CpioArchiveInputStream cin = new CpioArchiveInputStream(in);
+        CpioArchiveEntry entry = null;
+        while ((entry = (CpioArchiveEntry) cin.getNextCPIOEntry()) != null) 
+{
+            File target = new File(dir, entry.getName());
+            final OutputStream out = new FileOutputStream(target);
+            IOUtils.copy(in, out);
+            out.close();
+        }
+
+        cin.close();
+Stacktrace is here:
+java.io.EOFException
+	at org.apache.commons.compress.archivers.cpio.CpioArchiveInputStream.readFully(CpioArchiveInputStream.java:293)
+	at org.apache.commons.compress.archivers.cpio.CpioArchiveInputStream.getNextCPIOEntry(CpioArchiveInputStream.java:168)
+	at org.apache.commons.compress.archivers.cpio.CpioArchiveInputStreamTest.testCpioUnpack(CpioArchiveInputStreamTest.java:26)
+	...
+This happens with the first read access to the archive. It occured while my try to improve the testcases.
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/cpio/CpioArchiveOutputStream.java):
+```java
+public void close() throws IOException {
+    if (!this.closed) {
+        super.close();
+        this.closed = true;
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import org.apache.commons.compress.utils.IOUtils;
+
+/**
+ * Patches for Commons Compress library that fix bugs and improve functionality.
+ */
+public class PatchedCpioArchiveOutputStream extends CpioArchiveOutputStream {
+
+    /**
+     * Constructs a new CpioArchiveOutputStream using the specified OutputStream.
+     *
+     * @param os The underlying OutputStream to write the CPIO archive to.
+     */
+    public PatchedCpioArchiveOutputStream(OutputStream os) {
+        super(os);
+    }
+
+    /**
+     * Overrides the close method to ensure resources are properly released.
+     *
+     * @throws IOException If an I/O error occurs.
+     */
+    @Override
+    public void close() throws IOException {
+        try {
+            // Ensure all entries are written before closing.
+            finalizeEntry();
+        } finally {
+            super.close();
+        }
+        this.closed = true;
+    }
+    
+    /**
+     * Finalizes the current CPIO entry before writing new ones.
+     */
+    private void finalizeEntry() {
+        if (currentHeader != null && !finished) {
+            finished = true;
+            int bytesLeftInBlock = BLOCK_SIZE - checksumOffset % BLOCK_SIZE;
+            if (bytesLeftInBlock == 1) {
+                final byte[] padding = new byte[BLOCK_SIZE];
+                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                try {
+                    baos.write(padding, 0, bytesLeftInBlock - 1);
+                    currentHeader.setChecksum(IOUtils.checkSum(baos.toByteArray()));
+                    writeChecksum(currentHeader.getChecksum(), false);
+                    // Write remaining block padding.
+                    baos.write(padding[0]);
+                    os.write(baos.toByteArray());
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            } else if (bytesLeftInBlock > 1) {
+                final byte[] padding = new byte[BLOCK_SIZE];
+                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                try {
+                    baos.write(padding, 0, bytesLeftInBlock - 1);
+                    currentHeader.setChecksum(IOUtils.checkSum(baos.toByteArray()));
+                    writeChecksum(currentHeader.getChecksum(), false);
+                    // Write remaining block padding.
+                    baos.write(padding, 0, bytesLeftInBlock);
+                    os.write(baos.toByteArray());
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            }
+        }
+    }
+}
+```
+
+**Test Cases**:
+Since we're modifying the existing class of `CpioArchiveOutputStream`, it's difficult to provide new test cases without mocking or creating a whole new test environment since it involves interactions with disk storage.
+
+However, as a best practice, it would be beneficial to have unit tests for each new patch introduced to ensure their correctness. For instance:
+
+1. Test that `close()` does not throw an `EOFException`.
+2. Test that writing an entry closes the previous one correctly.
+3. Test that closing the stream after writing an entry does not throw an `EOFException`.
+
+These tests would typically involve setting up an archive with multiple files and then verifying that each file can be extracted successfully from the archive after being added. This can be done by comparing the contents of the original files with those extracted during the testing process. 
+
+Alternatively, if there's a specific issue related to parsing a CPIO archive incorrectly, then unit tests might need to be crafted to replicate this scenario and check that the correct exception (`EOFException`) is thrown and handled appropriately.
+
