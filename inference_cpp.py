@@ -238,9 +238,9 @@ def set_file_limits():
 
 
 def extract_cpp_code(text: str) -> str:
-    """从生成的文本中提取第一个代码块"""
-    # 匹配第一个代码块：优先 c++，否则通用代码块
-    match = re.search(r'```(?:c\+\+)?\s*(.*?)(?:```|$)', text, re.DOTALL)
+    """从生成的文本中提取第一个完整的代码块（必须有闭合标记）"""
+    # 只匹配完整的代码块（有闭合标记），没有回退策略
+    match = re.search(r'```(?:c\+\+)?\s*(.*?)```', text, re.DOTALL)
     return match.group(1).strip() if match else ""
 
 # 模型提示格式（必须与训练时格式一致！）
@@ -250,15 +250,6 @@ MODEL_PROMPT_FORMATS = {
     'deepseek': ('###Instruction\n', '###response\n\n'),  # DeepSeek 格式
 }
 
-# 补全模型列表（使用代码补全格式，而非指令格式）
-COMPLETION_MODELS = [
-    'starcoder',
-]
-
-def is_completion_model(model_key: str) -> bool:
-    """判断是否为代码补全模型"""
-    model_key_lower = model_key.lower()
-    return any(comp_model in model_key_lower for comp_model in COMPLETION_MODELS)
 
 # 模型配置
 MODEL_CONFIGS = {
@@ -280,16 +271,19 @@ MODEL_CONFIGS = {
     'llama3.1-8b': {
         'model_path': 'model/Llama-3-8B-Instruct',
     },
+    'llama3.1-8b-nopro': {
+        'model_path': 'merged_models/llama3.1-8b-nopro',
+    },
     'llama3.1-8b-trained-parepair': {
         'model_path': 'merged_models/llama3.1-8b-prarepair',
     },
     'deepseek-6.7b': {
         'model_path': 'model/deepseek-coder-6.7b',
     },
-    'deepseek-6.7b': {
+    'deepseek-6.7b-nopro': {
         'model_path': 'merged_models/deepseek-6,7b-nopro',
     },
-    'deepseek-6.7b-trained-parepair': {
+    'deepseek-6.7b-parepair': {
         'model_path': 'merged_models/deepseek-6.7-prarepair',
     },
     'starcoder-7b': {
@@ -402,34 +396,16 @@ def generate_with_vllm(llm, prompt: str, model_key: str):
         # 组合完整文本
         complete_text = prompt + full_text
         
-        # 根据模型类型提取代码
+        # 从 EOF 标记之后提取代码
         ret = None
-        
-        if is_completion_model(model_key) or BOF is None or EOF is None:
-            # 代码补全模型：从 "output the fixed code" 标记之后提取C++代码块
-            marker = "only output the fixed code."  # 小写，配合 lower() 查找
-            marker_pos = complete_text.lower().find(marker)
-            
-            if marker_pos != -1:
-                # 找到标记，从标记之后提取
-                after_marker = complete_text[marker_pos + len(marker):]
-                ret = extract_cpp_code(after_marker)
-            else:
-                # 没找到标记，返回空，依靠重试机制
+        if EOF and EOF in complete_text:
+            try:
+                after_eof = complete_text.split(EOF)[1]
+                ret = extract_cpp_code(after_eof)
+            except (IndexError, AttributeError):
                 ret = None
-            
-            if not ret:
-                continue
         else:
-            # 指令模型：从 EOF 标记之后提取
-            if EOF in complete_text:
-                try:
-                    after_eof = complete_text.split(EOF)[1]
-                    ret = extract_cpp_code(after_eof)
-                except (IndexError, AttributeError):
-                    ret = None
-            else:
-                ret = None
+            ret = None
         
         if ret:
             print('code:', ret, flush=True)
@@ -450,34 +426,16 @@ def reextract_code_from_log(log_file_path, eof_marker, model_key):
         with open(log_file_path, 'r', encoding='utf-8') as f:
             log_content = f.read()
         
-        # 根据模型类型提取代码
-        if is_completion_model(model_key):
-            # 补全模型：直接查找代码块标记
-            if "Only output the fixed code." in log_content:
-                after_marker = log_content.split("Only output the fixed code.", 1)[1]
-                extracted_code = extract_cpp_code(after_marker)
-            else:
-                extracted_code = extract_cpp_code(log_content)
-            
-            if extracted_code:
-                print(f"成功从 {log_file_path} 提取代码块 (长度: {len(extracted_code)} 字符)")
-                return extracted_code
-        else:
-            # 指令模型：使用 EOF 标记分割
-            if eof_marker and eof_marker in log_content:
-                parts = log_content.split(eof_marker, 1)
-                if len(parts) > 1:
-                    output_part = parts[1]
-                    if output_part:
-                        extracted_code = extract_cpp_code(output_part)
-                        if extracted_code:
-                            print(f"成功从 {log_file_path} 提取代码块 (长度: {len(extracted_code)} 字符)")
-                            return extracted_code
-            else:
-                extracted_code = extract_cpp_code(log_content)
-                if extracted_code:
-                    print(f"成功从 {log_file_path} 提取代码块 (长度: {len(extracted_code)} 字符)")
-                    return extracted_code
+        # 使用 EOF 标记分割
+        if eof_marker and eof_marker in log_content:
+            parts = log_content.split(eof_marker, 1)
+            if len(parts) > 1:
+                output_part = parts[1]
+                if output_part:
+                    extracted_code = extract_cpp_code(output_part)
+                    if extracted_code:
+                        print(f"成功从 {log_file_path} 提取代码块 (长度: {len(extracted_code)} 字符)")
+                        return extracted_code
         
         print(f"警告: {log_file_path} 中找不到有效的C++代码块")
         return None
@@ -510,9 +468,8 @@ if __name__ == '__main__':
         
         # 根据result_tag获取对应的EOF标记
         BOF, EOF = get_prompt_format(result_tag)
-        is_completion = is_completion_model(result_tag)
         
-        print(f"重新提取模式: {result_tag} ({'补全模型' if is_completion else '指令模型'})")
+        print(f"重新提取模式: {result_tag}")
         print(f"目标目录: {result_base_dir}")
         
         # 遍历所有 fixed* 目录
@@ -584,17 +541,8 @@ def generate_fix(code: str, filename: str, prompt_dir: str, model_key: str):
     """生成代码修复"""
     prompt_suffix = get_prompt_suffix(filename, prompt_dir)
     
-    # 根据模型类型构建不同的 prompt
-    if is_completion_model(model_key):
-        # 代码补全模型：使用代码块标记，便于提取代码
-        prompt = f"// This is an incorrect code ({filename}):\n```c++\n{code}\n```\nYou are a software engineer. Can you repair the incorrect cpp code? Only output the fixed code.\n```c++\n{prompt_suffix}"
-    else:
-        # 指令模型：使用 BOF/EOF 包装
-        if BOF is None or EOF is None:
-            # 如果没有设置 BOF/EOF，回退到代码补全格式
-            prompt = f"// This is an incorrect code ({filename}):\n```c++\n{code}\n```\n\n// Fixed code:\n```c++\n{prompt_suffix}"
-        else:
-            prompt = f"{BOF}This is an incorrect code ({filename}):\n```c++\n{code}\n```\nYou are a software engineer. Can you repair the incorrect cpp code?\n{EOF}\n```c++\n{prompt_suffix}"
+    # 使用指令模型格式构建 prompt
+    prompt = f"{BOF}This is an incorrect code ({filename}):\n```c++\n{code}\n```\nYou are a software engineer. Can you repair the incorrect cpp code?\n{EOF}\n```c++\n{prompt_suffix}"
     
     print(prompt, flush=True)
     

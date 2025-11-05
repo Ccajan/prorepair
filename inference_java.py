@@ -238,16 +238,12 @@ def set_file_limits():
 
 
 def extract_java_code(text: str) -> str:
-    """从生成的文本中提取Java代码（与 d4j1.py 逻辑一致）"""
+    """从生成的文本中提取Java代码（提取最后一个代码块）"""
     # 首先尝试匹配完整的代码块（有闭合标记）
     matches = re.findall(r'```java(.*?)```', text, re.DOTALL)
     if matches:
-        return matches[0].strip()
+        return matches[-1].strip()  # 返回最后一个代码块
     
-    # 如果没有闭合标记，尝试匹配从 ```java 开始到字符串结尾或到下一个 ``` 的内容
-    match = re.search(r'```java\s*(.*?)(?:```|$)', text, re.DOTALL)
-    if match:
-        return match.group(1).strip()
     
     return ""
 
@@ -255,12 +251,9 @@ def extract_java_code(text: str) -> str:
 MODEL_PROMPT_FORMATS = {
     'qwen': ('<|im_start|>user\n', '<|im_end|>\n<|im_start|>assistant\n'),
     'llama3': ('<|start_header_id|>user<|end_header_id|>\n\n', '<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n'),
-    'deepseek': ('<|begin▁of▁sentence|>', '\n\n'),  # DeepSeek 格式（与训练一致）
-    'codellama': ('[INST]', '[/INST]'),
-    'llama': ('[INST]', '[/INST]'),  # Llama 2
-    'mistral': ('[INST]', '[/INST]'),
-    'starchat': ('<|system|>\n<|end|>\n<|user|>', '<|end|>\n<|assistant|>'),
+    'deepseek': ('###Instruction\n', '###response\n\n'),  # DeepSeek 格式
 }
+
 
 # 模型配置
 MODEL_CONFIGS = {
@@ -270,24 +263,28 @@ MODEL_CONFIGS = {
     'qwen3-4b': {
         'model_path': 'model/qwen3-4b',
     },
+    'qwen2.5-7b': {
+        'model_path': 'model/qwen2.5-7b',
+    },
     'qwen3-8b-trained': {
         'model_path': 'merged_models/qwen3-8b_merged_sft',
     },
     'qwen3-4b-trained': {
         'model_path': 'merged_models/qwen3-4b_merged_sft',
     },
-    'codellama-7b': {
-        'model_path': 'codellama/CodeLlama-7b-Instruct-hf',
-    },
-    'codellama-7b-trained': {
-        'model_path': '/data1/czj/model/CodeLlama-7b-Instruct',
-    },
-    'codellama-13b': {
-        'model_path': '/data1/czj/model/codeLlama-13b-instruct',
-    },
     'llama3.1-8b': {
-        'model_path': '/data1/czj/model/Llama-3-8B-Instruct',
+        'model_path': 'model/Llama-3-8B-Instruct',
     },
+    'deepseek-6.7b': {
+        'model_path': 'model/deepseek-coder-6.7b',
+    },
+    'deepseek-6.7b-nopro': {
+        'model_path': 'merged_models/deepseek-6,7b-nopro',
+    },
+    'deepseek-6.7b-parepair': {
+        'model_path': 'merged_models/deepseek-6.7b-prarepair',
+    },
+
 }
 
 def get_prompt_format(model_key: str) -> tuple:
@@ -336,97 +333,186 @@ def load_vllm_model(model_config):
     
     return llm, tokenizer, None
 
-def generate_with_vllm(llm, prompt: str) -> Tuple[str, str]:
+def generate_with_vllm(llm, prompt: str, model_key: str) -> Tuple[str, str]:
     """使用 vLLM 生成代码"""
-    global tokenizer, EOF
+    global tokenizer, EOF, BOF
     
+    # vLLM 采样参数 - 保守配置
     sampling_params = SamplingParams(
         temperature=1.0,
         top_p=0.9,
         top_k=50,
-        max_tokens=1536,  # 确保生成完整代码（max_new_tokens，不包括输入）
+        max_tokens=512,  # 确保生成完整代码（max_new_tokens，不包括输入）
         repetition_penalty=1.1,
         stop=[tokenizer.eos_token] if tokenizer.eos_token else None,
     )
     
-    try:
-        outputs = llm.generate([prompt], sampling_params)
-        output = outputs[0]
-        full_text = output.outputs[0].text
+    # 循环生成，直到获取到合法的 Java 代码
+    max_retries = 5
+    retry_count = 0
+    ret = ""
+    complete_text = None
+    
+    while not ret and retry_count < max_retries:
+        retry_count += 1
+        print(f"尝试生成 Java 代码 (第 {retry_count}/{max_retries} 次)...", flush=True)
         
-        # 完整文本包含prompt
-        complete_text = prompt + full_text
-        print(complete_text)
-        
-        # 根据模型格式提取生成的 Java 代码部分
+        # vLLM 生成 - 添加错误处理
         try:
-            ret = extract_java_code(full_text.split(EOF)[-1])
-        except (IndexError, AttributeError):
-            ret = extract_java_code(full_text)
+            outputs = llm.generate([prompt], sampling_params)
+            output = outputs[0]
+            full_text = output.outputs[0].text
+        except RuntimeError as e:
+            if "CUDA" in str(e) or "unknown error" in str(e):
+                print(f"vLLM CUDA错误，尝试清理缓存后重试: {e}")
+                # 清理CUDA缓存
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                # 重试一次
+                try:
+                    outputs = llm.generate([prompt], sampling_params)
+                    output = outputs[0]
+                    full_text = output.outputs[0].text
+                except Exception as e2:
+                    print(f"vLLM重试失败: {e2}")
+                    continue
+            else:
+                print(f"vLLM生成错误: {e}")
+                continue
+        except Exception as e:
+            print(f"vLLM生成异常: {e}")
+            continue
         
-        print('code:', ret, flush=True)
-        return complete_text, ret
+        # 组合完整文本
+        complete_text = prompt + full_text
         
-    except Exception as e:
-        print(f"生成出错: {e}")
+        # 从 EOF 标记之后提取代码
+        ret = None
+        if EOF and EOF in complete_text:
+            try:
+                after_eof = complete_text.split(EOF)[1]
+                ret = extract_java_code(after_eof)
+            except (IndexError, AttributeError):
+                ret = None
+        else:
+            ret = None
+        
+        if ret:
+            print('code:', ret, flush=True)
+        else:
+            ret = ""  # 重置为空字符串，继续循环
+    
+    # 检查最终结果
+    if not ret or not ret.strip():
+        print(f"❌ 经过 {max_retries} 次尝试仍未获取到有效的 Java 代码", flush=True)
         return "", ""
+    
+    return complete_text, ret
 
 # 添加 reextract 功能
-def reextract_code_from_log(log_file_path):
-    """从log文件中提取第二个Java代码块（第一个是prompt，第二个是模型输出）"""
+def reextract_code_from_log(log_file_path, eof_marker=None, model_key=None):
+    """
+    从log文件中提取Java代码块
+    新逻辑：从EOF之后找到public class，然后往前找最近的```java，从那里提取代码块
+    """
     try:
         with open(log_file_path, 'r', encoding='utf-8') as f:
             log_content = f.read()
         
-        # 查找所有Java代码块
-        java_blocks = re.findall(r'```java(.*?)```', log_content, re.DOTALL)
+        # 步骤1: 找到EOF标记的位置
+        eof_pos = -1
+        if eof_marker:
+            eof_pos = log_content.find(eof_marker)
         
-        if len(java_blocks) >= 2:
-            # 第二个代码块是模型输出的修复代码
-            code = java_blocks[1].strip()
-            if code:
-                print(f"成功从 {log_file_path} 提取第二个代码块 (长度: {len(code)} 字符)")
-                return code
+        # 如果没有找到EOF或者没有提供EOF，从头开始搜索
+        search_start = eof_pos + len(eof_marker) if eof_pos != -1 and eof_marker else 0
+        content_after_eof = log_content[search_start:]
         
-        # 如果没有找到两个```java块，尝试查找通用代码块
-        all_blocks = re.findall(r'```(.*?)```', log_content, re.DOTALL)
-        if len(all_blocks) >= 2:
-            code = all_blocks[1].strip()
-            if code:
-                print(f"成功从 {log_file_path} 提取第二个通用代码块 (长度: {len(code)} 字符)")
-                return code
+        # 步骤2: 在EOF之后找到"public class"的位置
+        public_class_match = re.search(r'public\s+class', content_after_eof)
         
-        print(f"警告: {log_file_path} 中找不到第二个代码块")
-        return None
+        if public_class_match:
+            # 找到了public class，计算在原始内容中的绝对位置
+            public_class_pos = search_start + public_class_match.start()
+            
+            # 步骤3: 从public class的位置往前找最近的```java
+            content_before_public_class = log_content[:public_class_pos]
+            
+            # 找到所有```java的位置
+            java_markers = [m.start() for m in re.finditer(r'```java', content_before_public_class)]
+            
+            if java_markers:
+                # 取最后一个（最接近public class的）```java
+                nearest_java_marker = java_markers[-1]
+                
+                # 步骤4: 从这个```java开始提取代码块
+                # 找到```java之后的内容
+                start_pos = nearest_java_marker + len('```java')
+                remaining_content = log_content[start_pos:]
+                
+                # 查找结束的```
+                end_match = re.search(r'```', remaining_content)
+                if end_match:
+                    extracted_code = remaining_content[:end_match.start()].strip()
+                    print(f"✓ 从 {os.path.basename(log_file_path)} 提取代码块 (从public class往前定位, 长度:{len(extracted_code)}字符)")
+                    return extracted_code
+                else:
+                    # 没有找到结束标记，提取到文件末尾
+                    extracted_code = remaining_content.strip()
+                    print(f"✓ 从 {os.path.basename(log_file_path)} 提取未闭合代码块 (从public class往前定位, 长度:{len(extracted_code)}字符)")
+                    return extracted_code
+            else:
+                print(f"✗ {os.path.basename(log_file_path)} 在public class之前找不到```java标记")
+                return None
+        else:
+            print(f"✗ {os.path.basename(log_file_path)} 在EOF之后找不到public class")
+            return None
         
     except Exception as e:
-        print(f"读取log文件 {log_file_path} 时出错: {e}")
+        print(f"✗ 读取 {os.path.basename(log_file_path)} 时出错: {e}")
         return None
 
 # 在导入其他模块前先设置GPU环境
 if __name__ == '__main__':
-    # 检查是否为 reextract 模式
-    reextract_mode = len(sys.argv) >= 2 and sys.argv[1] == '--reextract'
+    # 检查是否为 reextract 模式（支持两种参数顺序）
+    reextract_mode = False
+    result_tag = None
+    
+    if len(sys.argv) >= 3:
+        if sys.argv[1] == '--reextract':
+            # 格式1: python inference_java.py --reextract qwen3-4b
+            reextract_mode = True
+            result_tag = sys.argv[2]
+        elif sys.argv[2] == '--reextract':
+            # 格式2: python inference_java.py qwen3-4b --reextract
+            reextract_mode = True
+            result_tag = sys.argv[1]
     
     if reextract_mode:
         # Reextract 模式：只需要结果标签
-        if len(sys.argv) < 3:
+        if not result_tag:
             print(f"使用方法: python {sys.argv[0]} --reextract <result_tag>")
-            print("示例: python inference_java.py --reextract qwen3-8b")
-            print("将重新提取 evalrepair-java-res/<result_tag>/ 下所有的代码")
+            print(f"    或者: python {sys.argv[0]} <result_tag> --reextract")
+            print("示例: python inference_java.py --reextract qwen3-4b")
+            print("      python inference_java.py qwen3-4b --reextract")
+            print("将从 EOF 之后找 public class，然后往前定位 ```java 代码块")
             sys.exit(1)
         
-        result_tag = sys.argv[2]
         result_base_dir = f'evalrepair-java-res/{result_tag}'
         
         if not os.path.exists(result_base_dir):
             print(f"错误: 结果目录不存在: {result_base_dir}")
             sys.exit(1)
         
+        # 根据 result_tag 获取对应的 EOF 标记
+        BOF, EOF = get_prompt_format(result_tag)
+        
         print("=" * 60)
-        print("运行模式: 重新提取代码模式")
-        print(f"目标目录: {result_base_dir}")
-        print("将从已有的log文件中重新提取Java代码")
+        print(f"📝 重新提取模式: {result_tag}")
+        print(f"📂 目标目录: {result_base_dir}")
+        print(f"🎯 提取策略: EOF之后 → public class → 往前找最近的```java")
+        print(f"📌 EOF标记: {EOF if EOF else '(无EOF标记)'}")
         print("=" * 60)
         
         # 遍历所有 fixed* 目录
@@ -434,21 +520,20 @@ if __name__ == '__main__':
         total_success = 0
         
         for fixed_dir in sorted(Path(result_base_dir).glob('fixed*')):
-            print(f"\n处理目录: {fixed_dir}")
+            print(f"\n📁 处理目录: {fixed_dir.name}")
             for log_file in sorted(fixed_dir.glob('*.log')):
                 total_processed += 1
                 java_file = str(log_file)[:-4]  # 移除 .log 扩展名
                 
-                print(f"  处理: {log_file.name}")
-                extracted_code = reextract_code_from_log(str(log_file))
+                # 传入 EOF 标记和 model_key
+                extracted_code = reextract_code_from_log(str(log_file), eof_marker=EOF, model_key=result_tag)
                 
                 if extracted_code:
                     with open(java_file, 'w', encoding='utf-8') as f:
                         f.write(extracted_code)
-                    print(f"  ✓ 已更新: {os.path.basename(java_file)}")
                     total_success += 1
                 else:
-                    print(f"  ✗ 提取失败: {log_file.name}")
+                    pass  # 错误信息已在函数内打印
         
         print("\n" + "=" * 60)
         print(f"重新提取完成！")
@@ -484,15 +569,14 @@ llm, tokenizer, _ = load_vllm_model(model_config)
 print(f"Tokenizer vocab size: {len(tokenizer)}")
 print(f"GPU状态: {monitor_gpu_status()}")
 
-def generate_fix(code: str, filename: str) -> Tuple[str, str]:
+def generate_fix(code: str, filename: str, model_key: str) -> Tuple[str, str]:
     """生成代码修复"""
-    prompt = f"{BOF} This is an incorrect code ({filename}):\n```java\n{code}\n```\nYou are a software engineer. Can you repair the incorrect code?\n{EOF}\n```java\n"
+    # 使用指令模型格式构建 prompt
+    prompt = f"{BOF}This is an incorrect code ({filename}):\n```java\n{code}\n```\nYou are a software engineer. Can you repair the incorrect java code?\n{EOF}\n```java\n"
+    
     print(prompt, flush=True)
     
-    full_text, code_result = generate_with_vllm(llm, prompt)
-    print(full_text)
-    print('code:', code_result, flush=True)
-    return full_text, code_result
+    return generate_with_vllm(llm, prompt, model_key)
 
 # 配置路径
 base_dir = 'evalrepair-java/origin/'
@@ -536,7 +620,7 @@ for file_path in sorted(Path(base_dir).rglob('*.java'), reverse=True):
             continue
         
         # 生成修复代码
-        full_text, code_result = generate_fix(content, file_name)
+        full_text, code_result = generate_fix(content, file_name, model_key)
         if not full_text:
             continue
         

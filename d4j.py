@@ -310,17 +310,13 @@ EOF = None
 
 
 def extract_first_java_code(s: str) -> str:
-    # 首先尝试匹配完整的代码块（有闭合标记）
+    """从文本中提取第一个完整的Java代码块（必须有闭合标记），无回退策略"""
+    # 只匹配完整的代码块（有闭合标记）
     matches = re.findall(r'```java(.*?)```', s, re.DOTALL)
     if matches:
-        return matches[0].strip()
+        return matches[0].strip()  # 返回第一个代码块
 
-    # 如果没有闭合标记，尝试匹配从 ```java 开始到字符串结尾或到下一个 ``` 的内容
-    match = re.search(r'```java\s*(.*?)(?:```|$)', s, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-
-    return ""
+    return ""  # 找不到完整代码块就返回空，依靠重试机制
 
 
 def reextract_code_from_log(log_file_path):
@@ -786,7 +782,7 @@ def cal_vllm(bug_id, code, title, description, filename):
             temperature=1.0,
             top_p=0.9,
             top_k=50,
-            max_tokens=2048,  # 降低token数量减少显存压力
+            max_tokens=1024,  # 降低token数量减少显存压力
             repetition_penalty=1.1,
             stop=[tokenizer.eos_token] if tokenizer.eos_token else None,
         )
@@ -838,11 +834,11 @@ def cal_vllm(bug_id, code, title, description, filename):
             if is_completion_model(model_key) or BOF is None or EOF is None:
                 # 代码补全模型：从 "output the fixed code" 标记之后提取Java代码块
                 marker = "output the fixed code"
-                marker_pos = full_text.lower().find(marker)
+                marker_pos = complete_text.lower().find(marker)
                 
                 if marker_pos != -1:
                     # 找到标记，从标记之后提取
-                    after_marker = full_text[marker_pos + len(marker):]
+                    after_marker = complete_text[marker_pos + len(marker):]
                     ret = extract_first_java_code(after_marker)
                 else:
                     # 没找到标记，返回空，依靠重试机制
