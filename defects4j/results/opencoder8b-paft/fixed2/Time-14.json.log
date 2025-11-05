@@ -1,0 +1,336 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# #151 Unable to add days to a MonthDay set to the ISO leap date
+It's not possible to add days to a MonthDay set to the ISO leap date (February 29th). This is even more bizarre given the exact error message thrown.
+Sample snippet:
+final MonthDay isoLeap = new MonthDay(DateTimeConstants.FEBRUARY, 29, ISOChronology.getInstanceUTC());
+System.out.println(isoLeap);
+System.out.println(isoLeap.plusDays(2));
+
+Which generates the following combined console output and stack trace: 
+--02-29
+Exception in thread "main" org.joda.time.IllegalFieldValueException: Value 29 for dayOfMonth must be in the range [1,28]
+at org.joda.time.field.FieldUtils.verifyValueBounds(FieldUtils.java:215)
+at org.joda.time.field.PreciseDurationDateTimeField.set(PreciseDurationDateTimeField.java:78)
+at org.joda.time.chrono.BasicMonthOfYearDateTimeField.add(BasicMonthOfYearDateTimeField.java:212)
+at org.joda.time.field.BaseDateTimeField.add(BaseDateTimeField.java:324)
+at org.joda.time.MonthDay.withFieldAdded(MonthDay.java:519)
+at org.joda.time.MonthDay.minusDays(MonthDay.java:672)
+at ext.site.time.chrono.Main.m7(Main.java:191)
+at ext.site.time.chrono.Main.main(Main.java:27)
+The follwing method calls and parameters also generate the same or related error: 
+isoLeap.plusMonths(1);
+isoLeap.plusMonths(-1);
+isoLeap.minusMonths(1);
+isoLeap.minusMonths(-1);
+isoLeap.minusDays(-1);
+
+However, the following methods work: 
+isoLeap.minusDays(1);
+isoLeap.plusDays(-1);
+
+Performing operations on dates around the ISO leap date react as if it exists, ie:
+System.out.println(isoLeap.minusDays(1).plusDays(2));
+
+Prints out '--03-01' as expected.
+This is an incorrect Java code (src/main/java/org/joda/time/chrono/BasicMonthOfYearDateTimeField.java):
+```java
+public int[] add(ReadablePartial partial, int fieldIndex, int[] values, int valueToAdd) {
+    // overridden as superclass algorithm can't handle
+    // 2004-02-29 + 48 months -> 2008-02-29 type dates
+    if (valueToAdd == 0) {
+        return values;
+    }
+        // month is largest field and being added to, such as month-day
+    if (DateTimeUtils.isContiguous(partial)) {
+        long instant = 0L;
+        for (int i = 0, isize = partial.size(); i < isize; i++) {
+            instant = partial.getFieldType(i).getField(iChronology).set(instant, values[i]);
+        }
+        instant = add(instant, valueToAdd);
+        return iChronology.get(partial, instant);
+    } else {
+        return super.add(partial, fieldIndex, values, valueToAdd);
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+package org.joda.time;
+
+import org.joda.time.field.FieldUtils;
+import org.joda.time.field.PreciseDateTimeField;
+import org.joda.time.format.DateTimeFormat;
+import org.joda.time.format.DateTimeFormatter;
+import org.joda.time.chrono.BasicMonthOfYearDateTimeField;
+import java.util.Locale;
+import org.junit.Assert;
+import org.junit.Test;
+
+public class JodaBug151 {
+
+    @Test
+    public void testAddDays() throws Exception {
+        final MonthDay isoLeap = new MonthDay(DateTimeConstants.FEBRUARY, 29, ISOChronology.getInstanceUTC());
+
+        Assert.assertEquals("--02-29", DateTimeFormat.shortMonthDay().withLocale(Locale.US).print(isoLeap));
+        
+        try {
+        	isoLeap.plusDays(2);	
+	        Assert.fail("Should not pass");
+        } catch (IllegalFieldValueException ex){
+        	Assert.assertEquals(IllegalFieldValueException.class, ex.getClass());
+        }
+
+        try {
+        	isoLeap.minusDays(3);	
+	        Assert.fail("Should not pass");
+        } catch (IllegalFieldValueException ex){
+        	Assert.assertEquals(IllegalFieldValueException.class, ex.getClass());
+        }
+
+        Assert.assertEquals("--03-01", DateTimeFormat.shortMonthDay().withLocale(Locale.US).print(isoLeap.minusDays(1).plusDays(2)));
+    }
+}
+```
+
+assistant
+ ```java
+public int[] add(long instant, int valueToAdd) {
+    checkLeapYear();
+    return super.add(instant, valueToAdd);
+}
+
+private void checkLeapYear(){
+	if(getActualMaximum(DateTimeFieldType.dayOfMonth()) < 29){
+		throw new IllegalFieldValueException("Leap year not set");
+	}
+}
+
+@Override
+public long getLong(long instant) {
+    checkLeapYear();
+    return super.getLong(instant);
+}
+
+@Override
+public String getAsText(long instant, Locale locale) {
+    checkLeapYear();
+    return super.getAsText(instant, locale);
+}
+```
+
+
+传票传唤assistant
+ ```java
+public class BasicMonthOfYearDateTimeField extends PreciseDateTimeField {
+    ...
+    
+    private void checkLeapYear(long instant) {
+        YearMonthYear ymy = new YearMonthYear(instant, iChronology);
+        if (ymy.getMonthOfYear() != DateTimeConstants.FEBRUARY || ymy.getDayOfMonth() != 29) {
+            throw new IllegalFieldValueException(
+                "Field DayOfMonth cannot be set to " +
+                getReadableName() + " in year " +
+                getChronology().year().get(instant) +
+                " because " + this + " does not exist."
+            );
+        }
+    }
+
+    protected long getWrappedValue() {
+        return Long.MAX_VALUE;
+    }
+
+    @Override
+    public int[] add(ReadablePartial partial, int fieldIndex, int[] values, int valueToAdd) {
+        ...
+        if(valueToAdd >= 0 && DateTimeUtils.isContiguous(partial)){
+            long instant = 0L;
+            for(int i = 0, isize = partial.size(); i < isize; i++){
+                instant = partial.getFieldType(i).getField(iChronology).set(instant, values[i]);
+            }
+            checkLeapYear(instant);
+        }
+        ...
+    }
+}
+```
+
+
+assistant
+ ```java
+public class YearMonthYear {
+    ...
+
+    private YearMonthYear(long instant, Chronology chrono) {
+        int year = chrono.year().get(instant);
+        if ((year % 100 != 0 && year % 4 == 0) || year % 400 == 0) {
+            iChronology = chrono;
+            iYear = year;
+            MonthOfYear month = chrono.monthOfYear().get(instant);
+            int dom = chrono.dayOfMonth().get(instant);
+            if(month.getMinimumValue() <= DateTimeConstants.FEBRUARY && DateTimeConstants.FEBRUARY + dom > DateTimeConstants.FEBRUARY_29){
+                throw new IllegalArgumentException("Invalid date: " + this.toString());
+            }
+        }else{
+            throw new IllegalArgumentException("Not a leap year: " + this.toString());
+        }
+    }
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

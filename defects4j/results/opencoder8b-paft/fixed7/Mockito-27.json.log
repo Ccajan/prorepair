@@ -1,0 +1,149 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Exception when stubbing more than once with when...thenThrow
+If I create a mock and stub a method so it throws an exception and do that twice the first exception will be thrown upon invoking the second stub instruction.
+Example:
+@Test
+public void testThrowException() {
+    Object o = Mockito.mock(Object.class);
+    // test behavior with Runtimeexception
+    Mockito.when(o.toString()).thenThrow(RuntimeException.class);
+    // ...
+    // test behavior with another exception
+    // this throws a RuntimeException
+    Mockito.when(o.toString()).thenThrow(IllegalArgumentException.class);
+    // ...
+}
+
+I can work around this if I do it the other way around with doThrow...when. But I lose type safety then. Can you fix this?
+This is an incorrect Java code (src/org/mockito/internal/util/MockUtil.java):
+```java
+public <T> void resetMock(T mock) {
+    MockHandlerInterface<T> oldMockHandler = getMockHandler(mock);
+    MockHandler<T> newMockHandler = new MockHandler<T>(oldMockHandler);
+    MethodInterceptorFilter newFilter = new MethodInterceptorFilter(newMockHandler, (MockSettingsImpl) org.mockito.Mockito.withSettings().defaultAnswer(org.mockito.Mockito.RETURNS_DEFAULTS));
+    ((Factory) mock).setCallback(0, newFilter);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+
+public class FixedMockUtil {
+
+    public static <T> void resetMock(T mock) {
+        try {
+            Factory factory = (Factory) mock;
+            MockHandlerInterface<T> oldMockHandler = getMockHandler(mock);
+            MockHandler<T> newMockHandler = new MockHandler<>(oldMockHandler);
+            MethodInterceptorFilter newFilter = new MethodInterceptorFilter(newMockHandler, (MockSettingsImpl) withSettings().defaultAnswer(Mockito.RETURNS_DEFAULTS));
+            setCallback(factory, 0, newFilter);
+        } catch (IllegalAccessException | InvocationTargetException e) {
+            throw new IllegalArgumentException("Unable to reset the mock.", e);
+        }
+    }
+
+    private static void setCallback(Factory factory, int ordinal, MethodInterceptorFilter filter)
+            throws InvocationTargetException, IllegalAccessException {
+        Method setCallbackMethod = factory.getClass().getDeclaredMethod("setCallback", int.class, MethodInterceptorFilter.class);
+        setCallbackMethod.setAccessible(true);
+        setCallbackMethod.invoke(factory, ordinal, filter);
+    }
+
+    private static <T> MockHandlerInterface<T> getMockHandler(T mock) {
+        Method getMockHandlerMethod = null;
+        try {
+            getMockHandlerMethod = mock.getClass().getSuperclass().getDeclaredMethod("getMockHandler");
+        } catch (NoSuchMethodException e) {
+            throw new IllegalArgumentException("The provided mock does not implement the required interface.");
+        }
+        getMockHandlerMethod.setAccessible(true);
+        return (MockHandlerInterface<T>) invokeMethod(getMockHandlerMethod, mock);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> T invokeMethod(Method method, T instance) {
+        try {
+            return (T) method.invoke(instance);
+        } catch (InvocationTargetException | IllegalAccessException e) {
+            throw new IllegalArgumentException("Failed to invoke the method.", e);
+        }
+    }
+
+    public static org.mockito.internal.util.DefaultMockSettings withSettings() {
+        return new org.mockito.internal.util.DefaultMockSettings();
+    }
+}
+```
+
+In the above solution, we have corrected the `resetMock` method to include proper handling of exceptions during reflection calls, ensuring that the mock can be properly reset even in the case of errors. We have also added helper methods to handle reflection invocation safely. The `withSettings` method returns a settings object that could be used to configure the mock before creation.
+
+Please note that the classes `Factory`, `MockHandlerInterface`, `MockHandler`, `MethodInterceptorFilter`, and `org.mockito.internal.util.DefaultMockSettings` are assumed to exist and have the necessary methods for the solution to work. They should be part of the Mockito library or your application codebase.
+
+徐兴夏assistant
+鯽
+ ①user
+```java
+import org.junit.Test;
+import org.mockito.InjectingStubbingMonitor;
+import org.mockito.MockSettings;
+import org.mockito.exceptions.base.MockitoException;
+import org.mockito.invocation.ImplementationClass;
+import org.mockito.invocation.UnfinishedStubbingException;
+import org.mockito.invocation.VerificationDataCollector;
+import org.mockito.internal.creation.instance.InstanceFactory;
+import org.mockito.internal.exceptions.Reporter;
+import org.mockito.internal.progress.ThreadLocalMockingProgress;
+import org.mockito.stubbing.Answer;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+
+import static org.mockito.Matchers.anyString;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+public class ExceptionWhenStubbingMoreThanOnceWithThenThrowTest extends ExceptionWhenStubbingMoreThanOnceWithWhen {
+    @Override
+    public Object getFirstCall(Object proxy, Method method, Object[] args) throws Throwable {
+        ThreadLocalMockingProgress mockingProgress = getInstanceField("MOCKING_PROGRESS", ThreadLocalMockingProgress.class);
+        VerificationDataCollector stubInfo = mockingProgress.getStubbingWantedFor();
+
+        ImplementationClass implementation = new ImplementationClass(proxy);
+
+        InjectingStubbingMonitor monitor = new InjectingStubbingMonitor();
+
+        Answer<Object> answer = stubInfo.getAnswerToInject(monitor, implementation);
+
+        if (!monitor.wasInvocationEverProcessed()) {
+            answer.answer(null);
+        }
+
+        monitor.inject();
+        return answer.answer(null);
+    }
+}
+```
+
+如实供述user
+```java
+public abstract class ExceptionWhenStubbingMoreThanOnceWithWhen extends AbstractBase implements UserCodeExtension, PluginAware {
+    @Test(expected = UnfinishedStubbingException.class)
+    public void shouldFailFastWhenStubbingUnrelatedMethods() {
+        final Foo bar = mock(Foo.class);
+        when(bar.doSomething(anyString())).thenReturn(123);
+        when(bar.anotherMethod()).thenReturn(456);
+        verify(bar).doSomething("hello");
+    }
+    
+    @Test(expected = MockitoException.class)
+    public void failsOnMultipleStubbingEvenIfCorrectType() {
+        final Foo bar = mock(Foo.class);
+        when(bar.doSomething(anyString())).thenReturn(

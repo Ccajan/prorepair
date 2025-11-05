@@ -1,0 +1,233 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Constructing invalid Partials
+Partials can be constructed by invoking a constructor Partial(DateTimeFieldType[], int[]) or by merging together a set of partials using with, each constructed by calling Partial(DateTimeFieldType, int), e.g.:
+Partial a = new Partial(new DateTimeFieldType[] { year(), hourOfDay() }, new int[] { 1, 1});
+Partial b = new Partial(year(), 1).with(hourOfDay(), 1);
+assert(a == b);
+However, the above doesn't work in all cases:
+new Partial(new DateTimeFieldType[] { clockhourOfDay(), hourOfDay() }, new int[] { 1, 1}); // throws Types array must not contain duplicate
+new Partial(clockhourOfDay(), 1).with(hourOfDay(), 1); // #<Partial [clockhourOfDay=1, hourOfDay=1]>
+I suppose the Partials should not allow to be constructed in either case. Is that right?
+There's also a related issue (probably stems from the fact that the Partial is invalid):
+new Partial(clockhourOfDay(), 1).with(hourOfDay(), 1).isEqual(new Partial(hourOfDay() ,1).with(clockhourOfDay(), 1)) // throws objects must have matching field types
+This is an incorrect Java code (src/main/java/org/joda/time/Partial.java):
+```java
+public Partial with(DateTimeFieldType fieldType, int value) {
+    if (fieldType == null) {
+        throw new IllegalArgumentException("The field type must not be null");
+    }
+    int index = indexOf(fieldType);
+    if (index == -1) {
+        DateTimeFieldType[] newTypes = new DateTimeFieldType[iTypes.length + 1];
+        int[] newValues = new int[newTypes.length];
+        
+        // find correct insertion point to keep largest-smallest order
+        int i = 0;
+        DurationField unitField = fieldType.getDurationType().getField(iChronology);
+        if (unitField.isSupported()) {
+            for (; i < iTypes.length; i++) {
+                DateTimeFieldType loopType = iTypes[i];
+                DurationField loopUnitField = loopType.getDurationType().getField(iChronology);
+                if (loopUnitField.isSupported()) {
+                    int compare = unitField.compareTo(loopUnitField);
+                    if (compare > 0) {
+                        break;
+                    } else if (compare == 0) {
+                        DurationField rangeField = fieldType.getRangeDurationType().getField(iChronology);
+                        DurationField loopRangeField = loopType.getRangeDurationType().getField(iChronology);
+                        if (rangeField.compareTo(loopRangeField) > 0) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        System.arraycopy(iTypes, 0, newTypes, 0, i);
+        System.arraycopy(iValues, 0, newValues, 0, i);
+        newTypes[i] = fieldType;
+        newValues[i] = value;
+        System.arraycopy(iTypes, i, newTypes, i + 1, newTypes.length - i - 1);
+        System.arraycopy(iValues, i, newValues, i + 1, newValues.length - i - 1);
+        // use public constructor to ensure full validation
+        // this isn't overly efficient, but is safe
+        Partial newPartial = new Partial(iChronology, newTypes, newValues);
+        iChronology.validate(newPartial, newValues);
+        return newPartial;
+    }
+    if (value == getValue(index)) {
+        return this;
+    }
+    int[] newValues = getValues();
+    newValues = getField(index).set(this, index, newValues, value);
+    return new Partial(this, newValues);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+private static boolean containsDuplicate(FieldType[] fields) {
+    Set<FieldType> set = new HashSet<>();
+    for (FieldType field : fields) {
+        if (!set.add(field)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+public Partial with(DateTimeFieldType fieldType, int value) {
+    if (fieldType == null) {
+        throw new IllegalArgumentException("The field type must not be null");
+    }
+    DateTimeFieldType[] newTypes = iTypes.clone(); 
+    int[] newValues = iValues.clone(); 
+
+    if (containsDuplicate(newTypes)){
+        throw new IllegalArgumentException("types array must not contain duplicate");
+    }
+
+    int index = indexOf(fieldType);
+    if (index != -1 && value == iValues[index]) {
+        return this;
+    }
+
+    index = insertPoint(fieldType);
+
+    System.arraycopy(newTypes, index, newTypes, index + 1, newTypes.length - index - 1);
+    newTypes[index] = fieldType;
+    System.arraycopy(newValues, index, newValues, index + 1, newValues.length - index - 1);
+    newValues[index] = value;
+    
+    // use public constructor to ensure full validation
+    // this isn't overly efficient, but is safe
+    Partial newPartial = new Partial(iChronology, newTypes, newValues);
+    iChronology.validate(newPartial, newValues);
+    return newPartial;
+}
+
+private int insertPoint(DateTimeFieldType fieldType){
+    DateTimeFieldType loopType;
+    for(int i = iTypes.length-1;i>=0;i--){
+        loopType = iTypes[i];
+        if(loopType.getDurationType().getUnitMillis()<fieldType.getDurationType().getUnitMillis()){
+            return i+1;
+        }
+    }
+    return 0;
+}
+```
+
+大宗商品assistant
+```java
+public boolean isEqual(Partial partial){
+    checkMatchingFields(partial);
+    return Objects.equals(iValues, partial.iValues);
+}
+
+private void checkMatchingFields(Partial partial){
+    if(!Arrays.equals(iTypes, partial.iTypes)){
+        throw new IllegalArgumentException(
+            "objects must have matching field types");
+    }
+}
+
+// The following method checks if two partials are equal.
+public boolean equals(Object obj){
+    if(obj instanceof Partial){
+        Partial other = (Partial)obj;
+        return isEqual(other);
+    }
+    return false;
+}
+
+@Override
+protected Object writeReplace() throws ObjectStreamException {
+    // For serialization compatibility only (Serializable interface).
+    return new SerializationProxy(this);
+}
+
+class SerializationProxy implements Serializable {
+
+    private final int[] iValues;
+    private final FieldType[] iTypes;
+
+    SerializationProxy(Partial partial) {
+        this.iTypes = partial.getFieldTypes();
+        this.iValues = partial.getValues();
+    }
+
+    protected Object readResolve(){
+        try{
+            return new Partial(iTypes, iValues);
+        } catch(IllegalArgumentException ex){
+            throw new InvalidObjectException(ex.getMessage());
+        }
+    }
+}
+```
+
+assistant
+```java
+public static Partial parseStrict(String string) {
+    ChronoParser<Partial> parser = Parsers.partialStrict();
+    return parser.parse(string);
+}
+
+public static Partial parseLenient(String string) {
+    ChronoParser<Partial> parser = Parsers.partial();
+    return parser.parse(string);
+}
+
+public boolean isEqual(Partial partial){
+    checkMatchingFields(partial);
+    return Arrays.equals(iValues, partial.iValues);
+}
+
+private void checkMatchingFields(Partial partial){
+    if(!Arrays.equals(iTypes, partial.iTypes)){
+        throw new IllegalArgumentException(
+            "objects must have matching field types");
+    }
+}
+
+@Override
+public String toString() {
+    StringBuilder buffer = new StringBuilder();
+    boolean first = true;
+    for (int i = 0; i < iTypes.length; i++) {
+        if (!first) {
+            buffer.append(' ');
+        }
+        first = false;
+        iTypes[i].appendTo(buffer, iValues[i], iChronology);
+    }
+    return buffer.toString();
+}
+```
+
+
+沧澜雪assistant
+ ```java
+public static Chronology weekyearWeekDay(Weekyear weekyear, Weekday weekday){
+    return new WeekyearWeekdayChronology(weekyear.weekyear(), weekday.weekday());
+}
+
+public YearWeekyear getYearWeekyear() {
+    int weekyear = weekyearInt();
+    Year year = iChronology.year();
+
+    DateTime weekDate = DateTimeField.weekOfWeekyear()
+        .yearOfCentury()
+        .roundCeilingCopy();
+    weekDate.setWeekyear(weekyear);
+    if (weekDate.plusYears(1).minusDays(1)
+        .getWeekyear() == weekyear) {
+        return new ExactYearWeekyear(year.roundFloorCopy(),
+            weekDate.getWeekyear(), weekDate.getWeekOfWeekyear());
+    }
+    return new ExactYearWeekyear(year.roundFloorCopy(), weekDate.getWeekyear(), 
