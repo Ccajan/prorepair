@@ -291,6 +291,7 @@ MODEL_PROMPT_FORMATS = {
     'qwen': ('<|im_start|>user\n', '<|im_end|>\n<|im_start|>assistant\n'),
     'codellama': ('[INST]', '[/INST]'),
     'llama': ('[INST]', '[/INST]'),
+    'llama3': ('<|begin_of_text|><|start_header_id|>system<|end_header_id|>\nYou are a helpful assistant<|eot_id|><|start_header_id|>user<|end_header_id|>\n', '<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n'),
     'mistral': ('[INST]', '[/INST]'),
     'deepseek': ('You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.\n### Instruction:\n', '\n### Response:\n'),
     'qwen2.5coder': ('<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\n', '<|im_end|>\n<|im_start|>assistant\n'),
@@ -385,12 +386,12 @@ MODEL_CONFIGS = {
     },
     # Llama3.1 模型
     'llama3.1-8b': {
-        'base_model': '/data1/czj/model/Llama-3-8B-Instruct',
+        'base_model': 'VityaVitalich/Llama3.1-8b-Instruct',
         'adapter_path': None
     },
-    'llama3.1-8b-trained': {
-        'base_model': '/data1/czj/model/Llama-3-8B-Instruct',
-        'adapter_path': '/data1/czj/model/trained_model_llama'
+    'llama3.1-8b-paft': {
+        'base_model': 'merged_models/llama3.1-8b-paft',
+        'adapter_path': None
     },
     'llama3.1-8b-trained-v1': {
         'base_model': '/data1/czj/model/Llama-3-8B-Instruct',
