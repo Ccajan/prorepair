@@ -11,6 +11,7 @@ import json
 import argparse
 import psutil
 import torch
+import re
 
 # 修复 vLLM 多进程问题
 import multiprocessing
@@ -28,7 +29,6 @@ os.environ['VLLM_USE_V1'] = '0'
 
 from vllm import LLM, SamplingParams
 from transformers import AutoTokenizer
-from promptsource.templates import Template
 
 
 MODEL_CONFIGS = {
@@ -183,7 +183,6 @@ MODEL_PROMPT_FORMATS = {
     'llama3': ('<|start_header_id|>user<|end_header_id|>\n\n', '<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n'),
     'deepseek': ('###Instruction\n', '###response\n\n'),  # DeepSeek 格式
     'opencoder': ('<|im_start|>user\n', '<|im_end|>\n<|im_start|>assistant\n'),
-    'starcoder': ('', ''),  # StarCoder 不需要特殊格式
 }
 
 
@@ -193,6 +192,13 @@ def get_prompt_format(model_key: str) -> tuple:
         if model_key.startswith(key):
             return MODEL_PROMPT_FORMATS[key]
     return ('', '')  # 默认格式（无特殊标记）
+
+
+def extract_cpp_code(text: str) -> str:
+    """从生成的文本中提取第一个完整的代码块（必须有闭合标记）"""
+    # 只匹配完整的代码块（有闭合标记），没有回退策略
+    match = re.search(r'```(?:c\+\+)?\s*(.*?)```', text, re.DOTALL)
+    return match.group(1).strip() if match else ""
 
 
 def load_model(model_name):
@@ -236,67 +242,92 @@ def load_model(model_name):
         raise
 
 
-def gen(prompt, nsample):
-    """Generate responses using vLLM"""
+def gen_with_retry(prompt, nsample, max_retries=5):
+    """使用重试机制生成代码（与inference_cpp.py保持一致）"""
     global model, tokenizer
     
     if model is None or tokenizer is None:
         raise ValueError("Model not loaded. Call load_model() first.")
     
-    try:
-        # vLLM 采样参数 - 与 inference_java.py 一致
-        sampling_params = SamplingParams(
-            temperature=1.0,
-            top_p=0.9,
-            top_k=50,
-            max_tokens=1024,  # 修复：与README中说明的1024一致
-            repetition_penalty=1.1,
-            stop=[tokenizer.eos_token] if tokenizer.eos_token else None,
-            n=nsample,  # 一次生成多个样本
-        )
+    # vLLM 采样参数 - 与 inference_cpp.py 一致
+    sampling_params = SamplingParams(
+        temperature=1.0,
+        top_p=0.9,
+        top_k=50,
+        max_tokens=1024,  # 与inference_cpp.py一致
+        repetition_penalty=1.1,
+        stop=[tokenizer.eos_token] if tokenizer.eos_token else None,
+    )
+    
+    successful_responses = []
+    
+    for sample_idx in range(nsample):
+        retry_count = 0
+        extracted_code = ""
         
-        # vLLM 生成
-        outputs = model.generate([prompt], sampling_params)
-        output = outputs[0]
+        while not extracted_code and retry_count < max_retries:
+            retry_count += 1
+            print(f"样本 {sample_idx + 1}/{nsample}, 尝试 {retry_count}/{max_retries}...", flush=True)
+            
+            try:
+                # vLLM 生成
+                outputs = model.generate([prompt], sampling_params)
+                output = outputs[0]
+                generated_text = output.outputs[0].text.strip()
+                
+                # 从生成的文本中提取C++代码
+                extracted_code = extract_cpp_code(generated_text)
+                
+                if extracted_code:
+                    print(f"✅ 成功提取C++代码 (长度: {len(extracted_code)} 字符)")
+                    successful_responses.append({"message": {"content": extracted_code}})
+                    break
+                else:
+                    print(f"⚠️ 第 {retry_count} 次尝试未找到C++代码块")
+                    
+            except Exception as e:
+                print(f"生成错误 (尝试 {retry_count}): {e}")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
         
-        # 提取所有生成的样本
-        responses = []
-        for generated_output in output.outputs:
-            generated_text = generated_output.text.strip()
-            responses.append({"message": {"content": generated_text}})
-        
-        # Format response similar to OpenAI API
-        result = {
-            "choices": responses,
-            "prompt": prompt
-        }
-        return result
-        
-    except Exception as e:
-        print(f"Error during generation: {e}")
+        if not extracted_code:
+            print(f"❌ 样本 {sample_idx + 1} 经过 {max_retries} 次尝试仍未获取到有效代码")
+    
+    if not successful_responses:
+        print(f"❌ 所有样本都未能生成有效的C++代码")
         return None
+    
+    # Format response similar to OpenAI API
+    result = {
+        "choices": successful_responses,
+        "prompt": prompt
+    }
+    return result
 
 
-xcodeeval_prompt_template = {
-    "apr": [
-        "Fix a buggy program written in {{lang_cluster}} language to solve the following programming problem:\nDescription: {{prob_desc_description}}\nInput Specification: {{prob_desc_input_spec}}\nOutput Specification: {{prob_desc_output_spec}}\n{% for input, output in zip(prob_desc_sample_inputs, prob_desc_sample_outputs) %}\nSample Input:\n{{input}}\nSample Output:\n{{output}}\n{% endfor %}\nNotes: {{prob_desc_notes}}\nTake input from {{prob_desc_input_from}} and output to {{prob_desc_output_to}}\n\nHere is the code with a bug of {{bug_exec_outcome}}:\n\n{{bug_source_code}}\n\nProvide the fixed {{lang_cluster}} code without any description or extra tokens.\n\nFixed source code:\n ||END-of-SRC|| "
-    ]
-}
+def gen(prompt, nsample):
+    """Generate responses using vLLM with retry mechanism"""
+    return gen_with_retry(prompt, nsample)
 
 
-def process_prompt(dt, template, nsample, output_dir, index, model_key, dry_run=0):
+def process_prompt(dt, nsample, output_dir, index, model_key, dry_run=0):
     language = dt["lang_cluster"]
     file_path = os.path.join(output_dir, f"{index}_1.0_{language}.json")
-    if not os.path.exists(file_path):
-        # Sample inputs/outputs are already arrays in the JSON, no need to parse
-        lm_io = template.apply(dt)
-        assert len(lm_io) == 2, f"{json.dumps(lm_io, indent=4)}"
-        
+    log_file_path = file_path.replace('.json', '.log')
+    
+    # 只有当JSON和log文件都存在时才跳过
+    if not (os.path.exists(file_path) and os.path.exists(log_file_path)):
         # 获取模型特定的提示格式
         BOF, EOF = get_prompt_format(model_key)
         
-        # 将原始 prompt 包装在模型格式中
-        formatted_prompt = f"{BOF}{lm_io[0]}{EOF}"
+        # 直接构建完整的提示词
+        raw_prompt = f"Description: {dt['prob_desc_description']}\n"
+        raw_prompt += f"This is an incorrect code:\n```c++\n{dt['bug_source_code']}\n```\n"
+        raw_prompt += f"You are a software engineer. Can you repair the incorrect cpp code?\n"
+        
+        # 将原始 prompt 包装在模型格式中，并添加代码块开始标记
+        formatted_prompt = f"{BOF}{raw_prompt}{EOF}\n```c++\n"
         
         if dry_run:
             open(file_path, "w").write(f"{json.dumps(formatted_prompt, indent=4)}")
@@ -305,6 +336,34 @@ def process_prompt(dt, template, nsample, output_dir, index, model_key, dry_run=
             if out is not None:
                 export_data = {"model_response": out, "source_data": dt}
                 open(file_path, "w").write(f"{json.dumps(export_data, indent=4)}")
+                
+                # 保存完整的log文件，记录10次生成的输入输出
+                log_file_path = file_path.replace('.json', '.log')
+                with open(log_file_path, "w", encoding='utf-8') as log_f:
+                    log_f.write("=" * 80 + "\n")
+                    log_f.write(f"SAMPLE INDEX: {index}\n")
+                    log_f.write(f"LANGUAGE: {language}\n")
+                    log_f.write(f"MODEL: {model_key}\n")
+                    log_f.write(f"NSAMPLE: {nsample}\n")
+                    log_f.write("=" * 80 + "\n\n")
+                    
+                    log_f.write("INPUT PROMPT:\n")
+                    log_f.write("-" * 40 + "\n")
+                    log_f.write(formatted_prompt)
+                    log_f.write("\n" + "-" * 40 + "\n\n")
+                    
+                    log_f.write("GENERATED OUTPUTS:\n")
+                    log_f.write("-" * 40 + "\n")
+                    for i, choice in enumerate(out["choices"], 1):
+                        log_f.write(f"[OUTPUT {i}/{len(out['choices'])}]\n")
+                        log_f.write(choice["message"]["content"])
+                        log_f.write(f"\n{'-' * 20}\n\n")
+                    
+                    log_f.write("=" * 80 + "\n")
+                    log_f.write("END OF LOG\n")
+                    log_f.write("=" * 80 + "\n")
+                
+                print(f"✅ Saved: {file_path} and {log_file_path}")
             else:
                 print(f"Failed to generate response for index {index}")
 
@@ -375,11 +434,6 @@ def main():
     load_model(model_name)
     if not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
-    templates = [
-        Template(f"apr_{idx}", template, "xCodeEval", delimeter="||END-of-SRC||")
-        for idx, template in enumerate(xcodeeval_prompt_template["apr"])
-    ]
-    template = templates[0]
 
     # Load dataset from JSON file
     print(f"Loading dataset from JSON file: {dataset_path}")
@@ -406,7 +460,6 @@ def main():
         try:
             process_prompt(
                 dt,
-                template,
                 nsample,
                 output_dir,
                 idx,
