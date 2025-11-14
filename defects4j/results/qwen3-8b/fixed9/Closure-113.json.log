@@ -1,0 +1,192 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Bug in require calls processing
+The Problem
+
+ProcessClosurePrimitives pass has a bug in processRequireCall method.
+The method processes goog.require calls. If a require symbol is invalid i.e is not provided anywhere, the method collects it for further error reporting. If the require symbol is valid, the method removes it from the ast.
+
+All invalid require calls must be left for further using/checking of the code! The related comment in the code confirms this.
+
+Nevertheless, the second condition (requiresLevel.isOn() -> see source code) is invalid and always causes removing of the requires when we want to check these requires.
+
+In any case, the method should not use the requiresLevel to decide if we need removing. The requiresLevel should be used to check if we need error reporting. 
+
+The Solution
+
+Remove the condition.
+Please see the attached patch.
+This is an incorrect Java code (src/com/google/javascript/jscomp/ProcessClosurePrimitives.java):
+```java
+private void processRequireCall(NodeTraversal t, Node n, Node parent) {
+  Node left = n.getFirstChild();
+  Node arg = left.getNext();
+  if (verifyLastArgumentIsString(t, left, arg)) {
+    String ns = arg.getString();
+    ProvidedName provided = providedNames.get(ns);
+    if (provided == null || !provided.isExplicitlyProvided()) {
+      unrecognizedRequires.add(
+          new UnrecognizedRequire(n, ns, t.getSourceName()));
+    } else {
+      JSModule providedModule = provided.explicitModule;
+
+      // This must be non-null, because there was an explicit provide.
+      Preconditions.checkNotNull(providedModule);
+
+      JSModule module = t.getModule();
+      if (moduleGraph != null &&
+          module != providedModule &&
+          !moduleGraph.dependsOn(module, providedModule)) {
+        compiler.report(
+            t.makeError(n, XMODULE_REQUIRE_ERROR, ns,
+                providedModule.getName(),
+                module.getName()));
+      }
+    }
+
+    maybeAddToSymbolTable(left);
+    maybeAddStringNodeToSymbolTable(arg);
+
+    // Requires should be removed before further processing.
+    // Some clients run closure pass multiple times, first with
+    // the checks for broken requires turned off. In these cases, we
+    // allow broken requires to be preserved by the first run to
+    // let them be caught in the subsequent run.
+    if (provided != null) {
+      parent.detachFromParent();
+      compiler.reportCodeChange();
+    }
+  }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+Certainly! Let's analyze the issue and then apply the fix.
+
+### ✅ Understanding the Issue
+
+The problem lies in the logic of the `processRequireCall` method inside the `ProcessClosurePrimitives` class.
+
+Here’s what the current behavior does:
+
+- When a `goog.require` call is encountered:
+  - It tries to find whether that symbol (`ns`) is **explicitly provided** via `providedNames`.
+  - If it's not explicitly provided or if it's provided but **not explicitly imported**, it adds it to the list of **unrecognized requires**.
+  - But, importantly, **it also removes the `require` call from the AST** regardless of whether it is recognized or not, based on the following condition:
+
+```java
+if (provided != null)
+```
+
+That is **wrong** — even if a `goog.require` call refers to a valid module, it shouldn't be removed unless specifically instructed to do so by the configuration (e.g., `--check_requires`).
+
+---
+
+### 🚫 Why the Condition is Incorrect
+
+Currently, this line:
+```java
+if (provided != null)
+```
+causes the node to be detached from its parent **only if the module was explicitly provided**.
+
+But this leads to:
+- Valid `goog.require` statements being stripped out.
+- Invalid ones being reported, which is correct.
+- So, all require calls end up being removed during the processing phase — **which violates the stated requirement** of keeping them for later checking.
+
+Moreover, the comment in the code states:
+
+> "Requires should be removed before further processing."
+
+But this doesn’t mean **all** requires should be removed — only those whose validity can be determined *after* initial processing.
+
+So the decision to remove a `goog.require` should be **based on something like the config flag (requiresLevel)**, not on the presence of a provider.
+
+---
+
+### ✅ Fix: Remove the Removal Logic Based on `provided != null`
+
+We need to change how the removal of `goog.require` nodes is controlled. Instead of depending solely on `provided != null`, it should be decided based on whether `requiresLevel.isOn()` is true or not.
+
+However, since your goal is to **preserve all require calls until later passes** (for example, when error checking is enabled), we **should not remove any** — except possibly under specific configurations such as optimization or stripping unnecessary imports.
+
+But in most scenarios, the intent is to keep the require calls in the AST while performing checks, and only remove them **once validation is complete**.
+
+Therefore, the correct way is to **remove the condition that currently removes the node**.
+
+---
+
+### 🔧 Final Corrected Code
+
+Here is the corrected version of the function with the problematic line removed:
+
+```java
+private void processRequireCall(NodeTraversal t, Node n, Node parent) {
+  Node left = n.getFirstChild();
+  Node arg = left.getNext();
+  if (verifyLastArgumentIsString(t, left, arg)) {
+    String ns = arg.getString();
+    ProvidedName provided = providedNames.get(ns);
+    if (provided == null || !provided.isExplicitlyProvided()) {
+      unrecognizedRequires.add(
+          new UnrecognizedRequire(n, ns, t.getSourceName()));
+    } else {
+      JSModule providedModule = provided.explicitModule;
+      // This must be non-null, because there was an explicit provide.
+      Preconditions.checkNotNull(providedModule);
+
+      JSModule module = t.getModule();
+      if (moduleGraph != null &&
+          module != providedModule &&
+          !moduleGraph.dependsOn(module, providedModule)) {
+        compiler.report(
+            t.makeError(n, XMODULE_REQUIRE_ERROR, ns,
+                providedModule.getName(),
+                module.getName()));
+      }
+    }
+
+    maybeAddToSymbolTable(left);
+    maybeAddStringNodeToSymbolTable(arg);
+
+    // Requires should be removed before further processing.
+    // Some clients run closure pass multiple times, first with
+    // the checks for broken requires turned off. In these cases, we
+    // allow broken requires to be preserved by the first run to
+    // let them be caught in the subsequent run.
+    // 
+    // Removed the conditional: DO NOT REMOVE THE REQUIRE CALL BY DEFAULT
+    // if (provided != null) {
+    //   parent.detachFromParent();
+    //   compiler.reportCodeChange();
+    // }
+  }
+}
+```
+
+---
+
+### ✅ Summary of Changes
+
+- **Removed:**  
+  ```java
+  if (provided != null) {
+    parent.detachFromParent();
+    compiler.reportCodeChange();
+  }
+  ```
+  
+- **Rationale:**  
+  This block was incorrectly causing the removal of all valid `goog.require` calls, which broke the intended flow of keeping require calls intact for further analysis.
+
+---
+
+Let me know if you'd like the full file updated or need help applying this fix to your project!

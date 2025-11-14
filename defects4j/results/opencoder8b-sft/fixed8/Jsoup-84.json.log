@@ -1,0 +1,154 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# W3CDom Helper fails to convert whenever some namespace declarations are missing
+Hello
+I've been running into an issue where if I convert my Jsoup parsed document into a org.w3c.dom.Document with the W3CDom helper and that document happens to be missing namespace declarations we get the following exception:
+NAMESPACE_ERR: An attempt is made to create or change an object in a way which is incorrect with regard to namespaces.
+
+I've looked into this a bit and first thing I tried was using a locally forked version of the W3CDom helper that simply turned this flag off:
+factory.setNamespaceAware(false);
+
+However the issue continued, so instead I simply hacked the code to completely ignore namespaces
+// (csueiras): We purposely remove any namespace because we get malformed HTML that might not be
+// declaring all of it's namespaces!
+Element el = doc.createElementNS("", sourceEl.tagName());
+
+I am not completely sure if this will have any side effects, but it resolved the issues with the document I'm interacting with. I would be glad to provide a pull request if I have some guidance regarding how to properly handle this issue if it can be handled by Jsoup.
+The document I'm having issues is simply making use of the Facebook like buttons using tags like this:
+<fb:like ...
+
+But there's no namespace declaration for "fb".
+This is an incorrect Java code (src/main/java/org/jsoup/helper/W3CDom.java):
+```java
+public void head(org.jsoup.nodes.Node source, int depth) {
+    namespacesStack.push(new HashMap<>(namespacesStack.peek())); // inherit from above on the stack
+    if (source instanceof org.jsoup.nodes.Element) {
+        org.jsoup.nodes.Element sourceEl = (org.jsoup.nodes.Element) source;
+
+        String prefix = updateNamespaces(sourceEl);
+        String namespace = namespacesStack.peek().get(prefix);
+        String tagName = sourceEl.tagName();
+
+        Element el = 
+            doc.createElementNS(namespace, tagName);
+        copyAttributes(sourceEl, el);
+        if (dest == null) { // sets up the root
+            doc.appendChild(el);
+        } else {
+            dest.appendChild(el);
+        }
+        dest = el; // descend
+    } else if (source instanceof org.jsoup.nodes.TextNode) {
+        org.jsoup.nodes.TextNode sourceText = (org.jsoup.nodes.TextNode) source;
+        Text text = doc.createTextNode(sourceText.getWholeText());
+        dest.appendChild(text);
+    } else if (source instanceof org.jsoup.nodes.Comment) {
+        org.jsoup.nodes.Comment sourceComment = (org.jsoup.nodes.Comment) source;
+        Comment comment = doc.createComment(sourceComment.getData());
+        dest.appendChild(comment);
+    } else if (source instanceof org.jsoup.nodes.DataNode) {
+        org.jsoup.nodes.DataNode sourceData = (org.jsoup.nodes.DataNode) source;
+        Text node = doc.createTextNode(sourceData.getWholeData());
+        dest.appendChild(node);
+    } else {
+        // unhandled
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import java.util.HashMap;
+import java.util.Map;
+import javax.xml.parsers.FactoryConfigurationError;
+import javax.xml.parsers.DocumentBuilderFactory;
+import org.jsoup.Jsoup;
+import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Element;
+import org.w3c.dom.Document as DOMDocument;
+
+public class W3CDom {
+
+    public static Document toDocument(String html) {
+        Document doc = Jsoup.parse(html);
+        return toDocument(doc);
+    }
+
+    public static Document toDocument(Document jsoupDoc) {
+        try {
+            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+            //factory.setNamespaceAware(true); 
+            DOMDocument domDoc = factory.newDocumentBuilder().newDocument();
+            
+            Stack<Map<String,String>> namespacesStack = new Stack<>();
+            Map<String,String> emptyMap = new HashMap<>();
+            namespacesStack.push(emptyMap);
+            
+            recurse(domDoc, null, 0, namespacesStack, jsoupDoc.child(0));
+            return domDoc;
+        } catch (Exception ex) {
+            throw new RuntimeException(ex);
+        }
+    }
+
+    private static void recurse(DOMDocument domDoc, Element dest, int depth,
+                                 Stack<Map<String,String>> namespacesStack,
+                                 org.jsoup.nodes.Node source) {
+        if (source instanceof org.jsoup.nodes.Element) {
+            org.jsoup.nodes.Element sourceEl = (org.jsoup.nodes.Element) source;
+            
+            String tagname = updateNamespaces(namespacesStack, sourceEl);
+            String namespaceURI = namespacesStack.peek().get(tagname);
+            
+            Element el = domDoc.createElementNS(namespaceURI, tagname);
+            copyAttributes(sourceEl, el);
+            dest.appendChild(el);
+            
+            dest = el; 
+        } else if (source instanceof org.jsoup.nodes.TextNode) {
+            Text text = domDoc.createTextNode(((TextNode) source).getWholeText());
+            dest.appendChild(text);
+        } else if (source instanceof org.jsoup.nodes.Comment) {
+            Comment comment = domDoc.createComment(((Comment) source).getData());
+            dest.appendChild(comment);
+        } else if (source instanceof DataNode) {
+            Text data = domDoc.createTextNode(((DataNode) source).getWholeData());
+            dest.appendChild(data);
+        } else {
+            // Unhandled type - just ignore it
+        }
+        
+        for (int i = 1; i < source.children().size(); i++) { 
+            recurse(domDoc, dest, depth + 1, namespacesStack, source.child(i));
+        }
+    }
+    
+    private static String updateNamespaces(Stack<Map<String,String>> namespacesStack,
+                                               Element element) {
+        Map<String,String> inheritedMap = namespacesStack.peek();
+        
+        for (String key : element.attributes().asList()) {
+            Attr attr = element.attributes().getAttr(key);
+            if ("xmlns".equals(attr.getKey())) {
+                inheritedMap.put("", attr.getValue()); 
+            } else if (attr.getKey().startsWith("xmlns:")) {
+                String prefix = attr.getKey().substring(6);
+                inheritedMap.put(prefix, attr.getValue()); 
+            }
+        }
+        
+        return element.tagName();
+    }
+
+    private static void copyAttributes(Element source, Element dest) {
+        for (org.jsoup.nodes.Attribute attr : source.attributes().asList()) {
+            dest.setAttribute(attr.getKey(), attr.getValue());
+        }
+    }
+}
+
+```

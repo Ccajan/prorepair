@@ -1,0 +1,188 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# DeserializationProblemHandler.handleUnknownTypeId() returning Void.class, enableDefaultTyping causing NPE
+Returning Void.class from com.fasterxml.jackson.databind.deser.HandleUnknowTypeIdTest.testDeserializationWithDeserializationProblemHandler().new DeserializationProblemHandler() {...}.handleUnknownTypeId(DeserializationContext, JavaType, String, TypeIdResolver, String) is causing a NPE in jackson 2.9. I'll provide a pull request illustrating the issue in a test.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/jsontype/impl/TypeDeserializerBase.java):
+```java
+protected final JsonDeserializer<Object> _findDeserializer(DeserializationContext ctxt,
+        String typeId) throws IOException
+{
+    JsonDeserializer<Object> deser = _deserializers.get(typeId);
+    if (deser == null) {
+        /* As per [databind#305], need to provide contextual info. But for
+         * backwards compatibility, let's start by only supporting this
+         * for base class, not via interface. Later on we can add this
+         * to the interface, assuming deprecation at base class helps.
+         */
+        JavaType type = _idResolver.typeFromId(ctxt, typeId);
+        if (type == null) {
+            // use the default impl if no type id available:
+            deser = _findDefaultImplDeserializer(ctxt);
+            if (deser == null) {
+                // 10-May-2016, tatu: We may get some help...
+                JavaType actual = _handleUnknownTypeId(ctxt, typeId);
+                if (actual == null) { // what should this be taken to mean?
+                    // 17-Jan-2019, tatu: As per [databind#2221], better NOT return `null` but...
+                    return null;
+                }
+                // ... would this actually work?
+                deser = ctxt.findContextualValueDeserializer(actual, _property);
+            }
+        } else {
+            /* 16-Dec-2010, tatu: Since nominal type we get here has no (generic) type parameters,
+             *   we actually now need to explicitly narrow from base type (which may have parameterization)
+             *   using raw type.
+             *
+             *   One complication, though; cannot change 'type class' (simple type to container); otherwise
+             *   we may try to narrow a SimpleType (Object.class) into MapType (Map.class), losing actual
+             *   type in process (getting SimpleType of Map.class which will not work as expected)
+             */
+            if ((_baseType != null)
+                    && _baseType.getClass() == type.getClass()) {
+                /* 09-Aug-2015, tatu: Not sure if the second part of the check makes sense;
+                 *   but it appears to check that JavaType impl class is the same which is
+                 *   important for some reason?
+                 *   Disabling the check will break 2 Enum-related tests.
+                 */
+                // 19-Jun-2016, tatu: As per [databind#1270] we may actually get full
+                //   generic type with custom type resolvers. If so, should try to retain them.
+                //  Whether this is sufficient to avoid problems remains to be seen, but for
+                //  now it should improve things.
+                if (!type.hasGenericTypes()) {
+                    type = ctxt.getTypeFactory().constructSpecializedType(_baseType, type.getRawClass());
+                }
+            }
+            deser = ctxt.findContextualValueDeserializer(type, _property);
+        }
+        _deserializers.put(typeId, deser);
+    }
+    return deser;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+The core issue in the provided method lies in how `_handleUnknownTypeId()` is used within the logic flow. Specifically, when it returns `Void.class`, and the code tries to proceed under the assumption that a valid `JavaType` object was returned, this leads to a **NullPointerException (NPE)** because the returned value may be `null` or invalid.
+
+---
+
+### ✅ **Problem Summary**
+
+In the following block:
+
+```java
+if (type == null) {
+    deser = _findDefaultImplDeserializer(ctxt);
+    if (deser == null) {
+        JavaType actual = _handleUnknownTypeId(ctxt, typeId);
+        if (actual == null) {
+            return null;
+        }
+        deser = ctxt.findContextualValueDeserializer(actual, _property);
+    }
+}
+```
+
+If `_handleUnknownTypeId(ctxt, typeId)` returns `Void.class`, then `actual` will be `Void.TYPE`. That's fine, but the next line calls:
+
+```java
+ctxt.findContextualValueDeserializer(actual, _property)
+```
+
+However, if `_handleUnknownTypeId(...)` does **not** return a properly constructed `JavaType`, such as when it is misused or incorrectly implemented (like just returning `Void.class`), it could lead to unexpected behavior or even an NPE if `_property` or other context information isn't correctly handled.
+
+---
+
+### 🔧 **Fix Approach**
+
+#### ✅ **1. Improve Validation**
+Ensure that the result of `_handleUnknownTypeId(...)` is always a meaningful `JavaType`. It should never return something like `Void.class` unless that’s intended.
+
+#### ✅ **2. Fix Return Value of `_handleUnknownTypeId(...)`
+
+The original problem described that this method is returning `Void.class`, which is likely incorrect. So, instead, implement this method to construct an appropriate `JavaType`.
+
+For example, if we're using `enableDefaultTyping(true, DEFAULT_TYPING_LUB)`, we might want to fallback to a basic object deserializer like `ObjectDeserializer`.
+
+---
+
+### ✅ **Proposed Fix**
+
+Replace this method:
+
+```java
+private JavaType _handleUnknownTypeId(DeserializationContext ctxt, String typeId) {
+    // This is illustrative — replace with your own implementation
+    return Void.TYPE; // ❌ Bad practice!
+}
+```
+
+with this more robust version:
+
+```java
+private JavaType _handleUnknownTypeId(DeserializationContext ctxt, String typeId) {
+    // Return a sensible default type
+    // e.g., Object if nothing else matches
+    return ctxt.getTypeFactory().constructType(Object.class);
+}
+```
+
+Or, if you're implementing a custom handler:
+
+```java
+private JavaType _handleUnknownTypeId(DeserializationContext ctxt, String typeId) {
+    // Example: Use a predefined generic type
+    return ctxt.getTypeFactory().constructParametricType(List.class, String.class);
+}
+```
+
+---
+
+### 🔄 **Update the Main Method Flow**
+
+Now that the `_handleUnknownTypeId(...)` method returns a proper `JavaType`, update the code to ensure it handles it safely:
+
+```java
+JavaType actual = _handleUnknownTypeId(ctxt, typeId);
+if (actual == null) {
+    return null;
+}
+
+// Make sure that the type is non-null and suitable
+if (actual == Void.TYPE || !actual.isConcrete()) {
+    // Handle error or use default
+    throw new IllegalArgumentException("Invalid or unknown type ID: " + typeId);
+}
+
+deser = ctxt.findContextualValueDeserializer(actual, _property);
+```
+
+---
+
+### 📌 **Key Fixes**
+
+| Problem | Solution |
+|--------|----------|
+| `_handleUnknownTypeId(...)` returns `Void.class` | Replace it with a concrete `JavaType` |
+| No validation of `actual` before using it | Add guard clauses and validation |
+| Possible NPE due to invalid types | Ensure safe usage of results |
+
+---
+
+### 🛠️ **Final Note**
+
+To prevent the NPE in the future, ensure that:
+
+- Any type resolution logic is wrapped with proper checks
+- Use `ctxt.getTypeFactory().constructType()` or similar methods where needed
+- Avoid returning `Void.TYPE` or other platform-specific types unless absolutely necessary
+
+---
+
+Would you like me to create a unit test or integration test to verify this fix?

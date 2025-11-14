@@ -1,0 +1,157 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# StringCollectionDeserializer fails with custom collection
+Seeing this with Jackson 2.9.8.
+We have a custom collection implementation, which is wired to use its "immutable" version for deserialization. The rationale is that we don't want accidental modifications to the data structures that come from the wire, so they all are forced to be immutable.
+After upgrade from 2.6.3 to 2.9.8, the deserialization started breaking with the message:
+
+Cannot construct instance of XXX (although at least one Creator exists): no default no-arguments constructor found
+
+This happens ONLY when you deserialize a custom collection of strings as a property of the other object. Deserializing the custom collection of strings directly works fine, and so does the deserialization of custom collection of non-strings. I believe either the StringCollectionDeserializer should not be invoked for custom collections, or perhaps it does not handle the delegation as expected.
+Please see comments for repro and workaround.
+Thanks!
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/deser/std/StringCollectionDeserializer.java):
+```java
+public JsonDeserializer<?> createContextual(DeserializationContext ctxt,
+        BeanProperty property) throws JsonMappingException
+{
+    // May need to resolve types for delegate-based creators:
+    JsonDeserializer<Object> delegate = null;
+    if (_valueInstantiator != null) {
+        // [databind#2324]: check both array-delegating and delegating
+        AnnotatedWithParams delegateCreator = _valueInstantiator.getDelegateCreator();
+        if (delegateCreator != null) {
+            JavaType delegateType = _valueInstantiator.getDelegateType(ctxt.getConfig());
+            delegate = findDeserializer(ctxt, delegateType, property);
+        }
+    }
+    JsonDeserializer<?> valueDeser = _valueDeserializer;
+    final JavaType valueType = _containerType.getContentType();
+    if (valueDeser == null) {
+        // [databind#125]: May have a content converter
+        valueDeser = findConvertingContentDeserializer(ctxt, property, valueDeser);
+        if (valueDeser == null) {
+        // And we may also need to get deserializer for String
+            valueDeser = ctxt.findContextualValueDeserializer(valueType, property);
+        }
+    } else { // if directly assigned, probably not yet contextual, so:
+        valueDeser = ctxt.handleSecondaryContextualization(valueDeser, property, valueType);
+    }
+    // 11-Dec-2015, tatu: Should we pass basic `Collection.class`, or more refined? Mostly
+    //   comes down to "List vs Collection" I suppose... for now, pass Collection
+    Boolean unwrapSingle = findFormatFeature(ctxt, property, Collection.class,
+            JsonFormat.Feature.ACCEPT_SINGLE_VALUE_AS_ARRAY);
+    NullValueProvider nuller = findContentNullProvider(ctxt, property, valueDeser);
+    if (isDefaultDeserializer(valueDeser)) {
+        valueDeser = null;
+    }
+    return withResolved(delegate, valueDeser, nuller, unwrapSingle);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+Certainly! Let's walk through the issue first before providing a fix.
+
+---
+
+### ✅ **Understanding the Problem**
+
+The key problem appears to stem from the behavior of `StringCollectionDeserializer` in Jackson 2.9.8, particularly in how it handles **custom collections** during deserialization. 
+
+Here's what we know from your description:
+
+- You're using a **custom immutable collection class** that implements `Collection<String>` or similar.
+- When you deserialize such a collection **as a field inside another POJO**, it fails with:
+  
+  ```
+  Cannot construct instance of XXX (although at least one Creator exists): no default no-arguments constructor found
+  ```
+
+- This failure **only occurs** when the collection is **a field inside a larger object** — **not when it’s deserialized standalone**.
+- It doesn’t happen for collections of other types (e.g., `Collection<Integer>`).
+
+The core of the problem lies in how Jackson identifies the correct deserializer for a custom collection. In older versions of Jackson (like 2.6.3), the deserializer would correctly look up a suitable deserializer based on type information. But starting with Jackson 2.9.8, there was a regression or change in logic that caused it to use `StringCollectionDeserializer` instead of properly finding a matching deserializer for your custom collection.
+
+---
+
+### 🔍 **Root Cause Analysis**
+
+From the provided code snippet, here's what's happening:
+
+In the method `createContextual()`, Jackson tries to create a context-aware deserializer for a `StringCollectionDeserializer`. It checks for possible delegates and then tries to locate a deserializer for the inner contents (`String`). However, in some cases, especially with custom `Collection` implementations, this logic gets confused — it ends up trying to instantiate the collection without proper constructors, leading to the error.
+
+Key parts involved:
+
+- `_valueInstantiator.getDelegateCreator()` — used to determine if a delegate constructor is present.
+- `findDeserializer(...)` — tries to find a matching deserializer.
+- `ctxt.findContextualValueDeserializer(...)` — tries to find deserializer based on type.
+
+But for **custom `Collection<String>`** types, even though you might define a constructor or factory method, these may not be recognized unless explicitly set up via annotations like `@JsonCreator`.
+
+So in this scenario, Jackson attempts to use the `StringCollectionDeserializer` as a general-purpose deserializer, but it assumes it knows how to instantiate the underlying type (the string list). Since your custom `Collection<String>` has no default constructor, it fails with that message.
+
+---
+
+### ✅ **Solution: Fixing the Logic**
+
+To prevent this regression, the logic within `createContextual()` needs to **prevent the invocation of `StringCollectionDeserializer`** on **non-string** collections — specifically **custom ones**.
+
+Here's the updated corrected version of the relevant portion of `StringCollectionDeserializer.createContextual()`:
+
+---
+
+### ✅ **Fixed Code**
+
+Replace this block:
+
+```java
+// Original problematic code section
+if (_valueInstantiator != null) {
+    // [databind#2324]: check both array-delegating and delegating
+    AnnotatedWithParams delegateCreator = _valueInstantiator.getDelegateCreator();
+    if (delegateCreator != null) {
+        JavaType delegateType = _valueInstantiator.getDelegateType(ctxt.getConfig());
+        delegate = findDeserializer(ctxt, delegateType, property);
+    }
+}
+
+final JavaType valueType = _containerType.getContentType();
+
+if (valueDeser == null) {
+    // [databind#125]: May have a content converter
+    valueDeser = findConvertingContentDeserializer(ctxt, property, valueDeser);
+    if (valueDeser == null) {
+        // And we may also need to get deserializer for String
+        valueDeser = ctxt.findContextualValueDeserializer(valueType, property);
+    }
+}
+```
+
+With this modified version to avoid applying the `StringCollectionDeserializer` to non-string collections:
+
+```java
+if (_valueInstantiator != null && !_containerType.isAssignableFrom(String.class)) {
+    // Only consider delegate creator if the container is not String
+    AnnotatedWithParams delegateCreator = _valueInstantiator.getDelegateCreator();
+    if (delegateCreator != null) {
+        JavaType delegateType = _valueInstantiator.getDelegateType(ctxt.getConfig());
+        delegate = findDeserializer(ctxt, delegateType, property);
+    }
+}
+
+final JavaType valueType = _containerType.getContentType();
+
+if (valueDeser == null) {
+    // [databind#125]: May have a content converter
+    valueDeser = findConvertingContentDeserializer(ctxt, property, valueDeser);
+    if (valueDeser == null) {
+        // And we may also need to get deserializer for String
+        valueDeser = ctxt.findContextualValueDeserializer(valueType, property);
+   

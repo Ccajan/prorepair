@@ -1,0 +1,208 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Too relaxed tar detection in ArchiveStreamFactory
+The relaxed tar detection logic added in COMPRESS-117 unfortunately matches also some non-tar files like a test AIFF file that Apache Tika uses. It would be good to improve the detection heuristics to still match files like the one in COMPRESS-117 but avoid false positives like the AIFF file in Tika.
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/ArchiveStreamFactory.java):
+```java
+public ArchiveInputStream createArchiveInputStream(final InputStream in)
+        throws ArchiveException {
+    if (in == null) {
+        throw new IllegalArgumentException("Stream must not be null.");
+    }
+
+    if (!in.markSupported()) {
+        throw new IllegalArgumentException("Mark is not supported.");
+    }
+
+    final byte[] signature = new byte[12];
+    in.mark(signature.length);
+    try {
+        int signatureLength = in.read(signature);
+        in.reset();
+        if (ZipArchiveInputStream.matches(signature, signatureLength)) {
+            return new ZipArchiveInputStream(in);
+        } else if (JarArchiveInputStream.matches(signature, signatureLength)) {
+            return new JarArchiveInputStream(in);
+        } else if (ArArchiveInputStream.matches(signature, signatureLength)) {
+            return new ArArchiveInputStream(in);
+        } else if (CpioArchiveInputStream.matches(signature, signatureLength)) {
+            return new CpioArchiveInputStream(in);
+        }
+
+        // Dump needs a bigger buffer to check the signature;
+        final byte[] dumpsig = new byte[32];
+        in.mark(dumpsig.length);
+        signatureLength = in.read(dumpsig);
+        in.reset();
+        if (DumpArchiveInputStream.matches(dumpsig, signatureLength)) {
+            return new DumpArchiveInputStream(in);
+        }
+
+        // Tar needs an even bigger buffer to check the signature; read the first block
+        final byte[] tarheader = new byte[512];
+        in.mark(tarheader.length);
+        signatureLength = in.read(tarheader);
+        in.reset();
+        if (TarArchiveInputStream.matches(tarheader, signatureLength)) {
+            return new TarArchiveInputStream(in);
+        }
+        // COMPRESS-117 - improve auto-recognition
+        if (signatureLength >= 512) {
+            try {
+                TarArchiveInputStream tais = new TarArchiveInputStream(new ByteArrayInputStream(tarheader));
+                // COMPRESS-191 - verify the header checksum
+                tais.getNextEntry();
+                    return new TarArchiveInputStream(in);
+            } catch (Exception e) { // NOPMD
+                // can generate IllegalArgumentException as well
+                // as IOException
+                // autodetection, simply not a TAR
+                // ignored
+            }
+        }
+    } catch (IOException e) {
+        throw new ArchiveException("Could not use reset and mark operations.", e);
+    }
+
+    throw new ArchiveException("No Archiver found for the stream signature");
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+Certainly! The issue with the current implementation lies in how it checks for the **TAR archive** format after reading its initial 512-byte block. Specifically, the `COMPRESS-117` enhancement introduced an attempt to detect TAR archives based on the first few bytes of the file, but this logic is flawed and causes **false positives** when handling other formats.
+
+---
+
+### 🔍 Problem Summary:
+
+In the section marked as `// COMPRESS-117 - improve auto-recognition`, the following logic is used:
+```java
+if (signatureLength >= 512) {
+    try {
+        TarArchiveInputStream tais = new TarArchiveInputStream(new ByteArrayInputStream(tarheader));
+        tais.getNextEntry();  // This will cause any valid Tar entry to be parsed
+        return new TarArchiveInputStream(in);
+    } catch (Exception e) {
+        // Ignored
+    }
+}
+```
+
+This pattern is **not reliable**, because:
+- It tries to parse the entire Tar header using a `ByteArrayInputStream`, which might include garbage or incomplete data.
+- It does **not validate whether the header actually belongs to a real Tar file** before assuming it is.
+- It can incorrectly recognize files that have similar patterns as a Tar header (like `.aiff` audio files).
+
+---
+
+### ✅ Solution Overview:
+
+We need to:
+1. Ensure we only consider files that have valid **Tar headers**.
+2. Use more accurate signature matching than just checking the length.
+3. Avoid false positives by not blindly creating a `TarArchiveInputStream` without validation.
+4. Maintain the original logic from `COMPRESS-117` but apply it carefully.
+
+---
+
+### 🛠️ Corrected Code Implementation
+
+Here's a corrected version of your method:
+
+```java
+public ArchiveInputStream createArchiveInputStream(final InputStream in)
+        throws ArchiveException {
+    if (in == null) {
+        throw new IllegalArgumentException("Stream must not be null.");
+    }
+
+    if (!in.markSupported()) {
+        throw new IllegalArgumentException("Mark is not supported.");
+    }
+
+    final byte[] signature = new byte[12];
+    in.mark(signature.length);
+    try {
+        int signatureLength = in.read(signature);
+        in.reset();
+
+        // Check for ZIP, JAR, AR, CPio
+        if (ZipArchiveInputStream.matches(signature, signatureLength)) {
+            return new ZipArchiveInputStream(in);
+        } else if (JarArchiveInputStream.matches(signature, signatureLength)) {
+            return new JarArchiveInputStream(in);
+        } else if (ArArchiveInputStream.matches(signature, signatureLength)) {
+            return new ArArchiveInputStream(in);
+        } else if (CpioArchiveInputStream.matches(signature, signatureLength)) {
+            return new CpioArchiveInputStream(in);
+        }
+
+        // Try to check for DUMP format
+        final byte[] dumpsig = new byte[32];
+        in.mark(dumpsig.length);
+        signatureLength = in.read(dumpsig);
+        in.reset();
+        if (DumpArchiveInputStream.matches(dumpsig, signatureLength)) {
+            return new DumpArchiveInputStream(in);
+        }
+
+        // Try to check for TAR format
+        final byte[] tarHeader = new byte[512];
+        in.mark(tarHeader.length);
+        signatureLength = in.read(tarHeader);
+        in.reset();
+
+        if (TarArchiveInputStream.matches(tarHeader, signatureLength)) {
+            return new TarArchiveInputStream(in);
+        }
+
+        // COMPRESS-117: Improve auto-detection of TARs
+        // Only proceed if we have full header and it looks like a potential TAR
+        if (signatureLength >= 512 && !isBinaryGarbage(tarHeader)) {
+            try {
+                TarArchiveInputStream tais = new TarArchiveInputStream(
+                    new ByteArrayInputStream(tarHeader));
+                // Read the first entry to ensure it is a valid TAR header
+                tais.getNextEntry();
+                return new TarArchiveInputStream(in);  // We've confirmed it's a TAR
+            } catch (Exception e) {
+                // If it fails, do not assume it's a TAR
+            }
+        }
+    } catch (IOException e) {
+        throw new ArchiveException("Could not use reset and mark operations.", e);
+    }
+
+    throw new ArchiveException("No Archiver found for the stream signature");
+}
+
+/**
+ * Checks if a given byte array contains binary garbage (e.g., non-text characters).
+ *
+ * @param bytes the byte array to inspect
+ * @return true if it seems to be binary data
+ */
+private boolean isBinaryGarbage(byte[] bytes) {
+    for (byte b : bytes) {
+        if (b < 0x20 || b > 0x7E) { // ASCII printable range
+            return true;
+        }
+    }
+    return false;
+}
+```
+
+---
+
+### 🧪 Additional Recommendations:
+
+To further reduce false positives:
+
+- Add custom signature matching for `.aiff` and similar files, so they don't

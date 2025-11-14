@@ -1,0 +1,152 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Add support for writing byte[] via JsonGenerator.writeEmbeddedObject()
+(note: should be safe for patch, that is, 2.8.3)
+Default implementation of 2.8-added writeEmbeddedObject() throws exception (unsupported operation) for all values, since JSON does not have any native object types.
+This is different from handling of writeObject(), which tries to either delegate to ObjectCodec (if one registered), or even encode "simple" values.
+However: since support for binary data is already handled in some cases using VALUE_EMBEDDED_OBJECT, it would actually make sense to handle case of byte[] (and, if feasible, perhaps ByteBuffer for extra points), and also ensure null can be written.
+This is likely necessary to support FasterXML/jackson-databind#1361 and should in general make system more robust.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/core/JsonGenerator.java):
+```java
+public void writeEmbeddedObject(Object object) throws IOException {
+    // 01-Sep-2016, tatu: As per [core#318], handle small number of cases
+    throw new JsonGenerationException("No native support for writing embedded objects",
+            this);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import com.fasterxml.jackson.core.JsonEncoding;
+import com.fasterxml.jackson.core.JsonGenerator;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+
+public class CustomJsonGenerator extends JsonGenerator {
+    private final JsonGenerator _generator;
+
+    public CustomJsonGenerator(JsonGenerator generator) {
+        this._generator = generator;
+    }
+
+    @Override
+    public void writeEmbeddedObject(Object object) throws IOException {
+        if (object == null) {
+            _generator.writeNull();
+            return;
+        }
+
+        if (object instanceof byte[]) {
+            byte[] bytes = (byte[]) object;
+            String base64 = Base64.getEncoder().encodeToString(bytes);
+            _generator.writeString(base64);
+            return;
+        } else if (object instanceof ByteBuffer) {
+            ByteBuffer buffer = (ByteBuffer) object;
+            byte[] bytes = new byte[buffer.remaining()];
+            buffer.get(bytes);
+            String base64 = Base64.getEncoder().encodeToString(bytes);
+            _generator.writeString(base64);
+            return;
+        }
+        
+        // For other types, let the default behavior handle it
+        _generator.writeEmbeddedObject(object);
+    }
+}
+```
+
+Wait, but this approach creates a custom subclass of JsonGenerator. Maybe a better way is to override the method directly in the original class. However, modifying the original class may not be ideal.
+
+An alternative approach could be to create a custom ObjectMapper and register a custom serializer for byte[]:
+
+```java
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.module.SimpleModule;
+import com.fasterxml.jackson.dataformat.xml.XmlMapper;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.Base64;
+
+public class CustomObjectMapper extends ObjectMapper {
+    public CustomObjectMapper() {
+        SimpleModule module = new SimpleModule();
+        module.addSerializer(byte[].class, (ser, ctxt) -> {
+            byte[] value = (byte[]) ser.getValue();
+            String base64 = Base64.getEncoder().encodeToString(value);
+            ctxt.writeBase64String(base64);
+            return null;
+        });
+        module.addSerializer(ByteBuffer.class, (ser, ctxt) -> {
+            ByteBuffer buffer = (ByteBuffer) ser.getValue();
+            byte[] bytes = new byte[buffer.remaining()];
+            buffer.get(bytes);
+            String base64 = Base64.getEncoder().encodeToString(bytes);
+            ctxt.writeBase64String(base64);
+            return null;
+        });
+        addModule(module);
+    }
+}
+```
+
+But I'm not sure if this approach is correct. It might be better to modify the original code in the JsonGenerator class.
+
+The correct fix would involve modifying the writeEmbeddedObject method in the original JsonGenerator class to handle byte[] and ByteBuffer properly. The previous code example was incorrect because it just threw an exception for all cases. Here's the corrected version:
+
+```java
+@Override
+public void writeEmbeddedObject(Object object) throws IOException {
+    if (object == null) {
+        writeNull();
+        return;
+    }
+
+    if (object instanceof byte[]) {
+        byte[] bytes = (byte[]) object;
+        String base64 = Base64.getEncoder().encodeToString(bytes);
+        writeString(base64);
+        return;
+    } else if (object instanceof ByteBuffer) {
+        ByteBuffer buffer = (ByteBuffer) object;
+        byte[] bytes = new byte[buffer.remaining()];
+        buffer.get(bytes);
+        String base64 = Base64.getEncoder().encodeToString(bytes);
+        writeString(base64);
+        return;
+    }
+    
+    // For other types, let the default behavior handle it
+    super.writeEmbeddedObject(object);
+}
+```
+
+But again, modifying the original class may not be appropriate. A better approach would be to use a custom serializer as described earlier. However, without access to the original class, we can't modify it directly.
+
+I think the best solution is to create a custom JsonGenerator that overrides the writeEmbeddedObject method to handle byte[] and ByteBuffer correctly. This way, we don't need to modify the original library code.
+</think>
+
+To address the issue with `writeEmbeddedObject()` throwing exceptions when attempting to serialize `byte[]` or `ByteBuffer`, we need to **provide proper handling** within the `JsonGenerator` interface — particularly in the overridden `writeEmbeddedObject()` method.
+
+Here’s how we can resolve this correctly while keeping compatibility with existing code:
+
+---
+
+### ✅ Corrected Implementation Strategy
+
+The idea is to implement logic inside the `writeEmbeddedObject()` method that explicitly checks whether the input is:
+
+1. `null` → write `null`.
+2. `byte[]` → encode as **Base64 string**, then write it as a regular string (since no direct binary type exists in JSON).
+3. `ByteBuffer` → convert to `byte[]` and apply same Base64 encoding.
+4. Fallback to standard behavior for unknown types.
+
+This avoids any reliance on external serializers and keeps the logic self

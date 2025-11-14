@@ -1,0 +1,157 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Bug in require calls processing
+The Problem
+
+ProcessClosurePrimitives pass has a bug in processRequireCall method.
+The method processes goog.require calls. If a require symbol is invalid i.e is not provided anywhere, the method collects it for further error reporting. If the require symbol is valid, the method removes it from the ast.
+
+All invalid require calls must be left for further using/checking of the code! The related comment in the code confirms this.
+
+Nevertheless, the second condition (requiresLevel.isOn() -> see source code) is invalid and always causes removing of the requires when we want to check these requires.
+
+In any case, the method should not use the requiresLevel to decide if we need removing. The requiresLevel should be used to check if we need error reporting. 
+
+The Solution
+
+Remove the condition.
+Please see the attached patch.
+This is an incorrect Java code (src/com/google/javascript/jscomp/ProcessClosurePrimitives.java):
+```java
+private void processRequireCall(NodeTraversal t, Node n, Node parent) {
+  Node left = n.getFirstChild();
+  Node arg = left.getNext();
+  if (verifyLastArgumentIsString(t, left, arg)) {
+    String ns = arg.getString();
+    ProvidedName provided = providedNames.get(ns);
+    if (provided == null || !provided.isExplicitlyProvided()) {
+      unrecognizedRequires.add(
+          new UnrecognizedRequire(n, ns, t.getSourceName()));
+    } else {
+      JSModule providedModule = provided.explicitModule;
+
+      // This must be non-null, because there was an explicit provide.
+      Preconditions.checkNotNull(providedModule);
+
+      JSModule module = t.getModule();
+      if (moduleGraph != null &&
+          module != providedModule &&
+          !moduleGraph.dependsOn(module, providedModule)) {
+        compiler.report(
+            t.makeError(n, XMODULE_REQUIRE_ERROR, ns,
+                providedModule.getName(),
+                module.getName()));
+      }
+    }
+
+    maybeAddToSymbolTable(left);
+    maybeAddStringNodeToSymbolTable(arg);
+
+    // Requires should be removed before further processing.
+    // Some clients run closure pass multiple times, first with
+    // the checks for broken requires turned off. In these cases, we
+    // allow broken requires to be preserved by the first run to
+    // let them be caught in the subsequent run.
+    if (provided != null) {
+      parent.detachFromParent();
+      compiler.reportCodeChange();
+    }
+  }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+Yes, I can help fix the issue described. The core problem lies in the conditional logic that determines whether or not `require` calls should be removed from the AST.
+
+### 🔍 What's wrong?
+
+In the current implementation:
+- There is a condition `if (provided != null)` that **removes** `goog.require` calls even when they are *valid* but not explicitly linked (i.e., their dependencies are not properly resolved).
+- Instead of using `requiresLevel` for determining removal, the code incorrectly uses `provided != null`.
+
+According to the comment in the code and the overall behavior requirement:
+> "All invalid require calls must be left for further using/checking of the code!"
+
+So, the goal is:
+- **Do not remove** valid `require` calls unless necessary.
+- Only report errors (and possibly remove) based on `requiresLevel`, not on whether the require is explicitly provided.
+
+---
+
+### ✅ Corrected Code
+
+Here’s the corrected version of your `processRequireCall` method:
+
+```java
+private void processRequireCall(NodeTraversal t, Node n, Node parent) {
+  Node left = n.getFirstChild();
+  Node arg = left.getNext();
+  if (verifyLastArgumentIsString(t, left, arg)) {
+    String ns = arg.getString();
+    ProvidedName provided = providedNames.get(ns);
+    
+    // Always collect unrecognized requires
+    if (provided == null || !provided.isExplicitlyProvided()) {
+      unrecognizedRequires.add(
+          new UnrecognizedRequire(n, ns, t.getSourceName()));
+      
+      // Do NOT remove these - leave them for later analysis
+      return;
+    }
+
+    JSModule providedModule = provided.explicitModule;
+
+    // This must be non-null, because there was an explicit provide.
+    Preconditions.checkNotNull(providedModule);
+
+    JSModule module = t.getModule();
+    if (moduleGraph != null &&
+        module != providedModule &&
+        !moduleGraph.dependsOn(module, providedModule)) {
+      compiler.report(
+          t.makeError(n, XMODULE_REQUIRE_ERROR, ns,
+              providedModule.getName(),
+              module.getName()));
+    }
+
+    maybeAddToSymbolTable(left);
+    maybeAddStringNodeToSymbolTable(arg);
+
+    // Remove require only if required level is ON
+    if (requiresLevel.isOn()) {
+      parent.detachFromParent();
+      compiler.reportCodeChange();
+    }
+  }
+}
+```
+
+---
+
+### 📌 Key Fixes
+
+1. **Removed** the `if (provided != null)` block which unconditionally removed nodes.
+2. **Added** a condition: `if (requiresLevel.isOn())` — this ensures that `require` calls are only removed when the "requires level" is enabled.
+3. **Kept** the `unrecognizedRequires` collection for all missing modules.
+4. **Left** all `require` calls intact unless specifically instructed to remove them (based on configuration).
+
+---
+
+### 📝 Summary
+
+| Before | After |
+|-------|-------|
+| Removed node if `provided != null` | Removed node only if `requiresLevel.isOn()` |
+| Collected unrecognized requires regardless | Collected unrecognized requires, kept them in AST |
+| Used `provided != null` as a flag for removal | Used `requiresLevel.isOn()` as a flag for removal |
+
+This change aligns with the original design intention — ensuring that all require statements are available for further checking and validation unless explicitly configured otherwise.
+
+Would you like me to provide a diff file or additional context?

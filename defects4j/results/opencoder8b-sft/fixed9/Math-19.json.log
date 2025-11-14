@@ -1,0 +1,176 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Wide bounds to CMAESOptimizer result in NaN parameters passed to fitness function
+If you give large values as lower/upper bounds (for example -Double.MAX_VALUE as a lower bound), the optimizer can call the fitness function with parameters set to NaN.  My guess is this is due to FitnessFunction.encode/decode generating NaN when normalizing/denormalizing parameters.  For example, if the difference between the lower and upper bound is greater than Double.MAX_VALUE, encode could divide infinity by infinity.
+This is an incorrect Java code (src/main/java/org/apache/commons/math3/optimization/direct/CMAESOptimizer.java):
+```java
+private void checkParameters() {
+    final double[] init = getStartPoint();
+    final double[] lB = getLowerBound();
+    final double[] uB = getUpperBound();
+
+    // Checks whether there is at least one finite bound value.
+    boolean hasFiniteBounds = false;
+    for (int i = 0; i < lB.length; i++) {
+        if (!Double.isInfinite(lB[i]) ||
+            !Double.isInfinite(uB[i])) {
+            hasFiniteBounds = true;
+            break;
+        }
+    }
+    // Checks whether there is at least one infinite bound value.
+    boolean hasInfiniteBounds = false;
+    if (hasFiniteBounds) {
+        for (int i = 0; i < lB.length; i++) {
+            if (Double.isInfinite(lB[i]) ||
+                Double.isInfinite(uB[i])) {
+                hasInfiniteBounds = true;
+                break;
+            }
+        }
+
+        if (hasInfiniteBounds) {
+            // If there is at least one finite bound, none can be infinite,
+            // because mixed cases are not supported by the current code.
+            throw new MathUnsupportedOperationException();
+        } else {
+            // Convert API to internal handling of boundaries.
+            boundaries = new double[2][];
+            boundaries[0] = lB;
+            boundaries[1] = uB;
+
+            // Abort early if the normalization will overflow (cf. "encode" method).
+        }
+    } else {
+        // Convert API to internal handling of boundaries.
+        boundaries = null;
+    }
+
+    if (inputSigma != null) {
+        if (inputSigma.length != init.length) {
+            throw new DimensionMismatchException(inputSigma.length, init.length);
+        }
+        for (int i = 0; i < init.length; i++) {
+            if (inputSigma[i] < 0) {
+                throw new NotPositiveException(inputSigma[i]);
+            }
+            if (boundaries != null) {
+                if (inputSigma[i] > boundaries[1][i] - boundaries[0][i]) {
+                    throw new OutOfRangeException(inputSigma[i], 0, boundaries[1][i] - boundaries[0][i]);
+                }
+            }
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+package org.apache.commons.math3.optimization.direct;
+
+import org.apache.commons.math3.exception.MathArithmeticException;
+import org.apache.commons.math3.exception.MathIllegalArgumentException;
+import org.apache.commons.math3.exception.util.LocalizedFormats;
+import org.apache.commons.math3.linear.RealVector;
+import org.apache.commons.math3.genetics.Chromosome;
+import org.apache.commons.math3.util.FastMath;
+import java.util.Locale;
+import org.apache.commons.math3.exception.NotPositiveException;
+import org.apache.commons.math3.exception.DimensionMismatchException;
+import org.apache.commons.math3.exception.OutOfRangeException;
+import org.apache.commons.math3.exception.MathUnsupportedOperationException;
+import org.apache.commons.math3.random.RandomGenerator;
+import org.apache.commons.math3.stat.descriptive.DescriptiveStatistics;
+import org.apache.commons.math3.util.CombinatoricsUtils;
+import org.apache.commons.math3.genetics.BinaryChromosomes;
+
+public class CMAESOptimizer extends AbstractDirectSearchOptimizer implements InitialGuessAwareOptimizer, ThreadSafeOptimizer {
+
+    @Override
+    public OptimizationResult optimize(final ObjectiveFunction f, final Goal goal, final double... startPoint) throws MaxIterationsExceededException, ObjectiveFunctionEvaluationException {
+        return super.optimize(f, goal, startPoint);
+    }
+
+    @Override
+    protected OptimizationResult doOptimize(ObjectiveFunction f, Goal goal, double[] startPoint)
+            throws ObjectiveFunctionEvaluationException, MaxIterationsExceededException {
+
+        checkParameters(goal, startPoint);
+
+        int numberOfVariables = startPoint.length;
+
+        RealVector startPointVector = VectorialRealField.getInstance().createVectorFromArray(numberOfVariables, startPoint);
+
+        RealVector lowerBound = VectorialRealField.getInstance().createVectorFromArray(numberOfVariables, getLowerBound());
+        RealVector upperBound = VectorialRealField.getInstance().createVectorFromArray(numberOfVariables, getUpperBound());
+
+        // Initialize the evolution path variables
+        RealVector pc = VectorialRealField.getInstance().getZeroVector(numberOfVariables); // Communication step vector
+        RealVector ps = VectorialRealField.getInstance().getZeroVector(numberOfVariables); // Stretching step vector
+
+        // Step-size control parameters
+        double cs = 0.5 * (Math.sqrt((numberOfVariables + 1) / (6 * numberOfVariables)));
+        double ds = 1 + cs * 2;
+
+        // Generate the initial search distribution base point
+        RealVector xmean = generateInitialSample(startPoint, goal, f, 100);
+
+        RandomGenerator random = getRandomGenerator(); // The only place where we directly use getRandomGenerator
+
+        // Main loop
+        for (int iterationCount = 0; iterationCount < maxIterationCount; iterationCount++) {
+            // Select parents
+            Chromosome[][] parentPair = selectParents(xmean, goal, f, 6);
+
+            // Perform arithmetics on the best sample in the population
+            RealVector pbest = decode(BinaryChromosomes.toBinary(parentPair[0][0]), lowerBound, upperBound, ds);
+            
+            // Update evolution paths
+            updateEvolutionPaths(pc, ps, xmean, pbest, random, ds, cs);
+
+            // Update strategy parameter
+            double sigma = xmean.getNorm();
+            cs = cs + 0.01 * sigma;
+            ds = ds + 0.02 * sigma;
+            
+            // Calculate the fitness value
+            double value = f.value(pbest.toArray()).doubleValue();
+            
+            // Update the global best solution
+            if ((goal == Goal.MINIMIZE && value < MINUS_INFINITY) || (goal == Goal.MAXIMIZE && value > PLUS_INFINITY)) {
+                System.out.println("Best Value: " + value);
+            }
+        }
+
+        return null; // Placeholder for actual return value based on the optimized solution
+    }
+}
+
+```
+assistant
+```java
+package org.apache.commons.math3.optimization.direct;
+
+import org.apache.commons.math3.exception.MathArithmeticException;
+import org.apache.commons.math3.exception.MathIllegalArgumentException;
+import org.apache.commons.math3.exception.util.LocalizedFormats;
+import org.apache.commons.math3.linear.RealVector;
+import org.apache.commons.math3.util.FastMath;
+import java.util.Locale;
+import org.apache.commons.math3.exception.NotPositiveException;
+import org.apache.commons.math3.exception.DimensionMismatchException;
+import org.apache.commons.math3.exception.OutOfRangeException;
+import org.apache.commons.math3.exception.MathUnsupportedOperationException;
+import org.apache.commons.math3.random.RandomGenerator;
+import org.apache.commons.math3.stat.descriptive.DescriptiveStatistics;
+import org.apachecommons.math3.util.CombinatoricsUtils;
+import org.apache.commons.math3.genetics.BinaryChromosomes;
+
+class CMAESOptimizer extends AbstractDirectSearchOptimizer implements InitialGuessAwareOptimizer, ThreadSafeOptimizer {
+
+    @Override
+    public OptimizationResult optimize(final ObjectiveFunction f, final Goal goal, final double... startPoint) throws MaxIterationsExceededException, ObjectiveFunction

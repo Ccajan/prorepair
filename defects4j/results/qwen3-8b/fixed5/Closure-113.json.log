@@ -1,0 +1,184 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Bug in require calls processing
+The Problem
+
+ProcessClosurePrimitives pass has a bug in processRequireCall method.
+The method processes goog.require calls. If a require symbol is invalid i.e is not provided anywhere, the method collects it for further error reporting. If the require symbol is valid, the method removes it from the ast.
+
+All invalid require calls must be left for further using/checking of the code! The related comment in the code confirms this.
+
+Nevertheless, the second condition (requiresLevel.isOn() -> see source code) is invalid and always causes removing of the requires when we want to check these requires.
+
+In any case, the method should not use the requiresLevel to decide if we need removing. The requiresLevel should be used to check if we need error reporting. 
+
+The Solution
+
+Remove the condition.
+Please see the attached patch.
+This is an incorrect Java code (src/com/google/javascript/jscomp/ProcessClosurePrimitives.java):
+```java
+private void processRequireCall(NodeTraversal t, Node n, Node parent) {
+  Node left = n.getFirstChild();
+  Node arg = left.getNext();
+  if (verifyLastArgumentIsString(t, left, arg)) {
+    String ns = arg.getString();
+    ProvidedName provided = providedNames.get(ns);
+    if (provided == null || !provided.isExplicitlyProvided()) {
+      unrecognizedRequires.add(
+          new UnrecognizedRequire(n, ns, t.getSourceName()));
+    } else {
+      JSModule providedModule = provided.explicitModule;
+
+      // This must be non-null, because there was an explicit provide.
+      Preconditions.checkNotNull(providedModule);
+
+      JSModule module = t.getModule();
+      if (moduleGraph != null &&
+          module != providedModule &&
+          !moduleGraph.dependsOn(module, providedModule)) {
+        compiler.report(
+            t.makeError(n, XMODULE_REQUIRE_ERROR, ns,
+                providedModule.getName(),
+                module.getName()));
+      }
+    }
+
+    maybeAddToSymbolTable(left);
+    maybeAddStringNodeToSymbolTable(arg);
+
+    // Requires should be removed before further processing.
+    // Some clients run closure pass multiple times, first with
+    // the checks for broken requires turned off. In these cases, we
+    // allow broken requires to be preserved by the first run to
+    // let them be caught in the subsequent run.
+    if (provided != null) {
+      parent.detachFromParent();
+      compiler.reportCodeChange();
+    }
+  }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+if (provided != null && requiresLevel.isOn()) {
+  parent.detachFromParent();
+  compiler.reportCodeChange();
+}
+```
+
+I will fix this part of the code.
+
+The original code has:
+```java
+if (provided != null) {
+  parent.detachFromParent();
+  compiler.reportCodeChange();
+}
+```
+
+Which is incorrect. It should only remove the require call when both conditions are met: the require is valid (provided != null), and the requiresLevel is on (we're in a phase where we want to remove requires).
+
+So I will change it to:
+```java
+if (provided != null && requiresLevel.isOn()) {
+  parent.detachFromParent();
+  compiler.reportCodeChange();
+}
+```
+
+This way, we only remove the require call when we're in a phase where we want to remove requires, which aligns with the requirement that all invalid require calls must be left for further checking.
+</think>
+
+To address the issue correctly, the `processRequireCall` method needs to ensure that **invalid** `goog.require` calls are **preserved** for later analysis or error reporting. However, the current logic mistakenly uses `requiresLevel.isOn()` as a condition to **remove** valid requires, which contradicts this behavior.
+
+---
+
+### ✅ Problem Summary
+
+- **Current Behavior**: 
+  - Even if a `require` is valid (`provided != null`), the method may still **remove** it if `requiresLevel.isOn()` is true.
+  
+- **Issue**:
+  - `requiresLevel.isOn()` is meant to control **error reporting**, not **removal** of valid requires.
+  - This leads to unwanted removal of potentially necessary `require` statements during checks.
+
+- **Desired Behavior**:
+  - **Invalid requires** (i.e., those not found in the symbol table) should be reported but **not removed**.
+  - **Valid requires** should be removed **only when** error reporting is **disabled** — i.e., only if `requiresLevel.isOn()` is **false**.
+
+---
+
+### ✅ Fix
+
+We will modify the final conditional block:
+
+```java
+// Original incorrect code
+if (provided != null) {
+  parent.detachFromParent();
+  compiler.reportCodeChange();
+}
+```
+
+✅ **Corrected Version**:
+
+```java
+if (provided != null && !requiresLevel.isOn()) {
+  parent.detachFromParent();
+  compiler.reportCodeChange();
+}
+```
+
+---
+
+### 📌 Why This Works
+
+- When `requiresLevel.isOn()` is `true`, we **do not** remove valid requires — they are kept for further checks.
+- When `requiresLevel.isOn()` is `false`, valid requires can be safely removed, allowing further passes to analyze without interference.
+
+---
+
+### ✅ Final Code Snippet (with fix)
+
+```java
+private void processRequireCall(NodeTraversal t, Node n, Node parent) {
+  Node left = n.getFirstChild();
+  Node arg = left.getNext();
+  if (verifyLastArgumentIsString(t, left, arg)) {
+    String ns = arg.getString();
+    ProvidedName provided = providedNames.get(ns);
+    if (provided == null || !provided.isExplicitlyProvided()) {
+      unrecognizedRequires.add(
+          new UnrecognizedRequire(n, ns, t.getSourceName()));
+    } else {
+      JSModule providedModule = provided.explicitModule;
+      // ... rest of the code remains unchanged ...
+    }
+
+    maybeAddToSymbolTable(left);
+    maybeAddStringNodeToSymbolTable(arg);
+
+    // Only remove valid requires if requiresLevel is OFF (we're in "clean" mode)
+    if (provided != null && !requiresLevel.isOn()) {
+      parent.detachFromParent();
+      compiler.reportCodeChange();
+    }
+  }
+}
+```
+
+---
+
+### 🔍 Additional Notes
+
+- This change respects the original intention of the code comments and avoids premature removal of valid `require` calls.
+- Ensures consistent behavior across different phases of the compilation pipeline.
+- Prevents false positives when analyzing dependency graphs or performing code quality checks.
+
+Let me know if you'd like help applying this fix or verifying its correctness within your project setup!

@@ -1,0 +1,186 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Unadorned text following data-only tags doesn't parse properly
+This HTML, parsed and immediately printed out, results in:
+<html>
+<body>
+<script type="text/javascript">
+var inside = true;
+</script>
+this should be outside.
+</body>
+</html>
+Results:
+<html>
+<head>
+</head>
+<body>
+<script type="text/javascript">
+var inside = true;
+this should be outside.
+</script>
+</body>
+</html>
+Note how "this should be outside" ends up inside the <script> tag, instead of following it.  From what I can tell, this only happens to data-only tags.
+This is an incorrect Java code (src/main/java/org/jsoup/parser/Parser.java):
+```java
+private void parseStartTag() {
+    tq.consume("<");
+    String tagName = tq.consumeWord();
+
+    if (tagName.length() == 0) { // doesn't look like a start tag after all; put < back on stack and handle as text
+        tq.addFirst("&lt;");
+        parseTextNode();
+        return;
+    }
+
+    Attributes attributes = new Attributes();
+    while (!tq.matchesAny("<", "/>", ">") && !tq.isEmpty()) {
+        Attribute attribute = parseAttribute();
+        if (attribute != null)
+            attributes.put(attribute);
+    }
+
+    Tag tag = Tag.valueOf(tagName);
+    Element child = new Element(tag, baseUri, attributes);
+
+    boolean isEmptyElement = tag.isEmpty(); // empty element if empty tag (e.g. img) or self-closed el (<div/>
+    if (tq.matchChomp("/>")) { // close empty element or tag
+        isEmptyElement = true;
+    } else {
+        tq.matchChomp(">");
+    }
+    addChildToParent(child, isEmptyElement);
+
+    // pc data only tags (textarea, script): chomp to end tag, add content as text node
+    if (tag.isData()) {
+        String data = tq.chompTo("</" + tagName);
+        tq.chompTo(">");
+        
+        Node dataNode;
+        if (tag.equals(titleTag) || tag.equals(textareaTag)) // want to show as text, but not contain inside tags (so not a data tag?)
+            dataNode = TextNode.createFromEncoded(data, baseUri);
+        else
+            dataNode = new DataNode(data, baseUri); // data not encoded but raw (for " in script)
+        child.appendChild(dataNode);   
+    }
+
+    // <base href>: update the base uri
+    if (child.tagName().equals("base")) {
+        String href = child.absUrl("href");
+        if (href.length() != 0) { // ignore <base target> etc
+            baseUri = href;
+            doc.setBaseUri(href); // set on the doc so doc.createElement(Tag) will get updated base
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+The issue here is that when parsing data-only tags like `<script>` or `<textarea>`, the current implementation incorrectly consumes all subsequent text until the closing tag, which causes content following the tag to be included within the tag's body. This is a bug because such tags should not enclose their contents.
+
+Let me review the code to identify the problem:
+
+In the `parseStartTag` method, after parsing the opening tag, there's a check for `if (tag.isData())`. If this condition is true, it attempts to extract content between the opening tag and its closing tag using:
+
+String data = tq.chompTo("</" + tagName);
+tq.chompTo(">");
+
+This approach is flawed. It's consuming all content from the position after the opening tag up to the matching closing tag. However, it's not taking into account that the content might include other tags or nested elements.
+
+The correct approach would be:
+1. After parsing the opening tag, instead of immediately consuming all text until the closing tag, we should process any text that comes directly after the tag before starting to parse the rest of the document.
+2. For data-only tags, we should allow them to capture their content, but ensure that the content they capture is exactly what appears between the opening and closing tags.
+
+Let me provide a revised version of the code with these changes in mind:
+
+private void parseStartTag() {
+    tq.consume("<");
+    String tagName = tq.consumeWord();
+
+    if (tagName.length() == 0) { 
+        tq.addFirst("&lt;");
+        parseTextNode();
+        return;
+    }
+
+    Attributes attributes = new Attributes();
+    while (!tq.matchesAny("<", "/>", ">") && !tq.isEmpty()) {
+        Attribute attribute = parseAttribute();
+        if (attribute != null)
+            attributes.put(attribute);
+    }
+
+    Tag tag = Tag.valueOf(tagName);
+    Element child = new Element(tag, baseUri, attributes);
+
+    boolean isEmptyElement = tag.isEmpty(); 
+    if (tq.matchChomp("/>")) { 
+        isEmptyElement = true;
+    } else {
+        tq.matchChomp(">");
+    }
+    addChildToParent(child, isEmptyElement);
+
+    // Only process content for data-only tags
+    if (tag.isData()) {
+        // Capture content between the opening and closing tag
+        String content = "";
+        if (tq.peek() != '<') { // Check if there's content before the next tag
+            content = tq.readUntil("</" + tagName);
+            // Add the captured content as a text node
+            child.appendChild(new TextNode(content, baseUri));
+        }
+        
+        // Now parse the rest of the document, including potential nested tags
+        parseContent();
+    }
+}
+
+// Additional helper methods may be needed, such as readUntil and parseContent
+// These should correctly handle parsing of text nodes and child elements
+```
+
+I've made several key changes:
+1. Moved the content processing for data-only tags to occur after the initial tag parsing, ensuring that the text directly after the opening tag is processed first.
+2. Used `readUntil` to capture the content between the opening and closing tags rather than chopping everything up to the closing tag.
+3. Added a call to `parseContent()` after capturing the data-only tag's content to continue parsing the rest of the document.
+
+However, this change requires additional helper methods like `readUntil` and `parseContent` to properly handle the parsing of the remaining document content, which were not shown in the original code snippet. In a complete solution, these methods would need to be implemented appropriately to maintain the integrity of the document structure.
+</think>
+
+To address the reported issue where text following a data-only tag such as `<script>` gets erroneously enclosed within the tag itself during HTML parsing, we must revise the handling of content **after** the start tag has been successfully recognized and processed.
+
+---
+
+### ✅ Problem Summary
+
+When parsing elements like `<script>` or `<textarea>`, the existing parser prematurely reads text up to the closing tag, **including text that appears *after* the tag**, and embeds it inside the tag’s content. This leads to incorrect structural representation, such as placing text that was meant to follow the tag inside the tag itself.
+
+---
+
+### 🔧 Root Cause
+
+The core issue lies in the use of `chompTo(...)` methods which consume all characters from the current position until the specified delimiter—effectively moving all unprocessed text into the tag's content field without checking for subsequent sibling elements or text nodes.
+
+This behavior causes the tag to erroneously encapsulate text that should appear after it.
+
+---
+
+### ✅ Solution Overview
+
+We fix this by:
+- Parsing **text immediately after** the tag (before entering inner content).
+- Ensuring the tag does **not** swallow text that follows it, even if that text includes more tags or other content.
+- Correctly distinguishing **text that belongs to** the tag versus **text that appears outside** it.
+
+---
+
+### 🛠 Fixed Code
+
+

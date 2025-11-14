@@ -1,0 +1,176 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Incorrect handling of self-closing tags noframes, style and title cause remainder of document to be html-escaped
+Given the input:
+<html>
+<head>
+	<style />   <!-- < - - this is the culprit -->
+</head>
+<body>
+	<p>Whatever</p>
+</body>
+</html>
+JSoup 1.8.2 and also http://try.jsoup.org/~lJwWpjXYUSTBeBZhdEnS3Mt56g4 will produce:
+    <html>
+     <head> 
+      <style></style>
+     </head>
+     <body>
+       &lt;/head&gt; &lt;body&gt; &lt;p&gt;Whatever&lt;/p&gt; &lt;/body&gt; &lt;/html&gt;
+     </body>
+    </html>
+With <title/> instead of <style/>, the result is different but still wrong (http://try.jsoup.org/~BZ3uoMki-r904fZxUOWJgLJO7r8 ):
+<html>
+ <head> 
+  <title></title>
+ </head>
+ <body>
+   &lt;/head&gt;  
+  <p>Whatever</p>  
+ </body>
+</html>
+That weirdness was fixed for <script> with Issue #305: http://try.jsoup.org/~3Ms6TQCrrdaA_uPgxgURYYvwFAg
+<html>
+ <head> 
+  <script></script> 
+ </head> 
+ <body> 
+  <p>Whatever</p>  
+ </body>
+</html>
+Looking at the source, it seems only the HtmlTreeBuilderState handling for <noframes>, <style> and <title> in the methods handleRawText and handleRcData doesn't get along with the self-closing tags.
+Any other tagname I've checked (and I tried to cover all branches of that case StartTag switch) results in a good parse similar to the <script> case, which is what I'd expect.
+Thanks for looking into this!
+This is an incorrect Java code (src/main/java/org/jsoup/parser/HtmlTreeBuilderState.java):
+```java
+private static void handleRawtext(Token.StartTag startTag, HtmlTreeBuilder tb) {
+    tb.insert(startTag);
+    tb.tokeniser.transition(TokeniserState.Rawtext);
+    tb.markInsertionMode();
+    tb.transition(Text);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+private static void handleRawtext(Token.StartTag startTag, HtmlTreeBuilder tb) {
+    // Check if the tag is self-closing
+    boolean isSelfClosing = startTag.isSelfClosing();
+
+    // For certain tags like <style>, <title>, and <noframes>,
+    // we need special handling when they're self-closed.
+    if ("style".equals(startTag.tagName) || "title".equals(startTag.tagName) || "noframes".equals(startTag.tagName)) {
+        if (isSelfClosing) {
+            // If the tag is self-closed, just insert it as is
+            tb.insert(startTag);
+            return;
+        } else {
+            // Otherwise, create an empty element and insert it
+            Token.StartTag newStartTag = new Token.StartTag(startTag.tagName, Collections.emptyList(), false, startTag.attributes, null);
+            tb.insert(newStartTag);
+        }
+    } else {
+        // For other tags, proceed normally
+        tb.insert(startTag);
+    }
+
+    tb.tokeniser.transition(TokeniserState.Rawtext);
+    tb.markInsertionMode();
+    tb.transition(Text);
+}
+```
+
+I think there's a missing piece here. The issue appears to stem from how JSoup handles self-closing tags within specific contexts (like raw text). Let me refine the solution:
+
+```java
+private static void handleRawtext(Token.StartTag startTag, HtmlTreeBuilder tb) {
+    // Check if the tag is self-closing
+    boolean isSelfClosing = startTag.isSelfClosing();
+
+    // Special handling for certain tags in raw text context
+    if ((startTag.tagName.equalsIgnoreCase("style") || startTag.tagName.equalsIgnoreCase("title") || 
+         startTag.tagName.equalsIgnoreCase("noframes")) && isSelfClosing) {
+
+        // Self-closing versions of these tags should be handled specially
+        // Create an empty element and insert it without processing further content
+        Token.StartTag newStartTag = new Token.StartTag(startTag.tagName, Collections.emptyList(), false, startTag.attributes, null);
+        tb.insert(newStartTag);
+
+    } else {
+        // Default handling: insert the tag and transition to text mode
+        tb.insert(startTag);
+    }
+
+    tb.tokeniser.transition(TokeniserState.Rawtext);
+    tb.markInsertionMode();
+    tb.transition(Text);
+}
+```
+
+Let me examine the issue again more carefully.
+
+The problem occurs because JSoup incorrectly processes self-closing tags for certain elements (like `<style />`, `<title />` and `<noframes />`) in specific contexts, causing subsequent HTML to be improperly escaped.
+
+When parsing these types of tags, JSoup shouldn't attempt to process their contents or escape them. Instead, it should simply treat them as normal tags with an empty body.
+
+After reviewing the logic, I believe the key issue is how JSoup handles self-closing tags inside certain contexts (like raw text), particularly for specific tags like `<style>`, `<title>` and `<noframes>`.
+
+Here's my recommended fix:
+
+```java
+private static void handleRawtext(Token.StartTag startTag, HtmlTreeBuilder tb) {
+    // Handle special cases for self-closing tags in raw text context
+    if ((startTag.tagName.equals("style") || startTag.tagName.equals("title") ||
+         startTag.tagName.equals("noframes")) && startTag.isSelfClosing()) {
+        
+        // For self-closing version of these tags, just insert as a regular element
+        Token.StartTag newStartTag = new Token.StartTag(
+            startTag.tagName,
+            startTag.attributes,
+            false, // not self-closing
+            Collections.emptyList(), // no children
+            null // no end tag
+        );
+        tb.insert(newStartTag);
+        return;
+    }
+
+    // Regular handling for other tags
+    tb.insert(startTag);
+    
+    tb.tokeniser.transition(TokeniserState.Rawtext);
+    tb.markInsertionMode();
+    tb.transition(Text);
+}
+```
+
+I'll provide one last refinement based on careful analysis of the original issue.
+
+```java
+private static void handleRawtext(Token.StartTag startTag, HtmlTreeBuilder tb) {
+    // Special handling for certain self-closing tags in raw text context
+    String tagName = startTag.tagName.toLowerCase(Locale.ENGLISH);
+    boolean isSpecialSelfClose = tagName.equals("style") || tagName.equals("title") || tagName.equals("noframes");
+    boolean isSelfClosing = startTag.isSelfClosing();
+
+    if (isSpecialSelfClose && isSelfClosing) {
+        // For these tags, just insert as a normal tag with no content
+        Token.StartTag newStartTag = new Token.StartTag(tagName, startTag.attributes, false, Collections.emptyList(), null);
+        tb.insert(newStartTag);
+        return;
+    }
+
+    // Default behavior: insert the tag and transition to text mode
+    tb.insert(startTag);
+    
+    tb.tokeniser.transition(TokeniserState.Rawtext);
+    tb.markInsertionMode();
+    tb.transition(Text);
+}
+```
+
+After careful consideration,

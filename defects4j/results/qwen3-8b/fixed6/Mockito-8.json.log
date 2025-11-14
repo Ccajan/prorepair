@@ -1,0 +1,174 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# 1.10 regression (StackOverflowError) with interface where generic type has itself as upper bound
+Add this to GenericMetadataSupportTest:
+    interface GenericsSelfReference<T extends GenericsSelfReference<T>> {
+        T self();
+    }
+
+    @Test
+    public void typeVariable_of_self_type() {
+        GenericMetadataSupport genericMetadata = inferFrom(GenericsSelfReference.class).resolveGenericReturnType(firstNamedMethod("self", GenericsSelfReference.class));
+
+        assertThat(genericMetadata.rawType()).isEqualTo(GenericsSelfReference.class);
+    }
+It fails on master and 1.10.8 with this:
+java.lang.StackOverflowError
+    at sun.reflect.generics.reflectiveObjects.TypeVariableImpl.hashCode(TypeVariableImpl.java:201)
+    at java.util.HashMap.hash(HashMap.java:338)
+    at java.util.HashMap.get(HashMap.java:556)
+    at org.mockito.internal.util.reflection.GenericMetadataSupport.getActualTypeArgumentFor(GenericMetadataSupport.java:193)
+    at org.mockito.internal.util.reflection.GenericMetadataSupport.getActualTypeArgumentFor(GenericMetadataSupport.java:196)
+    at org.mockito.internal.util.reflection.GenericMetadataSupport.getActualTypeArgumentFor(GenericMetadataSupport.java:196)
+
+It worked on 1.9.5. May be caused by the changes in ab9e9f3 (cc @bric3).
+(Also note that while the above interface looks strange, it is commonly used for builder hierarchies, where base class methods want to return this with a more specific type.)
+This is an incorrect Java code (src/org/mockito/internal/util/reflection/GenericMetadataSupport.java):
+```java
+protected void registerTypeVariablesOn(Type classType) {
+    if (!(classType instanceof ParameterizedType)) {
+        return;
+    }
+    ParameterizedType parameterizedType = (ParameterizedType) classType;
+    TypeVariable[] typeParameters = ((Class<?>) parameterizedType.getRawType()).getTypeParameters();
+    Type[] actualTypeArguments = parameterizedType.getActualTypeArguments();
+    for (int i = 0; i < actualTypeArguments.length; i++) {
+        TypeVariable typeParameter = typeParameters[i];
+        Type actualTypeArgument = actualTypeArguments[i];
+
+        if (actualTypeArgument instanceof WildcardType) {
+            contextualActualTypeParameters.put(typeParameter, boundsOf((WildcardType) actualTypeArgument));
+        } else {
+            contextualActualTypeParameters.put(typeParameter, actualTypeArgument);
+        }
+        // logger.log("For '" + parameterizedType + "' found type variable : { '" + typeParameter + "(" + System.identityHashCode(typeParameter) + ")" + "' : '" + actualTypeArgument + "(" + System.identityHashCode(typeParameter) + ")" + "' }");
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+To fix the issue causing `StackOverflowError` when dealing with a generic interface that has self-referential bounds like:
+
+```java
+interface GenericsSelfReference<T extends GenericsSelfReference<T>> {
+    T self();
+}
+```
+
+We need to analyze the **root cause** of the error and then make a targeted correction.
+
+---
+
+## 🔍 Root Cause Analysis
+
+The StackOverflowError arises because Mockito's internal reflection mechanism (`GenericMetadataSupport`) tries to resolve or store type parameters recursively in such a way that leads to infinite recursion when handling a circular reference like `T extends GenericsSelfReference<T>`.
+
+In particular, Mockito uses a `Map<TypeVariable, Type>` to cache resolved types for each type variable. But in the case of recursive generics, it can get stuck in an infinite loop while trying to look up or compute type arguments due to repeated references to the same type variables.
+
+Here’s a breakdown of what happens:
+
+- The method `registerTypeVariablesOn(...)` tries to collect and map all the type parameters.
+- For interfaces like `GenericsSelfReference`, the type variable `T` depends on the same interface.
+- Mockito attempts to resolve this using its `getActualTypeArgumentFor(...)`, which calls back into itself.
+- This results in an infinite loop during type resolution, eventually causing a `StackOverflowError`.
+
+---
+
+## ✅ Solution
+
+### Step-by-step Fix
+
+The root problem lies in how `GenericMetadataSupport` resolves type arguments recursively in situations with self-reference bounds. To fix this, we need to modify the logic so that it correctly handles such cases without entering an infinite loop.
+
+Below is a **corrected version** of the problematic method:
+
+```java
+protected void registerTypeVariablesOn(Type classType) {
+    if (!(classType instanceof ParameterizedType)) {
+        return;
+    }
+
+    ParameterizedType parameterizedType = (ParameterizedType) classType;
+    Class<?> rawType = (Class<?>) parameterizedType.getRawType();
+
+    if (!rawType.getTypeParameters().length > 0) {
+        return;
+    }
+
+    TypeVariable<?>[] typeParameters = rawType.getTypeParameters();
+    Type[] actualTypeArguments = parameterizedType.getActualTypeArguments();
+
+    Set<TypeVariable<?>> visited = new HashSet<>();
+    
+    Map<TypeVariable<?>, Type> resolvedTypes = new HashMap<>();
+
+    for (int i = 0; i < typeParameters.length; i++) {
+        TypeVariable<?> typeParam = typeParameters[i];
+        Type actualArg = actualTypeArguments[i];
+
+        if (visited.contains(typeParam)) {
+            continue;
+        }
+
+        visited.add(typeParam);
+
+        // Handle wildcard types
+        if (actualArg instanceof WildcardType) {
+            resolvedTypes.put(typeParam, boundsOf((WildcardType) actualArg));
+        } else if (actualArg instanceof TypeVariable<?>) {
+            // Avoid infinite loops when typeArg is another type variable
+            // We use a set to track already processed type variables
+            if (visited.contains(actualArg)) {
+                resolvedTypes.put(typeParam, actualArg);
+            } else {
+                resolvedTypes.put(typeParam, resolveRecursively(actualArg, visited));
+            }
+        } else {
+            resolvedTypes.put(typeParam, actualArg);
+        }
+    }
+
+    contextualActualTypeParameters.putAll(resolvedTypes);
+}
+
+private <T extends Type> T resolveRecursively(T type, Set<TypeVariable<?>> visited) {
+    if (type instanceof TypeVariable<?>) {
+        TypeVariable<?> tVar = (TypeVariable<?>) type;
+
+        if (visited.contains(tVar)) {
+            return tVar;
+        }
+
+        visited.add(tVar);
+
+        if (tVar.getBounds().length == 0) {
+            return tVar;
+        }
+
+        for (Type bound : tVar.getBounds()) {
+            if (bound instanceof TypeVariable<?>) {
+                resolveRecursively((TypeVariable<?>) bound, visited);
+            }
+        }
+
+        return tVar;
+    }
+
+    return type;
+}
+```
+
+---
+
+## 📌 Summary
+
+This approach introduces a safe recursive resolution mechanism with a `Set` of visited type variables to avoid infinite cycles. It also includes checks for both wildcards and other type variables, ensuring correct behavior even in complex, self-referential type scenarios like `T extends GenericsSelfReference<T>`.
+
+By implementing this change, the `StackOverflowError` should be resolved, and the test case should pass as expected in both older and newer versions of Mockito.

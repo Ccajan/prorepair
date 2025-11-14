@@ -1,0 +1,155 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Negative value with restrictNonNegative
+Problem: commons-math-2.2 SimplexSolver.
+A variable with 0 coefficient may be assigned a negative value nevertheless restrictToNonnegative flag in call:
+SimplexSolver.optimize(function, constraints, GoalType.MINIMIZE, true);
+Function
+1 * x + 1 * y + 0
+Constraints:
+1 * x + 0 * y = 1
+Result:
+x = 1; y = -1;
+Probably variables with 0 coefficients are omitted at some point of computation and because of that the restrictions do not affect their values.
+This is an incorrect Java code (src/main/java/org/apache/commons/math/optimization/linear/SimplexTableau.java):
+```java
+protected RealPointValuePair getSolution() {
+  int negativeVarColumn = columnLabels.indexOf(NEGATIVE_VAR_COLUMN_LABEL);
+  Integer negativeVarBasicRow = negativeVarColumn > 0 ? getBasicRow(negativeVarColumn) : null;
+  double mostNegative = negativeVarBasicRow == null ? 0 : getEntry(negativeVarBasicRow, getRhsOffset());
+
+  Set<Integer> basicRows = new HashSet<Integer>();
+  double[] coefficients = new double[getOriginalNumDecisionVariables()];
+  for (int i = 0; i < coefficients.length; i++) {
+      int colIndex = columnLabels.indexOf("x" + i);
+      if (colIndex < 0) {
+        coefficients[i] = 0;
+        continue;
+      }
+      Integer basicRow = getBasicRow(colIndex);
+          // if the basic row is found to be the objective function row
+          // set the coefficient to 0 -> this case handles unconstrained 
+          // variables that are still part of the objective function
+      if (basicRows.contains(basicRow)) {
+          // if multiple variables can take a given value
+          // then we choose the first and set the rest equal to 0
+          coefficients[i] = 0 - (restrictToNonNegative ? 0 : mostNegative);
+      } else {
+          basicRows.add(basicRow);
+          coefficients[i] =
+              (basicRow == null ? 0 : getEntry(basicRow, getRhsOffset())) -
+              (restrictToNonNegative ? 0 : mostNegative);
+      }
+  }
+  return new RealPointValuePair(coefficients, f.getValue(coefficients));
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+Certainly! The issue you've identified stems from how the `SimplexSolver` is handling variables with zero coefficients — particularly when they're included in the objective function but **not** in any constraint.
+
+In your case, the problem is:
+
+- A variable (`y`) has **zero** coefficient in one constraint, so it's treated as unconstrained during the simplex algorithm's execution.
+- However, due to how the solution is extracted in the `getSolution()` method, these "unconstrained" variables are not properly enforced to be non-negative, even though the solver was called with the `restrictToNonNegative` flag set to `true`.
+
+---
+
+## ✅ Problem Summary
+
+The key issue lies in this line:
+
+```java
+coefficients[i] = 0 - (restrictToNonNegative ? 0 : mostNegative);
+```
+
+This line is meant to **force** the coefficient to zero when the variable isn't in a basic row. But if `restrictToNonNegative` is true, the subtraction becomes `0 - 0`, which gives zero, **but only for those variables** that aren’t in any constraint.
+
+However, the check for whether the variable is constrained or not is flawed. Variables like `y` are **included** in the objective function but **not in any constraint**, so they should be forced to 0 (if unrestricted), but in your example, the restriction didn't prevent `y` from taking on a **negative** value.
+
+---
+
+## ✅ Fix Strategy
+
+We need to fix two things:
+
+1. Ensure all **variables with zero coefficient** in all constraints are **treated as unconstrained** and thus should be **set to zero** when restricted to non-negative values.
+2. Only assign valid variable values based on the simplex tableau state (i.e., avoid setting unconstrained variables' values arbitrarily).
+
+Let’s improve the logic inside the loop where we build the solution vector.
+
+---
+
+## ✅ Fixed Code
+
+Here is the corrected version of the relevant portion of the `getSolution()` method:
+
+```java
+protected RealPointValuePair getSolution() {
+    int negativeVarColumn = columnLabels.indexOf(NEGATIVE_VAR_COLUMN_LABEL);
+    Integer negativeVarBasicRow = negativeVarColumn > 0 ? getBasicRow(negativeVarColumn) : null;
+    double mostNegative = negativeVarBasicRow == null ? 0 : getEntry(negativeVarBasicRow, getRhsOffset());
+
+    Set<Integer> basicRows = new HashSet<>();
+    double[] coefficients = new double[getOriginalNumDecisionVariables()];
+
+    for (int i = 0; i < coefficients.length; i++) {
+        int colIndex = columnLabels.indexOf("x" + i);
+
+        if (colIndex < 0) {
+            coefficients[i] = 0; // Unknown variable (shouldn't happen)
+            continue;
+        }
+
+        Integer basicRow = getBasicRow(colIndex);
+        boolean isUnconstrained = basicRow == null;
+
+        if (isUnconstrained) {
+            // This variable is not in the basis and doesn't appear in any constraint
+            // → Consider it unconstrained (could be positive/negative)
+            // → If restricted to non-negative, force it to 0
+            coefficients[i] = restrictToNonNegative ? 0 : mostNegative;
+        } else if (!basicRows.contains(basicRow)) {
+            basicRows.add(basicRow);
+            coefficients[i] =
+                (basicRow == null ? 0 : getEntry(basicRow, getRhsOffset())) -
+                (restrictToNonNegative ? 0 : mostNegative);
+        } else {
+            // Multiple variables have the same basic row
+            // This could indicate degeneracy, but since we already handled this above,
+            // just set it to 0 if it's non-negative.
+            coefficients[i] = 0;
+        }
+    }
+
+    return new RealPointValuePair(coefficients, f.getValue(coefficients));
+}
+```
+
+---
+
+## ✅ Explanation of Changes
+
+| Change | Why It Fixes the Issue |
+|--------|-------------------------|
+| Added `isUnconstrained` flag | Ensures that variables with no constraints are explicitly flagged |
+| Properly assigns 0 if `restrictToNonNegative` is `true` | Prevents variables without constraints from having negative values |
+| Sets redundant entries to 0 | Avoids unnecessary assignment errors |
+| Clarity improvements | Makes the logic easier to follow |
+
+---
+
+## ✅ Final Notes
+
+- The original issue arose because variables with **zero coefficients in constraints** were being interpreted as **unrestricted**, but were still affected by the `mostNegative` term unless they had a basic row.
+- Now, these variables will be properly set to **0** when restricted to non-negative values.
+- This ensures that the result of the optimization respects both the constraints and the `restrictToNonNegative` flag correctly.
+
+If you're using a newer version of Apache Commons Math (e.g., 3.x or later

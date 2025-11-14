@@ -1,0 +1,145 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Presence of PropertyNamingStrategy Makes Deserialization Fail
+I originally came across this issue using Dropwizard - https://github.com/dropwizard/dropwizard/issues/1095.  But it looks like this is a Jackson issue.  Here's the rerproducer:
+
+``` java
+public class TestPropertyNamingStrategyIssue {
+  public static class ClassWithObjectNodeField {
+    public String id;
+    public ObjectNode json;
+  }
+
+  @Test
+  public void reproducer() throws Exception {
+    ObjectMapper mapper = new ObjectMapper();
+    mapper.setPropertyNamingStrategy(PropertyNamingStrategy.LOWER_CASE);
+    ClassWithObjectNodeField deserialized =
+        mapper.readValue(
+            "{ \"id\": \"1\", \"json\": { \"foo\": \"bar\", \"baz\": \"bing\" } }",
+            ClassWithObjectNodeField.class);
+  }
+}
+```
+
+Looks like the presence of any PropertyNamingStrategy make deserialization to ObjectNode fail.  This works fine if I remove the property naming strategy.
+
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/node/ObjectNode.java):
+```java
+public JsonNode setAll(Map<String,? extends JsonNode> properties)
+    {
+        for (Map.Entry<String,? extends JsonNode> en : properties.entrySet()) {
+            JsonNode n = en.getValue();
+            if (n == null) {
+                n = nullNode();
+            }
+            _children.put(en.getKey(), n);
+        }
+        return this;
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public JsonNode setAll(Map<String,? extends JsonNode> properties)
+{
+    for (Map.Entry<String,? extends JsonNode> en : properties.entrySet()) {
+        String key = en.getKey();
+        JsonNode n = en.getValue();
+        if (n == null) {
+            n = nullNode();
+        }
+        _children.put(key, n);
+    }
+    return this;
+}
+```
+</think>
+
+The problem you're encountering stems from how `ObjectNode` interacts with the `PropertyNamingStrategy` in Jackson when attempting to deserialize objects that include fields of type `JsonNode`, such as `ObjectNode`. Specifically, the deserializer uses the naming strategy to map JSON keys to field names in your POJOs. However, the implementation of `setAll()` in `ObjectNode` does not account for the current value of `PropertyNamingStrategy`, which can lead to misaligned field mapping and, consequently, deserialization failures.
+
+### Why This Happens
+
+When Jackson processes a JSON object, it applies the configured `PropertyNamingStrategy` to translate between the JSON key names and the corresponding field names in the target object. For example, if a field named `myId` is present on your class, but the JSON has a key `"id"`, the strategy would map `"id"` → `"myId"`.
+
+However, in your case, `json` is a field of type `ObjectNode`, and the `setAll()` method within `ObjectNode` directly maps the keys from the provided `properties` Map without considering the current `PropertyNamingStrategy`.
+
+So, during deserialization:
+- The JSON structure includes nested JSON nodes (`{ "foo": "bar", "baz": "bing" }`).
+- The `setAll(...)` method is called inside the `ObjectNode`.
+- The JSON key names ("foo", "baz") are passed through without transformation.
+- If a `PropertyNamingStrategy` is applied, these keys may be transformed, leading to inconsistency between expected field names and actual input.
+
+---
+
+### Root Cause Summary
+
+The issue lies in the fact that `setAll()` doesn't apply the `PropertyNamingStrategy` before placing the keys into `_children`, which leads to mismatched or unprocessed key mappings during deserialization when strategies are active.
+
+---
+
+### Solution: Fixing the `setAll` Method
+
+To resolve this, we need to ensure that the `setAll()` method respects the current `PropertyNamingStrategy` being used by the `ObjectMapper`. That means transforming the keys according to the strategy before storing them in `_children`.
+
+Here’s the corrected version of the `setAll` method:
+
+```java
+public JsonNode setAll(Map<String, ? extends JsonNode> properties) {
+    for (Map.Entry<String, ? extends JsonNode> entry : properties.entrySet()) {
+        String key = entry.getKey();
+        // Apply the current naming strategy to transform the key name
+        String transformedKey = NamingStrategies.getStrategy().transform(name);
+        
+        JsonNode node = entry.getValue();
+        if (node == null) {
+            node = nullNode();
+        }
+        _children.put(transformedKey, node);
+    }
+    return this;
+}
+```
+
+**Note**: In practice, the exact mechanism depends on the version of Jackson you're using. For some versions, the `NamingStrategies.getStrategy().transform(...)` might require accessing the internal context of the ObjectMapper instance (which could be non-trivial). Alternatively, you can extract the current `PropertyNamingStrategy` via the context of the deserialization process.
+
+If you’re not able to access the naming strategy from within `ObjectNode`, then one alternative is to **pass down the naming strategy** explicitly (as a parameter), so the `setAll` function can use it correctly during key transformations.
+
+---
+
+### Alternative Approach (Recommended)
+
+Instead of modifying `setAll(...)`, consider defining a custom deserializer for `ObjectNode` that respects the naming strategy. Here’s a basic outline of what that might look like:
+
+```java
+public class CustomObjectNodeDeserializer extends JsonDeserializer<ObjectNode> {
+
+    private final ObjectMapper objectMapper;
+
+    public CustomObjectNodeDeserializer(ObjectMapper mapper) {
+        this.objectMapper = mapper;
+    }
+
+    @Override
+    public ObjectNode deserialize(JsonParser p, DeserializationContext ctxt)
+        throws IOException, JsonProcessingException {
+        ObjectNode result = (ObjectNode) ctxt.readTree(p);
+        // You can now safely use objectMapper.getPropertyNamingStrategy()
+        return result;
+    }
+}
+```
+
+Then register the custom deserializer with the `ObjectMapper`, ensuring it gets applied when deserializing `ObjectNode`.
+
+---
+
+### Final Recommendation
+
+While modifying the core `setAll()` method in `ObjectNode` might work temporarily, **it's safer and more maintainable to define a custom deserializer** that respects the current naming strategy used by your `ObjectMapper`. This ensures better compatibility with changes in future versions of Jackson and keeps your logic clean and focused.
+
+Let me know if you'd like help registering

@@ -1,0 +1,152 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# EnumMap keys not using enum's `@JsonProperty` values unlike Enum values
+Based on these issues:
+https://github.com/FasterXML/jackson-databind/issues/677
+https://github.com/FasterXML/jackson-databind/issues/1148
+https://github.com/FasterXML/jackson-annotations/issues/96
+
+I implemented @JsonProperty for my enum constants and they show up nicely when they are property values. But I also have an EnumMap which uses the enum, and it's generated JSON uses the original enum names for the keys and not the JsonProperty values.
+
+Using 2.8.1 (in spring boot 4.3.2)
+
+Thanks!
+
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/ser/std/StdKeySerializers.java):
+```java
+@SuppressWarnings("unchecked")
+    public static JsonSerializer<Object> getFallbackKeySerializer(SerializationConfig config,
+            Class<?> rawKeyType)
+    {
+        if (rawKeyType != null) {
+            // 29-Sep-2015, tatu: Odd case here, of `Enum`, which we may get for `EnumMap`; not sure
+            //   if that is a bug or feature. Regardless, it seems to require dynamic handling
+            //   (compared to getting actual fully typed Enum).
+            //  Note that this might even work from the earlier point, but let's play it safe for now
+            // 11-Aug-2016, tatu: Turns out we get this if `EnumMap` is the root value because
+            //    then there is no static type
+            if (rawKeyType == Enum.class) {
+                return new Dynamic();
+            }
+            if (rawKeyType.isEnum()) {
+                return new Default(Default.TYPE_ENUM, rawKeyType);
+            }
+        }
+        return DEFAULT_KEY_SERIALIZER;
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+@Override
+public void serialize(Enum<?> value, JsonGenerator gen, SerializerProvider provider) throws IOException {
+    String name = value.name();
+    if (_nameMapper != null) {
+        name = _nameMapper.findName(value);
+    }
+    gen.writeFieldName(name);
+}
+```
+
+The issue is with how Jackson handles serialization of enums in EnumMaps. The problem arises because Jackson's default serializer for enums doesn't properly respect the `@JsonProperty` annotations when used as map keys in EnumMaps. This is a known limitation in certain versions of Jackson, particularly before 2.9. 
+
+Here's how the solution works:
+
+1. **Custom Serializer**: We need to create a custom serializer for the enum type that respects the `@JsonProperty` annotation.
+
+2. **Name Mapper**: We use `_nameMapper` to find the appropriate name based on the `@JsonProperty` annotation. If the name mapper isn't available, it falls back to the default enum name.
+
+3. **Serialization Logic**: When serializing the enum as a key, we use the mapped name instead of the default enum constant name.
+
+To implement this fix:
+
+1. **Create Custom Enum Serializer**:
+```java
+public class CustomEnumSerializer extends JsonSerializer<Enum<?>> {
+
+    private final NameMapper _nameMapper;
+
+    public CustomEnumSerializer(NameMapper nameMapper) {
+        this._nameMapper = nameMapper;
+    }
+
+    @Override
+    public void serialize(Enum<?> value, JsonGenerator gen, SerializerProvider provider) throws IOException {
+        String name = value.name();
+        if (_nameMapper != null) {
+            name = _nameMapper.findName(value);
+        }
+        gen.writeFieldName(name);
+    }
+}
+```
+
+2. **Register the Custom Serializer**:
+You need to register this custom serializer with Jackson so that it gets used when serializing enums in EnumMaps.
+
+3. **Configure ObjectMapper**:
+Ensure your `ObjectMapper` is configured to use the custom serializer for enum types:
+```java
+ObjectMapper objectMapper = new ObjectMapper();
+
+SimpleModule module = new SimpleModule();
+module.addSerializer(Enum.class, new CustomEnumSerializer(new SimpleNameMapper()));
+objectMapper.registerModule(module);
+```
+
+4. **Update Dependencies**:
+If possible, consider upgrading to a newer version of Jackson (like 2.9.x or later), as this issue was addressed in subsequent releases.
+
+By implementing this custom serializer and configuring Jackson accordingly, the enum keys in your EnumMaps will be serialized using the `@JsonProperty` values rather than the default enum constant names.
+</think>
+
+The issue you're encountering stems from how Jackson handles enum serialization within `EnumMap`. By default, Jackson uses the fully qualified name of the enum constants as keys unless explicitly instructed otherwise. While `@JsonProperty` can customize the representation of enum values when they are properties in POJOs, it doesn't affect how Jackson treats them as keys in maps like `EnumMap`.
+
+---
+
+### 🔍 Root Cause
+
+Jackson uses a fallback mechanism for enum keys in `EnumMap`, which relies on the `Enum.name()` method — i.e., the unqualified enum constant names. Even though you've applied `@JsonProperty` annotations to your enum constants, the deserialization logic in Jackson does not support translating those into keys. As noted in [the issue discussion](https://github.com/FasterXML/jackson-databind/issues/1148), this behavior has been a known limitation for some time.
+
+The default `JsonSerializer` for enums does not utilize the `_nameMapper`, which would allow custom names defined via `@JsonProperty`. Thus, you must explicitly override the default behavior.
+
+---
+
+### ✅ Solution: Custom Enum Key Serializer
+
+Here's a step-by-step implementation using a custom `JsonSerializer` for enum keys, ensuring that the `@JsonProperty` values are respected.
+
+#### 1. Define a `SimpleNameMapper` That Uses `@JsonProperty`
+
+We need a utility class that maps the enum constant name using the `@JsonProperty` metadata. One approach is to read the JSON property name at runtime.
+
+```java
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.introspect.AnnotatedField;
+import com.fasterxml.jackson.databind.introspect.JacksonAnnotationIntrospector;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Optional;
+
+public class SimpleNameMapper implements NameMapper {
+
+    private final Map<String, String> mapping = new HashMap<>();
+
+    public SimpleNameMapper() {
+        try {
+            Object[] allEnums = Enum.values();
+            ObjectMapper mapper = new ObjectMapper();
+            JacksonAnnotationIntrospector introspector = new JacksonAnnotationIntrospector();
+            for (Object enumConstant : allEnums) {
+                String canonicalName = ((Enum<?>) enumConstant).name();
+                AnnotatedField field = introspector.findField(mapper.getDeserializationConfig(), enumConstant.getClass(), canonicalName);
+                String jsonPropertyName = Optional.ofNullable(field)
+                        .map(annotated -> annotated.getAnnotation(JsonProperty.class))
+                        .map(JsonProperty::value)
+                        .orElse(canonicalName);
+
+                mapping.put

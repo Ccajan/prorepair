@@ -1,0 +1,200 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# StringEscapeUtils.escapeXML() can't process UTF-16 supplementary characters
+Supplementary characters in UTF-16 are those whose code points are above 0xffff, that is, require more than 1 Java char to be encoded, as explained here: http://java.sun.com/developer/technicalArticles/Intl/Supplementary/
+Currently, StringEscapeUtils.escapeXML() isn't aware of this coding scheme and treats each char as one character, which is not always right.
+A possible solution in class Entities would be:
+    public void escape(Writer writer, String str) throws IOException {
+        int len = str.length();
+        for (int i = 0; i < len; i++) {
+            int code = str.codePointAt;
+            String entityName = this.entityName(code);
+            if (entityName != null) 
+{
+                writer.write('&');
+                writer.write(entityName);
+                writer.write(';');
+            }
+ else if (code > 0x7F) 
+{
+                    writer.write("&#");
+                    writer.write(code);
+                    writer.write(';');
+            }
+ else 
+{
+                    writer.write((char) code);
+            }
+
+            if (code > 0xffff) 
+{
+                    i++;
+            }
+        }
+    }
+Besides fixing escapeXML(), this will also affect HTML escaping functions. I guess that's a good thing, but please remember I have only tested escapeXML().
+This is an incorrect Java code (src/main/java/org/apache/commons/lang3/text/translate/NumericEntityUnescaper.java):
+```java
+public int translate(CharSequence input, int index, Writer out) throws IOException {
+    // TODO: Protect from ArrayIndexOutOfBounds
+    if(input.charAt(index) == '&' && input.charAt(index + 1) == '#') {
+        int start = index + 2;
+        boolean isHex = false;
+
+        char firstChar = input.charAt(start);
+        if(firstChar == 'x' || firstChar == 'X') {
+            start++;
+            isHex = true;
+        }
+
+        int end = start;
+        while(input.charAt(end) != ';') {
+            end++;
+        }
+
+        int entityValue;
+        try {
+            if(isHex) {
+                entityValue = Integer.parseInt(input.subSequence(start, end).toString(), 16);
+            } else {
+                entityValue = Integer.parseInt(input.subSequence(start, end).toString(), 10);
+            }
+        } catch(NumberFormatException nfe) {
+            return 0;
+        }
+
+            out.write(entityValue);
+        return 2 + (end - start) + (isHex ? 1 : 0) + 1;
+    }
+    return 0;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+Certainly! Let's take a closer look at the issue with the `NumericEntityUnescaper.translate()` method provided.
+
+---
+
+### ✅ **Problem Summary**
+
+The current implementation has several issues:
+
+1. **No bounds checking** — It doesn’t verify whether `index+1` or `end` are within the `input` string’s length, leading to potential `ArrayIndexOutOfBoundsException`.
+2. **Incorrect handling of numeric entities** — The `Integer.parseInt(...)` call may fail when parsing large numbers (like Unicode codepoints over `0xFFFF`, e.g., `0x10000`), which can exceed the maximum value of an `int`.
+3. **Missing validation** — There's no check to ensure that the numeric entity actually represents a valid Unicode code point.
+4. **Inefficient logic** — It directly accesses characters via `charAt()` without considering performance on very long strings.
+5. **Incomplete error recovery** — If something goes wrong, it just returns 0, potentially skipping content instead of providing better feedback.
+
+---
+
+### ✅ **Goal**
+
+To fix these issues and make the code robust, safe, and handle all cases including supplementary characters (i.e., Unicode code points ≥ 0x10000).
+
+---
+
+## ✅ **Rewritten Correct Implementation**
+
+Here's a cleaned-up version of the `NumericEntityUnescaper.translate()` method:
+
+```java
+import java.io.IOException;
+import java.io.Writer;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class NumericEntityUnescaper {
+
+    private static final Pattern NUMERIC_ENTITY_PATTERN = Pattern.compile("&#[0-9a-fA-F]+;");
+    
+    public int translate(CharSequence input, int index, Writer out) throws IOException {
+        Matcher matcher = NUMERIC_ENTITY_PATTERN.matcher(input);
+
+        if (!matcher.find(index)) {
+            return 0;
+        }
+
+        int start = matcher.start();
+        int end = matcher.end();
+
+        // Extract the numeric part between & # ... ;
+        int numStart = start + 2; // skip "&#" 
+        int numEnd = end - 1;     // exclude ";"
+        String numStr = input.subSequence(numStart, numEnd).toString();
+
+        try {
+            // Determine if hexadecimal or decimal
+            boolean isHex = numStr.startsWith("x") || numStr.startsWith("X");
+
+            long value;
+            if (isHex) {
+                value = Long.parseLong(numStr.substring(1), 16); // Skip "x" or "X"
+            } else {
+                value = Long.parseLong(numStr, 10);
+            }
+
+            // Ensure it's a valid Unicode code point
+            if (value < 0 || value > 0x10FFFF) {
+                throw new IllegalArgumentException("Invalid Unicode code point: " + value);
+            }
+
+            // Write the character corresponding to the code point
+            out.write((char) value);
+
+            // Return how many chars were processed
+            return end - start;
+
+        } catch (NumberFormatException | IndexOutOfBoundsException e) {
+            // Invalid numeric entity, do not consume any characters
+            return 0;
+        } catch (IllegalArgumentException e) {
+            // Invalid code point, log the problem
+            System.err.println(e.getMessage());
+            return 0;
+        }
+    }
+}
+```
+
+---
+
+## ✅ **Key Improvements**
+
+| Feature                          | Description |
+|----------------------------------|-------------|
+| **Pattern Matching**            | Uses regular expressions to detect `&...;` patterns safely and efficiently. |
+| **Safe Bounds Handling**         | Ensures we don't go out-of-bounds. |
+| **Long Value Parsing**          | Parses values as `long` to avoid integer overflow with large Unicode values. |
+| **Validation of Code Points**   | Only writes valid Unicode code points (within 0–0x10FFFF). |
+| **Error Handling**              | Handles malformed inputs gracefully and logs errors. |
+
+---
+
+## ✅ **Usage Example**
+
+```java
+String input = "&#100000;";
+NumericEntityUnescaper unescaper = new NumericEntityUnescaper();
+CharSequence cs = input;
+Writer writer = new StringWriter();
+
+int consumed = unescaper.translate(cs, 0, writer);
+System.out.println(writer.toString()); // Should output: "�"
+```
+
+---
+
+## ✅ **Conclusion**
+
+By using regular expressions and proper type checking, we've made the code **more robust**, **safe**, and **future-proof** against edge cases involving Unicode supplementary characters like those in UTF-16 encoding.
+
+If you're working with XML or HTML entities in modern applications, especially ones dealing with international text, this improved logic will help prevent bugs related to incorrect character decoding.
+
+Let me know if you need similar improvements for other methods or want assistance with unit tests.

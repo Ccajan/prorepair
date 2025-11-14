@@ -1,0 +1,147 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# #148 DateTimeFormatter.parseInto broken when no year in format
+In Joda Time 2.0, the default year was set to 2000 so that Feb 29 could be parsed correctly. However, parseInto now overwrites the given instant's year with 2000 (or whatever iDefaultYear is set to). The correct behavior would seem to be to use the given instant's year instead of iDefaultYear.
+This does mean that Feb 29 might not be parseable if the instant's year is not a leap year, but in this case the caller asked for that in a sense.
+This is an incorrect Java code (src/main/java/org/joda/time/format/DateTimeFormatter.java):
+```java
+public int parseInto(ReadWritableInstant instant, String text, int position) {
+    DateTimeParser parser = requireParser();
+    if (instant == null) {
+        throw new IllegalArgumentException("Instant must not be null");
+    }
+    
+    long instantMillis = instant.getMillis();
+    Chronology chrono = instant.getChronology();
+    long instantLocal = instantMillis + chrono.getZone().getOffset(instantMillis);
+    chrono = selectChronology(chrono);
+    
+    DateTimeParserBucket bucket = new DateTimeParserBucket(
+        instantLocal, chrono, iLocale, iPivotYear, iDefaultYear);
+    int newPos = parser.parseInto(bucket, text, position);
+    instant.setMillis(bucket.computeMillis(false, text));
+    if (iOffsetParsed && bucket.getOffsetInteger() != null) {
+        int parsedOffset = bucket.getOffsetInteger();
+        DateTimeZone parsedZone = DateTimeZone.forOffsetMillis(parsedOffset);
+        chrono = chrono.withZone(parsedZone);
+    } else if (bucket.getZone() != null) {
+        chrono = chrono.withZone(bucket.getZone());
+    }
+    instant.setChronology(chrono);
+    if (iZone != null) {
+        instant.setZone(iZone);
+    }
+    return newPos;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+Yes, I can help analyze and repair the issue described in your report.
+
+### Problem Summary:
+The current implementation of `parseInto` in Joda-Time 2.0 incorrectly sets the year of the resulting `instant` to `iDefaultYear` even when the input string contains a valid year. This leads to unexpected behavior, especially around date parsing involving February 29th (leap years).
+
+---
+
+## ✅ Root Cause:
+
+The line:
+
+```java
+instant.setMillis(bucket.computeMillis(false, text));
+```
+
+is responsible for setting the final millisecond value of the `instant`, but it does **not** consider whether the input string actually contained a year. Therefore, the behavior currently overrides the original `instant`'s year with one computed from the formatter or using `iDefaultYear`.
+
+---
+
+## 🔧 Suggested Fix:
+
+We need to change how we compute the result: instead of modifying the provided `instant`, we should:
+
+1. Create a **new instance** of `ReadWritableInstant` based on the original.
+2. Only apply the new value **if the input string includes a year**, otherwise preserve the original `instant`'s year.
+
+This avoids side effects caused by directly mutating the input `instant`.
+
+Here's the corrected version of the method:
+
+```java
+public int parseInto(ReadWritableInstant instant, String text, int position) {
+    DateTimeParser parser = requireParser();
+    if (instant == null) {
+        throw new IllegalArgumentException("Instant must not be null");
+    }
+
+    // Make sure to work with a copy to avoid side effects
+    ReadWritableInstant workingInstant = new DateTimeMidnight(instant); 
+
+    long instantMillis = workingInstant.getMillis();
+    Chronology chrono = workingInstant.getChronology();
+    long instantLocal = instantMillis + chrono.getZone().getOffset(instantMillis);
+    chrono = selectChronology(chrono);
+
+    DateTimeParserBucket bucket = new DateTimeParserBucket(
+        instantLocal, chrono, iLocale, iPivotYear, iDefaultYear);
+    int newPos = parser.parseInto(bucket, text, position);
+
+    boolean hasYearInText = false;
+    for (int i = 0; i < text.length(); i++) {
+        char c = text.charAt(i);
+        if (Character.isDigit(c)) { // Check if digit (approximate check)
+            hasYearInText = true;
+            break;
+        }
+    }
+
+    if (hasYearInText) {
+        long parsedMillis = bucket.computeMillis(false, text);
+        workingInstant.setMillis(parsedMillis);
+    }
+
+    if (iOffsetParsed && bucket.getOffsetInteger() != null) {
+        int parsedOffset = bucket.getOffsetInteger();
+        DateTimeZone parsedZone = DateTimeZone.forOffsetMillis(parsedOffset);
+        chrono = chrono.withZone(parsedZone);
+    } else if (bucket.getZone() != null) {
+        chrono = chrono.withZone(bucket.getZone());
+    }
+
+    workingInstant.setChronology(chrono);
+    if (iZone != null) {
+        workingInstant.setZone(iZone);
+    }
+
+    // Return the modified instant back to the caller
+    instant.setMillis(workingInstant.getMillis());
+    instant.setChronology(workingInstant.getChronology());
+    if (iZone != null) {
+        instant.setZone(iZone);
+    }
+
+    return newPos;
+}
+```
+
+---
+
+## 📌 Notes:
+
+- We used `DateTimeMidnight` as a simple way to create a working copy. Alternatively, you can create a new `MutableDateTime` or similar object depending on your specific `ReadWritableInstant` type.
+- The logic `hasYearInText` checks for digits in the input to infer whether a year was present — note that this is **a very simplified** approach. A more robust check would involve checking whether the input matched a pattern that explicitly included the year part.
+- By preserving the original year unless a year is present in the input, we align the behavior with what users expect: only override values they've provided.
+
+---
+
+## 💡 Best Practice Recommendation:
+
+In general, methods like `parseInto()` should **avoid mutating the input objects**. Instead, they should construct and return new instances or copies to prevent unintended side effects.
+
+Would you like me to implement a complete test case or provide an alternative implementation using modern libraries like Java 8+ `java.time`?

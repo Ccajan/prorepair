@@ -1,0 +1,178 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Regression - Boolean attributes not collapsed when using HTML syntax
+Hello,
+First off, thanks for a really useful library.
+So, upgrading from 1.10.2 to 1.11.2 we see that boolean attributes are no longer collapsed when using html syntax. Example test case:
+    @Test
+    public void test() {
+        Document document = Jsoup.parse(
+                "<html><head></head><body><hr size=\"1\" noshade=\"\"></body></html>");
+        assertEquals("<html>\n" +
+                     " <head></head>\n" +
+                     " <body>\n" +
+                     "  <hr size=\"1\" noshade>\n" +
+                     " </body>\n" +
+                     "</html>",
+                     document.outerHtml());
+    }
+
+Tracked it down to commit "Refactored Attributes to be an array pair vs LinkedHashSet " ea1fb65. The Attibutes.html(final Appendable accum, final Document.OutputSettings out) method no longer uses Attribute and fails to check the value of the attribute for an empty string(line 320).
+If I may also suggest to use Attribute.shouldCollapseAttribute(String key, String val, Document.OutputSettings out) instead as a single source of truth as the boolean expression is complex enough and easy to make a mistake. Not sure if this would have an impact in performance though but I am guessing that optimizer will inline the call at some point anyways?
+This is an incorrect Java code (src/main/java/org/jsoup/nodes/Attributes.java):
+```java
+final void html(final Appendable accum, final Document.OutputSettings out) throws IOException {
+    final int sz = size;
+    for (int i = 0; i < sz; i++) {
+        // inlined from Attribute.html()
+        final String key = keys[i];
+        final String val = vals[i];
+        accum.append(' ').append(key);
+
+        // collapse checked=null, checked="", checked=checked; write out others
+        if (!(out.syntax() == Document.OutputSettings.Syntax.html
+            && (val == null || val.equals(key) && Attribute.isBooleanAttribute(key)))) {
+            accum.append("=\"");
+            Entities.escape(accum, val == null ? EmptyString : val, out, true, false, false);
+            accum.append('"');
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public class Attributes {
+    private final String[] keys;
+    private final String[] vals;
+
+    // ... other methods ...
+
+    final void html(final Appendable accum, final Document.OutputSettings out) throws IOException {
+        final int sz = size;
+        for (int i = 0; i < sz; i++) {
+            // inlined from Attribute.html()
+            final String key = keys[i];
+            final String val = vals[i];
+            accum.append(' ').append(key);
+
+            // Collapse boolean attributes with empty strings or same name
+            boolean shouldCollapse = false;
+            
+            // Check if output syntax is HTML and attribute is boolean
+            if (out.syntax() == Document.OutputSettings.Syntax.html) {
+                // Check if the value is empty or matches the key (i.e., self-closing)
+                if (val == null || val.isEmpty() || val.equals(key)) {
+                    shouldCollapse = true;
+                }
+            }
+
+            if (!shouldCollapse) {
+                accum.append("=\"");
+                Entities.escape(accum, val == null ? "" : val, out, true, false, false);
+                accum.append('"');
+            }
+        }
+    }
+}
+
+```
+
+The issue in the original code was that the logic for collapsing boolean attributes wasn't properly implemented. The fix involves:
+
+1. Adding proper checks for both empty values and values matching the attribute name
+2. Making sure we only apply this logic when in HTML syntax mode
+3. Using the correct comparison operators
+4. Properly handling the case where the value might be null
+
+This implementation ensures that boolean attributes like `noshade` in your example will be correctly collapsed when appropriate, while maintaining the proper formatting for other attributes.
+
+Note that in practice, the JSoup library would likely implement this in a more optimized way than shown here, possibly using helper methods to avoid duplication. But this shows the core logic needed to fix the behavior.
+</think>
+
+To address the regression in JSoup's handling of **boolean attributes** when rendering HTML with `html()` syntax, let's analyze the root cause and propose a robust solution.
+
+---
+
+### ✅ Problem Summary
+
+In the upgraded version (`1.11.2`), there’s a change in how **boolean attributes** are handled during HTML serialization. Previously, JSoup would **collapse** attributes with empty values or matching names (e.g., `noshade=""` → `noshade`). 
+
+Now, this behavior has changed due to the refactoring in `Attributes.html(...)`. Specifically, the following line caused the problem:
+
+```java
+if (!(out.syntax() == Document.OutputSettings.Syntax.html
+      && (val == null || val.equals(key) && Attribute.isBooleanAttribute(key))))
+```
+
+This condition was flawed because:
+- It incorrectly used logical operator precedence.
+- It didn’t account for cases where `val` could be an *empty string* (i.e., `""`) rather than `null`.
+- It failed to fully understand what constitutes a valid **self-closed** boolean attribute in HTML.
+
+As a result, the code now renders **non-collapsed** versions even when they should be collapsed.
+
+---
+
+### 🔧 Proposed Solution
+
+Let's rewrite the `html(...)` method with the following considerations:
+
+| Constraint              | Purpose |
+|------------------------|---------|
+| Only collapse for `Syntax.html` | Avoid breaking XML compatibility |
+| Collapse when:          |         |
+| - Value is `null`       | Equivalent to default behavior in browsers |
+| - Value is empty (`""`) | Matches browser expectations |
+| - Key equals value     | Self-closed attributes (like `<hr noshade="">`) |
+
+Here's the fixed and improved version:
+
+---
+
+#### ✅ Corrected Code Implementation
+
+```java
+void html(Appendable accum, Document.OutputSettings out) throws IOException {
+    final int sz = size;
+    for (int i = 0; i < sz; i++) {
+        final String key = keys[i];
+        final String val = vals[i];
+
+        accum.append(' ').append(key);
+
+        // Determine whether to collapse the value
+        boolean shouldCollapse = false;
+
+        if (out.syntax() == Document.OutputSettings.Syntax.html) {
+            shouldCollapse =
+                val == null ||
+                val.isEmpty() ||
+                val.equals(key); // Handle self-closing like <hr noshade="">
+        }
+
+        if (!shouldCollapse) {
+            accum.append("=\"");
+            Entities.escape(accum, val != null ? val : "", out, true, false, false);
+            accum.append('"');
+        }
+    }
+}
+```
+
+---
+
+### 📌 Key Improvements
+
+1. **Fixed Logic Flow**:  
+   The condition is now unambiguous. We explicitly check all possible valid scenarios for collapsing a boolean attribute in HTML context.
+
+2. **Handles Null Values Gracefully**:  
+   If the value is `null`, it treats it as equivalent to being blank (as in modern web standards).
+
+3. **Avoids Redundant Method Calls**:  
+   By directly

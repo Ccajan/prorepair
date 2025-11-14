@@ -1,0 +1,102 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# CPIO reports unexpected EOF
+When unpacking an CPIO archive (made with the compress classes or even made with OSX cpio comandline tool) an EOF exception is thrown.
+Here is the testcode:
+        final File input = getFile("cmdcreated.cpio");
+        final InputStream in = new FileInputStream(input);
+        CpioArchiveInputStream cin = new CpioArchiveInputStream(in);
+        CpioArchiveEntry entry = null;
+        while ((entry = (CpioArchiveEntry) cin.getNextCPIOEntry()) != null) 
+{
+            File target = new File(dir, entry.getName());
+            final OutputStream out = new FileOutputStream(target);
+            IOUtils.copy(in, out);
+            out.close();
+        }
+
+        cin.close();
+Stacktrace is here:
+java.io.EOFException
+	at org.apache.commons.compress.archivers.cpio.CpioArchiveInputStream.readFully(CpioArchiveInputStream.java:293)
+	at org.apache.commons.compress.archivers.cpio.CpioArchiveInputStream.getNextCPIOEntry(CpioArchiveInputStream.java:168)
+	at org.apache.commons.compress.archivers.cpio.CpioArchiveInputStreamTest.testCpioUnpack(CpioArchiveInputStreamTest.java:26)
+	...
+This happens with the first read access to the archive. It occured while my try to improve the testcases.
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/cpio/CpioArchiveOutputStream.java):
+```java
+public void close() throws IOException {
+    if (!this.closed) {
+        super.close();
+        this.closed = true;
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public class CpioArchiveInputStream implements ArchiveInputStream<CpioArchiveEntry> {
+
+    protected final DataInputStream dataInputStream;
+    protected volatile boolean closed = false;
+    
+    public CpioArchiveInputStream(InputStream in) {
+        this.dataInputStream = new DataInputStream(new BufferedInputStream(in));
+    }
+
+    @Override
+    public CpioArchiveEntry getNextCPIOEntry() throws IOException {
+        long pos = 0L;
+        CpioArchiveEntry entry = null;
+        byte[] header = new byte[96];
+        while (true) {
+            pos += dataInputStream.skipBytes(pos);
+            if (dataInputStream.read(header) == -1 || compareHeaders(header)) {
+                return null;
+            }
+            
+            long mode = readIntHeader(header, 48);
+            long uid = readIntHeader(header, 56);
+            long gid = readIntHeader(header, 60);
+            long size = readSizeField(header, 44);           
+            long mtime = readSizeField(header, 32);
+            long chksum = readChkSum(header);
+            
+            checkCheckSum(chksum);
+            
+            String name = new String(header, 76, 14).trim();
+            entry = new CpioArchiveEntry(name, mode, uid, gid, size, mtime, "ustar");
+            entry.setSize(size);
+            
+            int namesize = (name.length() + 3) & (~0x03);
+            skip(namesize);
+            entry.setLinkName(readLinkName(namesize));
+            
+            return entry;
+        }       
+    }
+    
+    private void skip(long offset) throws IOException {
+        for (; offset > 0; offset -= dataInputStream.skipBytes((int)offset))
+            if (dataInputStream.read() < 0)
+                throw new EOFException();
+    }
+    
+    private void close() throws IOException {
+        if (!this.closed) {
+            dataInputStream.close();
+            this.closed = true;
+        }
+    }
+    
+}
+
+class CpioArchiveEntry extends ArchiveEntry { /* ... */ }
+
+class CpioArchiveOutputStream implements ArchiveOutputStream<CpioArchiveEntry> { /* ... */ }
+```
+

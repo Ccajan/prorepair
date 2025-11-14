@@ -1,0 +1,171 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Illegal reflective access operation warning when using `java.lang.Void` as value type
+I'm using Jackson (**2.9.7**) through Spring's RestTemplate:
+
+```java
+ResponseEntity<Void> response = getRestTemplate().exchange(
+		requestUrl,
+		HttpMethod.PATCH,
+		new HttpEntity<>(dto, authHeaders),
+		Void.class
+);
+```
+
+When [`Void`](https://docs.oracle.com/javase/7/docs/api/java/lang/Void.html) is used to indicate that the ResponseEntity has no body, the following warning appears in the console:
+
+```
+WARNING: An illegal reflective access operation has occurred
+WARNING: Illegal reflective access by com.fasterxml.jackson.databind.util.ClassUtil (file:/<snip>repository/com/fasterxml/jackson/core/jackson-databind/2.9.7/jackson-databind-2.9.7.jar) to constructor java.lang.Void()
+WARNING: Please consider reporting this to the maintainers of com.fasterxml.jackson.databind.util.ClassUtil
+WARNING: Use --illegal-access=warn to enable warnings of further illegal reflective access operations
+WARNING: All illegal access operations will be denied in a future release
+```
+
+The problem disappears if `String` is used as generic type. 
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/deser/std/JdkDeserializers.java):
+```java
+public static JsonDeserializer<?> find(Class<?> rawType, String clsName)
+    {
+        if (_classNames.contains(clsName)) {
+            JsonDeserializer<?> d = FromStringDeserializer.findDeserializer(rawType);
+            if (d != null) {
+                return d;
+            }
+            if (rawType == UUID.class) {
+                return new UUIDDeserializer();
+            }
+            if (rawType == StackTraceElement.class) {
+                return new StackTraceElementDeserializer();
+            }
+            if (rawType == AtomicBoolean.class) {
+                // (note: AtomicInteger/Long work due to single-arg constructor. For now?
+                return new AtomicBooleanDeserializer();
+            }
+            if (rawType == ByteBuffer.class) {
+                return new ByteBufferDeserializer();
+            }
+        }
+        return null;
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+if (rawType == AtomicBoolean.class) {
+    return new AtomicBooleanDeserializer();
+}
+```
+
+That's not correct because it's comparing the raw type directly to `AtomicBoolean.class`. The actual type could be parameterized, like `AtomicBoolean[]` or `List<AtomicBoolean>`.
+
+The fix would be to check for the class name instead:
+
+```java
+if (clsName.equals("java.util.concurrent.AtomicBoolean")) {
+    return new AtomicBooleanDeserializer();
+}
+```
+
+But there's more to it. Let me think about how Jackson typically handles these cases.
+
+The real issue here is that Jackson is trying to find a deserializer for `Void`, but it's getting confused because `Void` doesn't have a public constructor. The code in question is trying to handle certain classes with specific deserializers, but it's doing it in a way that doesn't account for all possible scenarios.
+
+A better approach would be to use the class name to identify the type rather than relying on the raw type. So let's modify the method to check the class name and then determine which deserializer to use based on that.
+
+Here's an improved version of the method:
+
+```java
+public static JsonDeserializer<?> find(Class<?> rawType, String clsName) {
+    if (_classNames.contains(clsName)) {
+        JsonDeserializer<?> d = FromStringDeserializer.findDeserializer(rawType);
+        if (d != null) {
+            return d;
+        }
+
+        // Check for known types by class name
+        if ("java.util.concurrent.AtomicBoolean".equals(clsName)) {
+            return new AtomicBooleanDeserializer();
+        } else if ("java.nio.ByteBuffer".equals(clsName)) {
+            return new ByteBufferDeserializer();
+        } else if ("java.lang.StackTraceElement".equals(clsName)) {
+            return new StackTraceElementDeserializer();
+        } else if ("java.util.UUID".equals(clsName)) {
+            return new UUIDDeserializer();
+        }
+        
+        // Additional checks can be added here for other types
+        
+        return null;
+    }
+    return null;
+}
+```
+
+In this version, we're checking the class name (`clsName`) directly, which avoids issues with comparing raw types. This makes the logic clearer and more robust against different parameterizations of the type.
+
+Now, back to the original issue with `Void`. The error message suggests that Jackson is attempting to reflectively access the constructor of `Void`. Since `Void` doesn't have any constructors (it's a special case), this causes an illegal reflective access warning.
+
+To address this specifically for `Void`, we should ensure that the deserialization process correctly identifies that `Void` has no body and doesn't attempt to create an instance of it. One way to do this is to add a specific check for `Void` in the deserializer lookup:
+
+```java
+else if ("java.lang.Void".equals(clsName)) {
+    return VoidDeserializer.INSTANCE; // Or some appropriate deserializer
+}
+```
+
+By explicitly handling `Void` in the deserializer lookup, we prevent Jackson from trying to instantiate it, thus avoiding the illegal reflective access warning.
+</think>
+
+When encountering an **illegal reflective access** warning related to the usage of `Void` as a generic type in Jackson 2.9.7 via Spring's `RestTemplate`, the root cause lies in how Jackson attempts to deserialize objects—specifically when trying to instantiate a class like `Void`.
+
+---
+
+## 🧩 Why does this happen?
+
+Jackson uses reflection under the hood to detect whether a class can be instantiated and what kind of deserializer it should use. When you pass `Void.class` as a type to `RestTemplate.exchange(...)`, Jackson tries to:
+
+1. Instantiate `Void`.
+2. Reflectively invoke its constructor.
+3. Create a deserializer for it.
+
+However, `Void` has **no public constructor** and cannot be instantiated. This leads to an **illegal reflective access** operation, which triggers a security warning.
+
+---
+
+## 🔍 The problematic part of the code
+
+The offending portion in Jackson's source code:
+
+```java
+if (rawType == AtomicBoolean.class) {
+    return new AtomicBooleanDeserializer();
+}
+```
+
+This comparison of raw types isn't reliable because it ignores possible generic parameterization such as `List<AtomicBoolean>` or `AtomicBoolean[]`. Also, it misses key cases like `Void`.
+
+---
+
+## ✅ Corrected Solution
+
+Instead of comparing `rawType` directly, we should inspect the **class name**, which is guaranteed to remain consistent across parameterized or array types.
+
+### ✅ Recommended Fix:
+
+Modify your custom deserializer lookup method to first verify the **full class name** and then decide which deserializer to apply:
+
+```java
+public static JsonDeserializer<?> find(Class<?> rawType, String clsName) {
+    if (_classNames.contains(clsName)) {
+        JsonDeserializer<?> d = FromStringDeserializer.findDeserializer(rawType);
+        if (d != null) {
+            return d;
+        }
+
+        // Handle special cases by class name
+        if ("java.util.concurrent.AtomicBoolean".

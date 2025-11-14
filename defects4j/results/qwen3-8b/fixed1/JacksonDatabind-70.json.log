@@ -1,0 +1,169 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# ACCEPT_CASE_INSENSITIVE_PROPERTIES fails with @JsonUnwrapped
+(note: moved from FasterXML/jackson-dataformat-csv#133)
+When trying to deserialize type like:
+public class Person {
+  @JsonUnwrapped(prefix = "businessAddress.")
+  public Address businessAddress;
+}
+
+public class Address {
+  public String street;
+  public String addon;
+  public String zip = "";
+  public String town;    
+  public String country;
+}
+with case-insensitive mapper (mapper.enable(MapperFeature.ACCEPT_CASE_INSENSITIVE_PROPERTIES);) I get exception:
+java.util.NoSuchElementException: No entry 'businessAddress' found, can't remove
+	at com.fasterxml.jackson.databind.deser.impl.BeanPropertyMap.remove(BeanPropertyMap.java:447)
+	at com.fasterxml.jackson.databind.deser.BeanDeserializerBase.resolve(BeanDeserializerBase.java:534)
+	at com.fasterxml.jackson.databind.deser.DeserializerCache._createAndCache2(DeserializerCache.java:293)
+   ...
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/deser/impl/BeanPropertyMap.java):
+```java
+public void remove(SettableBeanProperty propToRm)
+{
+    ArrayList<SettableBeanProperty> props = new ArrayList<SettableBeanProperty>(_size);
+    String key = getPropertyName(propToRm);
+    boolean found = false;
+
+    for (int i = 1, end = _hashArea.length; i < end; i += 2) {
+        SettableBeanProperty prop = (SettableBeanProperty) _hashArea[i];
+        if (prop == null) {
+            continue;
+        }
+        if (!found) {
+            // 09-Jan-2017, tatu: Important: must check name slot and NOT property name,
+            //   as only former is lower-case in case-insensitive case
+            found = key.equals(prop.getName());
+            if (found) {
+                // need to leave a hole here
+                _propsInOrder[_findFromOrdered(prop)] = null;
+                continue;
+            }
+        }
+        props.add(prop);
+    }
+    if (!found) {
+        throw new NoSuchElementException("No entry '"+propToRm.getName()+"' found, can't remove");
+    }
+    init(props);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+The issue arises because `ACCEPT_CASE_INSENSITIVE_PROPERTIES` enables case-insensitive matching when reading JSON properties, but `@JsonUnwrapped` requires exact matches when determining which fields to unwrap. The provided code attempts to remove a property using `propToRm.getName()` which, under case-insensitive settings, might not match due to incorrect comparison logic.
+
+Here's how to fix it:
+
+1. **Correct Property Comparison Logic**: Use the property's name instead of the `getName()` method in the comparison. In case-insensitive mode, this should be matched via the property's declared name.
+2. **Adjust Search Algorithm**: Ensure that during removal, we're checking against the original declared name, not the potentially modified one due to case insensitivity.
+
+Let me provide a revised version of the `remove` method in `BeanPropertyMap` that addresses these issues:
+
+```java
+public void remove(SettableBeanProperty propToRm) {
+    ArrayList<SettableBeanProperty> props = new ArrayList<>(_size);
+    String key = getPropertyName(propToRm); // This would be the actual property name
+    boolean found = false;
+
+    for (int i = 1, end = _hashArea.length; i < end; i += 2) {
+        SettableBeanProperty prop = (SettableBeanProperty) _hashArea[i];
+        if (prop == null) {
+            continue;
+        }
+        if (!found) {
+            // Compare using the original declared name to ensure correct match
+            found = key.equals(prop.getOriginalName()); 
+            if (found) {
+                // Mark as removed by setting to null in ordered list
+                _propsInOrder[_findFromOrdered(prop)] = null;
+                continue;
+            }
+        }
+        props.add(prop);
+    }
+    if (!found) {
+        throw new NoSuchElementException("No entry '" + key + "' found, can't remove");
+    }
+    init(props);
+}
+```
+
+In this correction:
+- We use `getOriginalName()` to get the original declared name of the property, ensuring accurate matching even under case-insensitive settings.
+- The rest of the logic remains the same to maintain the structure of the bean property map while correctly identifying and removing the specified property.
+
+By making this change, the `remove` operation will work correctly with case-insensitive property names, preventing the `NoSuchElementException`.
+</think>
+
+The problem occurs because Jackson's `ACCEPT_CASE_INSENSITIVE_PROPERTIES` feature causes mismatched comparisons during property resolution when combined with `@JsonUnwrapped`. This results in a failed search for a property whose actual name was transformed due to case insensitivity. Let's address the root cause and propose a corrected implementation.
+
+---
+
+### ✅ Root Cause Analysis
+
+1. **Case Sensitivity Issue**  
+   Under `ACCEPT_CASE_INSENSITIVE_PROPERTIES`, Jackson normalizes property names to lowercase (or another configuration), leading to differences between the actual declared property name and the normalized one used in deserialization.
+
+2. **Incorrect Matching in Removal Logic**  
+   When attempting to remove a property, the current logic uses the name returned by `prop.getName()`, which might be different than what was originally declared—especially after normalization. This leads to mismatches, causing exceptions like `NoSuchElementException`.
+
+---
+
+### ✅ Solution
+
+We need to adjust the logic so that the comparison uses the *original* name rather than the possibly normalized or case-mismatched version.
+
+#### 💡 Key Change
+Use `prop.getOriginalName()` instead of `prop.getName()` to compare against the expected property name.
+
+#### 🔧 Corrected Code
+
+Here's the revised version of the problematic `remove` method inside `BeanPropertyMap`:
+
+```java
+public void remove(SettableBeanProperty propToRm) {
+    ArrayList<SettableBeanProperty> props = new ArrayList<>(_size);
+    String key = getPropertyName(propToRm); // This is the actual property name we expect
+    boolean found = false;
+
+    for (int i = 1, end = _hashArea.length; i < end; i += 2) {
+        SettableBeanProperty prop = (SettableBeanProperty) _hashArea[i];
+        if (prop == null) {
+            continue;
+        }
+
+        if (!found) {
+            // Compare with original name to ensure accurate match
+            if (key.equals(prop.getOriginalName())) {
+                found = true;
+                // Mark as removed by setting to null in ordered list
+                _propsInOrder[_findFromOrdered(prop)] = null;
+                continue;
+            }
+        }
+        props.add(prop);
+    }
+
+    if (!found) {
+        throw new NoSuchElementException("No entry '" + key + "' found, can't remove");
+    }
+
+    init(props);
+}
+```
+
+---
+
+### 📌 Explanation
+
+- `prop.getOriginalName()` ensures we're working with the original declaration of the property, unaffected by any normalization (like case conversion).
+- This avoids the error where the normalized name (`prop.getName()`)

@@ -1,0 +1,187 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# #107 Incorrect date parsed when week and month used together
+I have following code snippet :
+    DateTimeFormatter dtf = DateTimeFormat.forPattern("xxxxMM'w'ww");
+DateTime dt = dtf.parseDateTime("201101w01");       
+System.out.println(dt);
+
+It should print 2011-01-03 but it is printing 2010-01-04. 
+Please let me know if I am doing something wrong here.
+This is an incorrect Java code (src/main/java/org/joda/time/format/DateTimeParserBucket.java):
+```java
+public long computeMillis(boolean resetFields, String text) {
+    SavedField[] savedFields = iSavedFields;
+    int count = iSavedFieldsCount;
+    if (iSavedFieldsShared) {
+        iSavedFields = savedFields = (SavedField[])iSavedFields.clone();
+        iSavedFieldsShared = false;
+    }
+    sort(savedFields, count);
+    if (count > 0) {
+        // alter base year for parsing if first field is month or day
+        DurationField months = DurationFieldType.months().getField(iChrono);
+        DurationField days = DurationFieldType.days().getField(iChrono);
+        DurationField first = savedFields[0].iField.getDurationField();
+        if (compareReverse(first, months) >= 0 && compareReverse(first, days) <= 0) {
+            saveField(DateTimeFieldType.year(), iDefaultYear);
+            return computeMillis(resetFields, text);
+        }
+    }
+
+    long millis = iMillis;
+    try {
+        for (int i = 0; i < count; i++) {
+            millis = savedFields[i].set(millis, resetFields);
+        }
+    } catch (IllegalFieldValueException e) {
+        if (text != null) {
+            e.prependMessage("Cannot parse \"" + text + '"');
+        }
+        throw e;
+    }
+    
+    if (iZone == null) {
+        millis -= iOffset;
+    } else {
+        int offset = iZone.getOffsetFromLocal(millis);
+        millis -= offset;
+        if (offset != iZone.getOffset(millis)) {
+            String message =
+                "Illegal instant due to time zone offset transition (" + iZone + ')';
+            if (text != null) {
+                message = "Cannot parse \"" + text + "\": " + message;
+            }
+            throw new IllegalArgumentException(message);
+        }
+    }
+    
+    return millis;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+The issue you're encountering stems from how Joda-Time's `DateTimeParserBucket` handles **date-time patterns** that combine **week numbers**, **month**, and **year**. Specifically, the problem arises in the way the code attempts to compute milliseconds during parsing.
+
+Let’s break this down:
+
+---
+
+### 🔍 Problem Summary:
+You’re using the pattern `"xxxxMM'w'ww"` which is intended to represent:
+
+- `xxxx`: Year
+- `MM`: Month (two-digit)
+- `'w'ww`: Week number within the year (e.g., "w01" means the first week of the year)
+
+But Joda-Time has a bug in its internal logic for handling this specific combination — especially when there's a conflict between the month (`MM`) and the week-number parsing logic.
+
+Your input is:  
+`"201101w01"`
+
+Expected output:  
+`2011-01-03`
+
+Actual output:  
+`2010-01-04`
+
+Why? Because Joda-Time's parser assumes that when you provide both month and week information, it uses **calendar rules** (like ISO calendar) to interpret them — not just as literal numeric values. So, parsing `"201101w01"` ends up interpreting this as *the first week of January*, which under standard calendars might land on Jan 3rd (depending on locale), **but it mistakenly resolves it to 2010 instead of 2011** due to a flaw in the parsing algorithm.
+
+---
+
+### 🛠️ Solution:
+
+#### ✅ Option 1: Use a more robust date-time format and avoid mixing `MM` with `ww` directly
+
+You can split your parsing into two parts:
+1. Parse the year and month as separate fields.
+2. Then add the week manually (or use a safer formatting pattern).
+
+Example:
+```java
+// Step 1: Parse the full year and month
+DateTimeFormatter ymFmt = DateTimeFormat.forPattern("yyyyMM");
+DateTime dt = ymFmt.parseDateTime("201101");
+
+// Step 2: Add week number manually (interpret as day-of-week)
+int weekNumber = 1;
+
+// Get the first Monday (or other reference point for the week)
+DateTime firstDayOfYear = dt.withMonthOfYear(1).withDayOfMonth(1);
+int startOfWeek = getStartOfWeek(firstDayOfYear);
+
+// Move forward by (week - 1) weeks plus the corresponding weekday offset
+dt = dt.plusDays((weekNumber - 1) * 7 + (startOfWeek - dt.getDayOfWeek()));
+System.out.println(dt); // Should print 2011-01-03
+```
+
+However, **this approach is error-prone** unless you carefully handle week definitions and locale settings.
+
+---
+
+### ✅ Option 2: Fix the core bug in the internal code
+
+You've provided the relevant method:  
+`computeMillis(...)`, which attempts to deduce the correct millisecond value based on saved fields and the chronology.
+
+In particular, this block may be problematic:
+
+```java
+if (compareReverse(first, months) >= 0 && compareReverse(first, days) <= 0) {
+    saveField(DateTimeFieldType.year(), iDefaultYear);
+    return computeMillis(resetFields, text);
+}
+```
+
+This line tries to set a default year before computing the result again — leading to confusion when multiple fields (year, month, week) are provided together.
+
+---
+
+### 🔧 Recommended Fix (Patch)
+
+We need to **prevent early setting of the year** when ambiguous fields like `week` are also present.
+
+Here’s a corrected version of the loop where the field order is checked:
+
+```java
+for (int i = 0; i < count; i++) {
+    final FieldPosition fieldPos = savedFields[i].fieldPosition;
+    if (!fieldPos.isSet()) continue;
+
+    final DateTimeFieldType fieldType = savedFields[i].iField.getType();
+
+    if (fieldType == DateTimeFieldType.weekOfWeekBasedYear()
+        || fieldType == DateTimeFieldType.weekYear() 
+        || fieldType == DateTimeFieldType.dayOfWeek()) {
+
+        // Do NOT allow setting year yet — wait for proper alignment
+        continue;
+    }
+
+    if (fieldType == DateTimeFieldType.monthOfYear()) {
+        // Handle month separately if needed
+        continue;
+    }
+
+    // Only apply other fields now
+    millis = savedFields[i].set(millis, resetFields);
+}
+```
+
+Or, even better:  
+Remove the early year-setting check **entirely** if ambiguity is high.
+
+---
+
+### 📌 Final Recommendation
+
+If you're facing this bug while using **Joda-Time**, consider upgrading to **Java 8+ with java.time package** (e.g. `java.time.LocalDate`, `java.time.YearWeek` etc.) because it offers more consistent and reliable date manipulation tools.
+
+For example,

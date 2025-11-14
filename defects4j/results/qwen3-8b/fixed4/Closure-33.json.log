@@ -1,0 +1,198 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# weird object literal invalid property error on unrelated object prototype
+Apologies in advance for the convoluted repro case and the vague summary.
+
+Compile the following code (attached as repro.js) with:
+java -jar build/compiler.jar --compilation_level=ADVANCED_OPTIMIZATIONS --jscomp_error=accessControls --jscomp_error=checkTypes --jscomp_error=checkVars --js repro.js *
+
+/**
+ * @param {{text: string}} opt_data
+ * @return {string}
+ */
+function temp1(opt_data) {
+  return opt_data.text;
+}
+
+/**
+ * @param {{activity: (boolean|number|string|null|Object)}} opt_data
+ * @return {string}
+ */
+function temp2(opt_data) {
+  /** @notypecheck */
+  function __inner() {
+    return temp1(opt_data.activity);
+  }
+  return __inner();
+}
+
+/**
+ * @param {{n: number, text: string, b: boolean}} opt_data
+ * @return {string}
+ */
+function temp3(opt_data) {
+  return 'n: ' + opt_data.n + ', t: ' + opt_data.text + '.';
+}
+
+function callee() {
+  var output = temp3({
+    n: 0,
+    text: 'a string',
+    b: true
+  })
+  alert(output);
+}
+
+callee();
+
+yields:
+repro.js:30: ERROR - actual parameter 1 of temp3 does not match formal parameter
+found   : {b: boolean, n: number, text: (string|undefined)}
+required: {b: boolean, n: number, text: string}
+  var output = temp3({
+
+It seems like temp3 is actually being called with the right type {b: boolean, n: number, text: string} though it seems to think that text is a (string|undefined)
+This seems to happen because of the seemingly unrelated code in functions temp1 and temp2. If I change the name of the text property (as in repro3.js) it works.
+Additionally, if I fix the type of the activity property in the record type of temp2 it works (as in repro2.js)
+
+This comes up in our codebase in some situations where we don't have type info for all the objects being passed into a function. It's always a tricky one to find because it reports an error at a location that looks correct.
+
+* it also fails with SIMPLE_OPTIMIZATIONS
+This is an incorrect Java code (src/com/google/javascript/rhino/jstype/PrototypeObjectType.java):
+```java
+public void matchConstraint(ObjectType constraintObj) {
+  // We only want to match contraints on anonymous types.
+
+  // Handle the case where the constraint object is a record type.
+  //
+  // param constraintObj {{prop: (number|undefined)}}
+  // function f(constraintObj) {}
+  // f({});
+  //
+  // We want to modify the object literal to match the constraint, by
+  // taking any each property on the record and trying to match
+  // properties on this object.
+  if (constraintObj.isRecordType()) {
+    for (String prop : constraintObj.getOwnPropertyNames()) {
+      JSType propType = constraintObj.getPropertyType(prop);
+      if (!isPropertyTypeDeclared(prop)) {
+        JSType typeToInfer = propType;
+        if (!hasProperty(prop)) {
+          typeToInfer = getNativeType(JSTypeNative.VOID_TYPE)
+              .getLeastSupertype(propType);
+        }
+        defineInferredProperty(prop, typeToInfer, null);
+      }
+    }
+  }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+The problem lies in the logic of how the PrototypeObjectType.matchConstraint method infers or matches properties when dealing with record types. Specifically, the issue arises when there is an object literal passed without explicitly specifying certain properties, but the inferred types end up incorrectly including undefined values as possible types for properties. This can lead to mismatch errors even when the actual usage appears correct.
+
+Here's my step-by-step analysis and the fix:
+
+Problem Analysis:
+1. The method is attempting to match an object against a constraint type.
+2. When a property isn't declared on the current object, it tries to infer its type from the constraint.
+3. However, when the constraint specifies a property as optional (e.g., `text: (string|undefined)`), the inference process might be allowing "undefined" as a valid value even when it shouldn't.
+4. This leads to type mismatches when the object doesn't include those optional properties.
+
+Fix Strategy:
+1. Modify the logic to correctly distinguish between required and optional properties.
+2. Ensure that when a property is not present in the object literal, its inferred type should reflect that it's missing rather than assuming it could be undefined.
+
+Proposed Fix:
+Modify the condition that checks whether a property exists in the object:
+
+Original line:
+if (!hasProperty(prop)) {
+
+Fixed line:
+if (!hasProperty(prop) && !isPropertyOptional(prop)) {
+
+Explanation:
+- This addition ensures that we only consider properties as potentially having undefined types if they're marked as optional in the constraint.
+- By checking if the property is optional before considering "undefined", we prevent unnecessary inclusion of undefined in the inferred types for required properties.
+
+The corrected Java code would look like this:
+
+public void matchConstraint(ObjectType constraintObj) {
+  // We only want to match constraints on anonymous types.
+
+  // Handle the case where the constraint object is a record type.
+  //
+  // param constraintObj {{prop: (number|undefined)}}
+  // function f(constraintObj) {}
+  // f({});
+  //
+  // We want to modify the object literal to match the constraint, by
+  // taking any each property on the record and trying to match
+  // properties on this object.
+  if (constraintObj.isRecordType()) {
+    for (String prop : constraintObj.getOwnPropertyNames()) {
+      JSType propType = constraintObj.getPropertyType(prop);
+      if (!isPropertyTypeDeclared(prop)) {
+        JSType typeToInfer = propType;
+        if (!hasProperty(prop) && !isPropertyOptional(prop)) {
+          typeToInfer = getNativeType(JSTypeNative.VOID_TYPE)
+              .getLeastSupertype(propType);
+        }
+        defineInferredProperty(prop, typeToInfer, null);
+      }
+    }
+  }
+}
+
+Additional Considerations:
+- This fix assumes that there's a method isPropertyOptional(String prop) available to check if a property is marked as optional in the constraint type.
+- This approach ensures that only truly optional properties will have their types potentially widened to include undefined, while required properties maintain stricter typing.
+
+This adjustment should resolve the reported type mismatch issues caused by incorrect handling of undefined in inferred types for required properties.
+</think>
+
+To address the issue described, we need to ensure that the `matchConstraint` method in `PrototypeObjectType.java` correctly differentiates between **required** and **optional** properties when inferring types during object literal matching.
+
+---
+
+### ✅ Problem Summary
+
+When an object literal is provided without explicitly defining a property, the type inference mechanism incorrectly infers the property's type as possibly `(string | undefined)` instead of just `string`. This leads to a false positive type-checking failure — even though the actual input used doesn't contain `undefined`.
+
+This behavior stems from an incorrect assumption about the nature of the property (i.e., it treats all unmentioned properties as optional).
+
+---
+
+### 🛠️ Proposed Fix
+
+We need to refine the logic so that the inferred type of a property is determined **only when the property is not present and is marked as optional**, not for every absent property.
+
+Update the conditional check inside the loop to only infer `undefined` if both conditions are met:
+- The property is **not defined** in the object literal.
+- The property is **marked as optional** in the constraint.
+
+This change prevents erroneous widening of required properties' types with `undefined`.
+
+---
+
+### 🔧 Updated Code Snippet
+
+```java
+public void matchConstraint(ObjectType constraintObj) {
+  // ... existing setup ...
+
+  if (constraintObj.isRecordType()) {
+    for (String prop : constraintObj.getOwnPropertyNames()) {
+      JSType propType = constraintObj.getPropertyType(prop);
+      if (!isPropertyTypeDeclared(prop)) {
+        JSType typeToInfer = propType;
+
+        // Only widen to 'undefined' if the property is NOT present AND optional
+        if (!hasProperty(prop) && !isPropertyOptional(prop)) {
+          typeToInfer = getNativeType(JSTypeNative.VOID_TYPE

@@ -1,0 +1,168 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# @JsonUnwrapped is not treated as assuming @JsonProperty("")
+See discussion here but basically @JsonUnwrapped on a private field by itself does not cause that field to be serialized, currently,  You need to add an explicit @JsonProperty.  You shouldn't have to do that.  (Following test fails currently, should pass, though you can make it pass by commenting out the line with @JsonProperty.  Uses TestNG and AssertJ.)
+package com.bakins_bits;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import org.testng.annotations.Test;
+
+import com.fasterxml.jackson.annotation.JsonUnwrapped;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+public class TestJsonUnwrappedShouldMakePrivateFieldsSerializable
+{
+    public static class Inner
+    {
+        public String animal;
+    }
+
+    public static class Outer
+    {
+        // @JsonProperty
+        @JsonUnwrapped
+        private Inner inner;
+    }
+
+    @Test
+    public void jsonUnwrapped_should_make_private_fields_serializable() throws JsonProcessingException {
+        // ARRANGE
+        Inner inner = new Inner();
+        inner.animal = "Zebra";
+
+        Outer outer = new Outer();
+        outer.inner = inner;
+
+        ObjectMapper sut = new ObjectMapper();
+
+        // ACT
+        String actual = sut.writeValueAsString(outer);
+
+        // ASSERT
+        assertThat(actual).contains("animal");
+        assertThat(actual).contains("Zebra");
+        assertThat(actual).doesNotContain("inner");
+    }
+}
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/introspect/JacksonAnnotationIntrospector.java):
+```java
+public PropertyName findNameForSerialization(Annotated a)
+{
+    String name = null;
+
+    JsonGetter jg = _findAnnotation(a, JsonGetter.class);
+    if (jg != null) {
+        name = jg.value();
+    } else {
+        JsonProperty pann = _findAnnotation(a, JsonProperty.class);
+        if (pann != null) {
+            name = pann.value();
+            /* 22-Apr-2014, tatu: Should figure out a better way to do this, but
+             *   it's actually bit tricky to do it more efficiently (meta-annotations
+             *   add more lookups; AnnotationMap costs etc)
+             */
+        } else if (_hasAnnotation(a, JsonSerialize.class)
+                || _hasAnnotation(a, JsonView.class)
+                || _hasAnnotation(a, JsonRawValue.class)) {
+            name = "";
+        } else {
+            return null;
+        }
+    }
+    return PropertyName.construct(name);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+@JsonUnwrapped
+private Inner inner;
+```
+
+The issue is that when using `@JsonUnwrapped` on a private field, Jackson doesn't automatically assign a property name for serialization unless we explicitly use `@JsonProperty`. This behavior seems inconsistent.
+
+Let me analyze the code you provided:
+
+When `@JsonUnwrapped` is used without `@JsonProperty`, the method `findNameForSerialization` in `JacksonAnnotationIntrospector` checks for annotations like `JsonGetter`, then `JsonProperty`. If none of these are found, it returns null.
+
+So, even though we're using `@JsonUnwrapped`, it doesn't get any name from the annotations, and thus the property isn't added to the JSON output.
+
+To fix this, I'd suggest modifying the logic in `findNameForSerialization` so that when we encounter `@JsonUnwrapped` on a field, it treats the field name as the property name, similar to how `@JsonProperty("")` works.
+
+I'll propose a solution:
+1. Check if the annotated element has `@JsonUnwrapped`.
+2. If it does, use the field name as the property name.
+3. Otherwise, proceed with the current logic.
+
+Here's my proposed modification to the method:
+</think>
+
+The problem stems from how Jackson's `JacksonAnnotationIntrospector` handles `@JsonUnwrapped` on private fields. While `@JsonUnwrapped` instructs Jackson to serialize the referenced object directly (without wrapping), it **does not automatically** provide a property name unless accompanied by `@JsonProperty`.
+
+Jackson looks for specific annotations (`JsonGetter`, `JsonProperty`) to determine the property name. When only `@JsonUnwrapped` exists and no `@JsonProperty` or `@JsonGetter` is present, it defaults to returning `null`, which results in the field being omitted from the serialized output.
+
+---
+
+### ✅ Solution Summary
+
+We should modify the `findNameForSerialization` method in `JacksonAnnotationIntrospector` to handle the case where `@JsonUnwrapped` appears on a field—specifically, we treat the field name (as if `@JsonProperty("")`) as the default property name. That means we should check for the presence of `@JsonUnwrapped` first and set the property name accordingly before proceeding with checking other annotations like `@JsonProperty`.
+
+---
+
+### ✅ Fix Code Patch
+
+Here’s the corrected version of the relevant part in `JacksonAnnotationIntrospector`:
+
+```java
+public PropertyName findNameForSerialization(Annotated a)
+{
+    String name = null;
+
+    // Special handling for @JsonUnwrapped - consider field name as the property name
+    if (_hasAnnotation(a, JsonUnwrapped.class)) {
+        name = a.getName();  // Use the field name as the property name
+    } else {
+        JsonGetter jg = _findAnnotation(a, JsonGetter.class);
+        if (jg != null) {
+            name = jg.value();
+        } else {
+            JsonProperty pann = _findAnnotation(a, JsonProperty.class);
+            if (pann != null) {
+                name = pann.value();
+            } else if (_hasAnnotation(a, JsonSerialize.class)
+                    || _hasAnnotation(a, JsonView.class)
+                    || _hasAnnotation(a, JsonRawValue.class)) {
+                name = "";
+            } else {
+                return null;
+            }
+        }
+    }
+
+    return PropertyName.construct(name);
+}
+```
+
+---
+
+### 🔍 Key Change Explanation
+
+- The change adds a conditional block at the beginning of the method that checks for the presence of `@JsonUnwrapped`.
+- If `@JsonUnwrapped` is present, the name of the annotated field is taken directly (via `a.getName()`), effectively emulating what `@JsonProperty("")` would achieve.
+- This ensures that even private fields decorated with `@JsonUnwrapped` will now appear in the resulting JSON with their original names, allowing tests like the one you shared to succeed.
+
+---
+
+### 🧪 Verification Example
+
+With this patch applied, your original test case should now pass. The field `inner` in `Outer` will correctly serialize as `"animal": "Zebra"` without including `"inner"` in the final JSON output, as intended.
+
+--- 
+
+This approach maintains consistency between `@JsonProperty("")` and `@JsonUnwrapped`, ensuring predictable and intuitive JSON serialization behavior across different types of fields.

@@ -1,0 +1,150 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Closure removes needed code.
+What steps will reproduce the problem?
+1. Try the following code, in Simple mode
+Math.blah = function(test) { test.a = 5; };
+var test = new Object();
+Math.blah(test); 
+2. The output is
+Math.blah=function(a){a.a=5};var test={};
+
+What is the expected output? What do you see instead?
+Note that Math.blah(test) was removed. It should not be. It issues a warning: JSC_USELESS_CODE: Suspicious code. This code lacks side-effects. Is there a bug? at line 4 character 9
+
+What version of the product are you using? On what operating system?
+Tested on Google hosted Closure service.
+
+Please provide any additional information below.
+Closure seems to be protective about Math in particular, and doesn't like people messing around with her? So, when I try the following code:-
+var n = {};
+n.blah = function(test) { test.a = 5; };
+var test = new Object();
+n.blah(test);
+
+It works. When I replace n by Math, then again, Closure kicks out blah. I need that poor fellow. Please talk some sense into it.
+This is an incorrect Java code (src/com/google/javascript/jscomp/NodeUtil.java):
+```java
+static boolean functionCallHasSideEffects(
+    Node callNode, @Nullable AbstractCompiler compiler) {
+  if (callNode.getType() != Token.CALL) {
+    throw new IllegalStateException(
+        "Expected CALL node, got " + Token.name(callNode.getType()));
+  }
+
+  if (callNode.isNoSideEffectsCall()) {
+    return false;
+  }
+
+  Node nameNode = callNode.getFirstChild();
+
+  // Built-in functions with no side effects.
+  if (nameNode.getType() == Token.NAME) {
+    String name = nameNode.getString();
+    if (BUILTIN_FUNCTIONS_WITHOUT_SIDEEFFECTS.contains(name)) {
+      return false;
+    }
+  } else if (nameNode.getType() == Token.GETPROP) {
+    if (callNode.hasOneChild()
+        && OBJECT_METHODS_WITHOUT_SIDEEFFECTS.contains(
+              nameNode.getLastChild().getString())) {
+      return false;
+    }
+
+    if (callNode.isOnlyModifiesThisCall()
+        && evaluatesToLocalValue(nameNode.getFirstChild())) {
+      return false;
+    }
+
+    // Functions in the "Math" namespace have no side effects.
+
+    if (compiler != null && !compiler.hasRegExpGlobalReferences()) {
+      if (nameNode.getFirstChild().getType() == Token.REGEXP
+          && REGEXP_METHODS.contains(nameNode.getLastChild().getString())) {
+        return false;
+      } else if (nameNode.getFirstChild().getType() == Token.STRING
+          && STRING_REGEXP_METHODS.contains(
+              nameNode.getLastChild().getString())) {
+        Node param = nameNode.getNext();
+        if (param != null &&
+            (param.getType() == Token.STRING
+                || param.getType() == Token.REGEXP))
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+Okay, let's take a look at this problem. The user is reporting that the Closure Compiler is removing their code when they use Math.blah, but it works when they use a different object like 'n'. The issue seems to be related to how the Closure Compiler determines if a function call has side effects.
+
+Looking at the provided Java code from NodeUtil.java, specifically the functionCallHasSideEffects method, there's a part where it checks if the function call has no side effects. The comment says, "Functions in the 'Math' namespace have no side effects." That might be the culprit here. 
+
+The user's example involves assigning a function to Math.blah, which is being treated as a no-side-effect call. However, in reality, the function does have side effects because it modifies the 'test' object's property. The Closure Compiler is incorrectly identifying this function call as having no side effects, leading it to remove the code.
+
+So, the problem lies in the logic where the Compiler assumes that any function in the Math namespace has no side effects. But in the user's case, the function is adding a property to an object, which is a side effect. Therefore, the Compiler shouldn't mark this as a no-side-effect call.
+
+To fix this, we need to adjust the condition that checks for the Math namespace. Instead of assuming all Math methods have no side effects, the Compiler should check whether the specific method actually has side effects. If the method is known to have no side effects, then it can be marked accordingly. Otherwise, it should treat it as a regular function call that may have side effects.
+
+In the current code, whenever the function is under the Math namespace, regardless of the actual method, it's considered safe. We need to change this so that only known non-side-effect methods of Math are flagged. For example, Math.pow or Math.random might have no side effects, but a custom method like Math.blah added by the user definitely does have side effects.
+
+Therefore, the fix would involve modifying the condition that checks for Math methods. Instead of checking the namespace, we should check if the method is in a predefined list of Math functions without side effects. If the method isn't in that list, then we should consider it as potentially having side effects and not remove it.
+
+Additionally, the code may be missing the proper handling of custom properties added to objects like Math. Since users can add their own methods to built-in objects, the Compiler shouldn't assume all such methods are side-effect-free unless explicitly declared.
+
+In summary, the solution requires updating the logic to correctly identify which Math methods are truly side-effect-free, rather than blanketly assuming all Math methods are safe. This way, the Closure Compiler will correctly analyze the side effects of each function call and decide whether to keep or remove the code accordingly.
+</think>
+
+To address the issue where **Closure Compiler** incorrectly identifies `Math.blah` as a no-side-effect call and removes it, we need to refine the logic in the `functionCallHasSideEffects` method. The root cause is the **incorrect assumption** that all methods within the `Math` namespace are inherently side-effect-free, even if the developer adds custom properties or functions to it.
+
+---
+
+### ✅ Problem Summary
+
+- **Issue:**  
+  The Closure Compiler removes `Math.blah(test)` because it falsely marks it as a no-side-effect call. However, `Math.blah` has side effects (e.g., modifying `test.a`).  
+
+- **Cause:**  
+  A hardcoded rule in the `functionCallHasSideEffects` method assumes that *any* method under the `Math` namespace is side-effect-free. This causes the compiler to eliminate valid code.
+
+- **Solution:**  
+  Adjust the logic to only flag **known** no-side-effect Math methods (like `Math.pow`, `Math.sqrt`) and avoid making assumptions about dynamically added properties (like `Math.blah`).
+
+---
+
+### 🔧 Code Fix
+
+Update the `functionCallHasSideEffects` method to:
+
+1. Check if the function is a known **no-side-effect Math method**.
+2. Do **not** assume that all `Math.*` calls are side-effect-free.
+3. Allow custom properties (like `Math.blah`) to be treated as normal function calls (i.e., **do not** remove them due to false positives).
+
+Here’s the corrected Java code segment:
+
+```java
+if (nameNode.getFirstChild().getType() == Token.NAME 
+    && nameNode.getString().equals("Math")) {
+
+    // Only flag known no-side-effect Math methods
+    String methodName = nameNode.getLastChild().getString();
+    if (MATH_NO_SIDE_EFFECT_METHODS.contains(methodName)) {
+        return false;
+    }
+
+    // Default: Assume potential side effects unless confirmed otherwise
+    return true;
+}
+```
+
+> **Explanation**:  
+> - The method now **only flags** known Math methods with no side effects (like `Math.floor`, `Math.abs`, etc.).
+> - All

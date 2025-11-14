@@ -1,0 +1,171 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Wide bounds to CMAESOptimizer result in NaN parameters passed to fitness function
+If you give large values as lower/upper bounds (for example -Double.MAX_VALUE as a lower bound), the optimizer can call the fitness function with parameters set to NaN.  My guess is this is due to FitnessFunction.encode/decode generating NaN when normalizing/denormalizing parameters.  For example, if the difference between the lower and upper bound is greater than Double.MAX_VALUE, encode could divide infinity by infinity.
+This is an incorrect Java code (src/main/java/org/apache/commons/math3/optimization/direct/CMAESOptimizer.java):
+```java
+private void checkParameters() {
+    final double[] init = getStartPoint();
+    final double[] lB = getLowerBound();
+    final double[] uB = getUpperBound();
+
+    // Checks whether there is at least one finite bound value.
+    boolean hasFiniteBounds = false;
+    for (int i = 0; i < lB.length; i++) {
+        if (!Double.isInfinite(lB[i]) ||
+            !Double.isInfinite(uB[i])) {
+            hasFiniteBounds = true;
+            break;
+        }
+    }
+    // Checks whether there is at least one infinite bound value.
+    boolean hasInfiniteBounds = false;
+    if (hasFiniteBounds) {
+        for (int i = 0; i < lB.length; i++) {
+            if (Double.isInfinite(lB[i]) ||
+                Double.isInfinite(uB[i])) {
+                hasInfiniteBounds = true;
+                break;
+            }
+        }
+
+        if (hasInfiniteBounds) {
+            // If there is at least one finite bound, none can be infinite,
+            // because mixed cases are not supported by the current code.
+            throw new MathUnsupportedOperationException();
+        } else {
+            // Convert API to internal handling of boundaries.
+            boundaries = new double[2][];
+            boundaries[0] = lB;
+            boundaries[1] = uB;
+
+            // Abort early if the normalization will overflow (cf. "encode" method).
+        }
+    } else {
+        // Convert API to internal handling of boundaries.
+        boundaries = null;
+    }
+
+    if (inputSigma != null) {
+        if (inputSigma.length != init.length) {
+            throw new DimensionMismatchException(inputSigma.length, init.length);
+        }
+        for (int i = 0; i < init.length; i++) {
+            if (inputSigma[i] < 0) {
+                throw new NotPositiveException(inputSigma[i]);
+            }
+            if (boundaries != null) {
+                if (inputSigma[i] > boundaries[1][i] - boundaries[0][i]) {
+                    throw new OutOfRangeException(inputSigma[i], 0, boundaries[1][i] - boundaries[0][i]);
+                }
+            }
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+The issue arises from the `checkParameters` method in the `CMAESOptimizer`, where it incorrectly assumes that having both finite and infinite bounds is invalid. This leads to an exception being thrown even when mixed bounds are acceptable. Additionally, the code may fail to handle cases where the bounds are extremely large, leading to potential `NaN` values during encoding/decoding.
+
+To fix these issues:
+
+1. **Allow Mixed Bounds:** The method should allow some dimensions to have finite bounds while others have infinite bounds, instead of throwing an exception.
+2. **Handle Large Bounds Gracefully:** Prevent division by zero or infinite operations that could result in `NaN` values when normalizing/denormalizing parameters.
+3. **Fix Logic Flows:** Refactor the logic to ensure correct behavior without unnecessary exceptions.
+
+Here's the corrected version of the `checkParameters` method:
+</think>
+
+To address the problem of `NaN` parameters being passed to the fitness function due to improper handling of wide bounds in the `CMAESOptimizer`, we need to carefully refactor the `checkParameters()` method. Here's a detailed breakdown of the issues and their corresponding fixes:
+
+---
+
+### 🔧 Problem Summary
+
+- The current implementation throws an exception (`MathUnsupportedOperationException`) when mixing **finite** and **infinite bounds**, which is not valid in all use cases (especially when only certain dimensions require bounded optimization).
+- It fails to gracefully handle **extremely large bounds**, potentially causing numerical instabilities like dividing infinities in the `encode` method, which results in `NaN`.
+- There’s also ambiguity around how the `boundaries` field is handled depending on the presence of infinite bounds — this can lead to logical inconsistencies in subsequent processing steps.
+
+---
+
+### ✅ Solution Approach
+
+1. **Allow Mixed Bounds:** Allow a mix of finite and infinite bounds — no need to throw an exception unless the bounds are entirely undefined or inconsistent.
+2. **Refine Bound Handling Logic:** Ensure that when `boundaries` is initialized, it’s done properly, regardless of bound type.
+3. **Avoid Numerical Instability:** Modify checks for invalid input sigmas and avoid comparisons involving infinite differences, such as `(uB[i] - lB[i])` when either is infinite.
+
+---
+
+### 🛠️ Corrected Code
+
+```java
+private void checkParameters() {
+    final double[] init = getStartPoint();
+    final double[] lB = getLowerBound();
+    final double[] uB = getUpperBound();
+
+    // Initialize boundaries array
+    boundaries = new double[2][];
+    boundaries[0] = Arrays.copyOf(lB, lB.length); // Lower bounds
+    boundaries[1] = Arrays.copyOf(uB, uB.length); // Upper bounds
+
+    // Check validity of initial point within bounds
+    if (init.length != lB.length || init.length != uB.length) {
+        throw new DimensionMismatchException(init.length, lB.length);
+    }
+
+    for (int i = 0; i < lB.length; i++) {
+        if (init[i] < lB[i] || init[i] > uB[i]) {
+            throw new OutOfRangeException(
+                String.format("Initial point %f out of bounds [%.16g, %.16g]", init[i], lB[i], uB[i]),
+                init[i],
+                lB[i],
+                uB[i]
+            );
+        }
+    }
+
+    if (inputSigma != null) {
+        if (inputSigma.length != init.length) {
+            throw new DimensionMismatchException(inputSigma.length, init.length);
+        }
+        for (int i = 0; i < init.length; i++) {
+            if (inputSigma[i] < 0) {
+                throw new NotPositiveException(inputSigma[i]);
+            }
+            if (Double.isFinite(inputSigma[i])) {
+                if (Double.isFinite(lB[i]) && Double.isFinite(uB[i])) {
+                    if (inputSigma[i] > Math.abs(uB[i] - lB[i])) {
+                        throw new OutOfRangeException(
+                            String.format("Sigma %f exceeds range size %.16g for dimension %d", inputSigma[i], uB[i] - lB[i], i),
+                            inputSigma[i],
+                            0.0,
+                            uB[i] - lB[i]
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+---
+
+### 📌 Key Improvements
+
+| Feature | Description |
+|--------|-------------|
+| **Mixed Bound Support** | Allows both finite and infinite bounds per dimension — useful for partial constraint models. |
+| **Avoids Infinities in Comparisons** | Uses `Double.isFinite(...)` to skip problematic `inf - inf` checks. |
+| **Improved Error Messaging** | Provides clearer messages about what went wrong. |
+| **Consistent Boundary Initialization** | Always initializes the `boundaries` array with copies, avoiding side effects. |
+
+---
+
+###

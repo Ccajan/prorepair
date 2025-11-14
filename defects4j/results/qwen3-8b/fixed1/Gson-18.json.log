@@ -1,0 +1,149 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Gson deserializes wildcards to LinkedHashMap
+This issue is a successor to #1101.
+Models:
+// ? extends causes the issue
+class BigClass { Map<String, ? extends List<SmallClass>> inBig; }
+
+class SmallClass { String inSmall; }
+Json:
+{
+  "inBig": {
+    "key": [
+      { "inSmall": "hello" }
+    ]
+  }
+}
+Gson call:
+SmallClass small = new Gson().fromJson(json, BigClass.class).inBig.get("inSmall").get(0);
+This call will fail with a ClassCastException exception –
+com.google.gson.internal.LinkedTreeMap cannot be cast to Entry. If we remove ? extends then everything works fine.
+This is an incorrect Java code (gson/src/main/java/com/google/gson/internal/$Gson$Types.java):
+```java
+static Type getSupertype(Type context, Class<?> contextRawType, Class<?> supertype) {
+    // wildcards are useless for resolving supertypes. As the upper bound has the same raw type, use it instead
+  checkArgument(supertype.isAssignableFrom(contextRawType));
+  return resolve(context, contextRawType,
+      $Gson$Types.getGenericSupertype(context, contextRawType, supertype));
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+The root cause of this issue lies in how Gson handles generic types with wildcards (`? extends T`) when performing deserialization. In particular, the line:
+
+```java
+return resolve(context, contextRawType,
+    $Gson$Types.getGenericSupertype(context, contextRawType, supertype));
+```
+
+is problematic because `getGenericSupertype` may not correctly handle wildcards when attempting to compute a suitable supertype.
+
+Let's understand what's going on step-by-step and then fix the issue.
+
+---
+
+### 🔍 **Understanding the Problem**
+
+In the provided model:
+
+```java
+class BigClass { 
+  Map<String, ? extends List<SmallClass>> inBig;
+}
+```
+
+Gson tries to resolve the type `? extends List<SmallClass>` during deserialization. The key problem occurs at the method:
+
+```java
+private static final class $Gson$Types {
+    static <T> Type getGenericSupertype(Type context, Class<?> contextRawType, Class<T> supertype) {
+        // ...
+    }
+}
+```
+
+When dealing with `? extends`, this method attempts to find a supertype using only the raw type (`List`). Because of that, it can't differentiate between `List<SmallClass>` and other `List`s like `List<String>` or `List<Integer>`.
+
+As a result, Gson ends up returning `LinkedHashMap` as the actual type during deserialization, which leads to a `ClassCastException` when trying to access entries from a `Map`.
+
+---
+
+### ✅ **Fix: Properly Handle Wildcard Types**
+
+To properly support wildcards during deserialization, we need to adjust the logic of how Gson determines the correct type.
+
+#### 🛠️ **Revised Code Fix**
+
+Replace the problematic line:
+
+```java
+return resolve(context, contextRawType,
+    $Gson$Types.getGenericSupertype(context, contextRawType, supertype));
+```
+
+with more robust handling:
+
+```java
+Type resolvedSupertype = $Gson$Types.getGenericSupertype(
+    context, 
+    contextRawType, 
+    supertype);
+
+if (resolvedSupertype instanceof ParameterizedType) {
+    ParameterizedType paramType = (ParameterizedType) resolvedSupertype;
+
+    // Try to extract the actual element type if available
+    Type[] actualTypeArguments = ((ParameterizedType) paramType)
+            .getActualTypeArguments();
+
+    if (actualTypeArguments.length > 0 && actualTypeArguments[0] instanceof WildcardType) {
+        WildcardType wildcard = (WildcardType) actualTypeArguments[0];
+        Type[] bounds = wildcard.getBounds();
+        if (bounds.length > 0) {
+            // We've found the upper bound
+            resolvedSupertype = $Gson$Types.resolve(
+                context, 
+                contextRawType, 
+                bounds[0]
+            );
+        }
+    }
+}
+
+return resolve(context, contextRawType, resolvedSupertype);
+```
+
+This revised logic now takes into account `WildcardType` and extracts the actual upper bound (like `List<SmallClass>`), thus preventing Gson from defaulting to `LinkedHashMap`.
+
+---
+
+### 🧪 **Example Usage After Fix**
+
+With this change, your original test case should work without errors:
+
+```java
+String json = "{ \"inBig\": { \"key\": [ { \"inSmall\": \"hello\" } ] } }";
+BigClass big = new Gson().fromJson(json, BigClass.class);
+SmallClass small = big.inBig.get("key").get(0); // Should work!
+System.out.println(small.inSmall); // Outputs: hello
+```
+
+---
+
+### ✅ **Summary**
+
+- The issue was due to improper handling of wildcard types in Gson’s internal type resolution logic.
+- By correctly identifying and extracting the upper bound of a wildcard, Gson can properly deserialize nested collections and maps.
+- This change ensures type safety and avoids runtime exceptions such as `ClassCastException`.
+
+---
+
+If you're running Gson version `<2.9`, consider updating to a newer version where these issues have already been fixed in upstream releases. Otherwise, applying the above patch should resolve the problem.

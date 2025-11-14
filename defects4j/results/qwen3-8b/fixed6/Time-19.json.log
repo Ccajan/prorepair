@@ -1,0 +1,163 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# #124 Inconsistent interpretation of ambiguous time during DST
+The inconsistency appears for timezone Europe/London.
+Consider the following code
+…
+DateTime britishDate = new DateTime(2011, 10, 30, 1, 59, 0, 0, DateTimeZone.forID("Europe/London"));
+DateTime norwDate = new DateTime(2011, 10, 30, 2, 59, 0, 0, DateTimeZone.forID("Europe/Oslo"));
+DateTime finnishDate = new DateTime(2011, 10, 30, 3, 59, 0, 0, DateTimeZone.forID("Europe/Helsinki"));
+    System.out.println(britishDate);
+    System.out.println(norwDate);
+    System.out.println(finnishDate);
+
+…
+These three DateTime objects should all represent the same moment in time even if they are ambiguous. And using jodatime 1.6.2 this is the case. The code produces the following output:
+2011-10-30T01:59:00.000Z
+2011-10-30T02:59:00.000+01:00
+2011-10-30T03:59:00.000+02:00
+Using jodatime 2.0 however, the output is:
+2011-10-30T01:59:00.000Z
+2011-10-30T02:59:00.000+02:00
+2011-10-30T03:59:00.000+03:00
+which IMO is wrong for Europe/London. Correct output should have been 
+2011-10-30T01:59:00.000+01:00
+The release notes for 2.0 states that: 
+"Now, it always returns the earlier instant (summer time) during an overlap. …"
+This is an incorrect Java code (src/main/java/org/joda/time/DateTimeZone.java):
+```java
+public int getOffsetFromLocal(long instantLocal) {
+    // get the offset at instantLocal (first estimate)
+    final int offsetLocal = getOffset(instantLocal);
+    // adjust instantLocal using the estimate and recalc the offset
+    final long instantAdjusted = instantLocal - offsetLocal;
+    final int offsetAdjusted = getOffset(instantAdjusted);
+    // if the offsets differ, we must be near a DST boundary
+    if (offsetLocal != offsetAdjusted) {
+        // we need to ensure that time is always after the DST gap
+        // this happens naturally for positive offsets, but not for negative
+        if ((offsetLocal - offsetAdjusted) < 0) {
+            // if we just return offsetAdjusted then the time is pushed
+            // back before the transition, whereas it should be
+            // on or after the transition
+            long nextLocal = nextTransition(instantAdjusted);
+            long nextAdjusted = nextTransition(instantLocal - offsetAdjusted);
+            if (nextLocal != nextAdjusted) {
+                return offsetLocal;
+            }
+        }
+    } else if (offsetLocal > 0) {
+        long prev = previousTransition(instantAdjusted);
+        if (prev < instantAdjusted) {
+            int offsetPrev = getOffset(prev);
+            int diff = offsetPrev - offsetLocal;
+            if (instantAdjusted - prev <= diff) {
+                return offsetPrev;
+            }
+        }
+    }
+    return offsetAdjusted;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public int getOffsetFromLocal(long instantLocal) {
+    // get the offset at instantLocal (first estimate)
+    final int offsetLocal = getOffset(instantLocal);
+    // adjust instantLocal using the estimate and recalculate the offset
+    final long instantAdjusted = instantLocal - offsetLocal;
+    final int offsetAdjusted = getOffset(instantAdjusted);
+    // Check if the offsets differ, which indicates a DST boundary
+    if (offsetLocal != offsetAdjusted) {
+        // For positive offsets, the transition is handled correctly
+        // but we need to check for negative offsets as well
+        if ((offsetLocal - offsetAdjusted) < 0) {
+            // If we return offsetAdjusted, the time is pushed back
+            // before the transition; it should be on or after
+            long nextLocal = nextTransition(instantAdjusted);
+            long nextAdjusted = nextTransition(instantLocal - offsetAdjusted);
+            if (nextLocal != nextAdjusted) {
+                return offsetLocal;
+            }
+        }
+    } else if (offsetLocal > 0) {
+        long prev = previousTransition(instantAdjusted);
+        if (prev < instantAdjusted) {
+            int offsetPrev = getOffset(prev);
+            int diff = offsetPrev - offsetLocal;
+            if (instantAdjusted - prev <= diff) {
+                return offsetPrev;
+            }
+        }
+    }
+    return offsetAdjusted;
+}
+```
+
+However, I believe there might be some issues with this fix. Let me try again.
+
+```java
+public int getOffsetFromLocal(long instantLocal) {
+    // get the offset at instantLocal (first estimate)
+    final int offsetLocal = getOffset(instantLocal);
+    // adjust instantLocal using the estimate and recalculate the offset
+    final long instantAdjusted = instantLocal - offsetLocal;
+    final int offsetAdjusted = getOffset(instantAdjusted);
+    // Check if the offsets differ, indicating a DST boundary
+    if (offsetLocal != offsetAdjusted) {
+        // For positive offsets, the transition is correctly handled
+        // but we need to handle negative offset cases carefully
+        if ((offsetLocal - offsetAdjusted) < 0) {
+            // If we return offsetAdjusted, the time is pushed back before the transition
+            // so we prefer the original offsetLocal
+            long nextLocal = nextTransition(instantAdjusted);
+            long nextAdjusted = nextTransition(instantLocal - offsetAdjusted);
+            if (nextLocal != nextAdjusted) {
+                return offsetLocal;
+            }
+        }
+    } else if (offsetLocal > 0) {
+        long prev = previousTransition(instantAdjusted);
+        if (prev < instantAdjusted) {
+            int offsetPrev = getOffset(prev);
+            int diff = offsetPrev - offsetLocal;
+            if (instantAdjusted - prev <= diff) {
+                return offsetPrev;
+            }
+        }
+    }
+    return offsetAdjusted;
+}
+```
+
+Hmm, maybe I'm missing something here. Let me think about the problem again.
+
+In the Joda-Time 2.0 version, when dealing with an ambiguous time (like 1:59 AM on October 30th, 2011 in London), it's choosing the summer time (positive offset) instead of the winter time (negative offset). This causes the printed date to show +01:00 instead of +00:00 for the British date.
+
+I believe the issue lies in how the method handles the transition from summer time to winter time. When there's an ambiguous period, we want to choose the earlier instant (summer time) as stated in the release notes.
+
+But in this particular case, the correct behavior would be to select the winter time (non-DST) for the British date.
+
+Wait, I'm getting confused. Let me clarify:
+
+In 2011, the UK had a daylight saving time change on March 27th, where clocks were moved forward by one hour, creating a gap. Then, on October 30th, clocks were turned back by one hour, creating an overlap. On this day, both 1:59 AM and 2:59 AM would correspond to the same UTC time.
+
+Joda-Time 2.0 chooses the later time (summer time) for the British date, while Joda-Time 1.6.2 chooses the earlier time (winter time).
+
+So in this case, the code is making the wrong choice according to what was expected.
+
+The problem is likely in the `getOffsetFromLocal` method, specifically in how it determines which offset to use when there's an ambiguity.
+
+After reviewing the code, I think the core issue is that the method is incorrectly favoring the summer time offset (positive) over the winter time offset (negative) during overlaps.
+
+Let me attempt to modify the code to address this:
+
+```java
+public int getOffsetFromLocal(long instantLocal) {
+    // get the offset at instantLocal (first estimate)
+    final int offsetLocal = getOffset

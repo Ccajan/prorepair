@@ -1,0 +1,180 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# StringEscapeUtils.escapeXml(input) outputs wrong results when an input contains characters in Supplementary Planes.
+Hello.
+I use StringEscapeUtils.escapeXml(input) to escape special characters for XML.
+This method outputs wrong results when input contains characters in Supplementary Planes.
+String str1 = "\uD842\uDFB7" + "A";
+String str2 = StringEscapeUtils.escapeXml(str1);
+// The value of str2 must be equal to the one of str1,
+// because str1 does not contain characters to be escaped.
+// However, str2 is diffrent from str1.
+System.out.println(URLEncoder.encode(str1, "UTF-16BE")); //%D8%42%DF%B7A
+System.out.println(URLEncoder.encode(str2, "UTF-16BE")); //%D8%42%DF%B7%FF%FD
+The cause of this problem is that the loop to translate input character by character is wrong.
+In CharSequenceTranslator.translate(CharSequence input, Writer out),
+loop counter "i" moves from 0 to Character.codePointCount(input, 0, input.length()),
+but it should move from 0 to input.length().
+This is an incorrect Java code (src/main/java/org/apache/commons/lang3/text/translate/CharSequenceTranslator.java):
+```java
+public final void translate(CharSequence input, Writer out) throws IOException {
+    if (out == null) {
+        throw new IllegalArgumentException("The Writer must not be null");
+    }
+    if (input == null) {
+        return;
+    }
+    int pos = 0;
+    int len = Character.codePointCount(input, 0, input.length());
+    while (pos < len) {
+        int consumed = translate(input, pos, out);
+        if (consumed == 0) {
+            char[] c = Character.toChars(Character.codePointAt(input, pos));
+            out.write(c);
+        }
+        else {
+        // contract with translators is that they have to understand codepoints 
+        // and they just took care of a surrogate pair
+        for (int pt = 0; pt < consumed; pt++) {
+                if (pos < len - 2) {
+            pos += Character.charCount(Character.codePointAt(input, pos));
+                } else {
+                    pos++;
+                }
+            }
+            pos--;
+        }
+        pos++;
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import java.io.IOException;
+import java.io.Writer;
+
+/**
+ * A CharSequenceTranslator allows multiple Translators to be composed
+ * into a single translator. Each Translator has a priority. If a Translator
+ * can handle a given character, then the translation is done, otherwise
+ * it is passed to the next translator in order.
+ */
+public class CharSequenceTranslator {
+
+    private static final int UNDEFINED = Integer.MAX_VALUE;
+
+    /**
+     * @return A sequence of Translators that will be used to do the actual translation
+     */
+    protected abstract CharSequenceTranslator[] getTranslators();
+
+    public final void translate(CharSequence input, Writer out) throws IOException {
+        if (out == null) {
+            throw new IllegalArgumentException("The Writer must not be null");
+        }
+        if (input == null) {
+            return;
+        }
+
+        int pos = 0;
+        int len = input.length();
+        while (pos < len) {
+            int consumed = translate(input, pos, out);
+            if (consumed == 0) {
+                // Handle single character case
+                char c = input.charAt(pos);
+                if (Character.isHighSurrogate(c)) {
+                    // Check if there's a low surrogate following
+                    if (pos + 1 < len && Character.isLowSurrogate(input.charAt(pos + 1))) {
+                        // Combine surrogates into a code point
+                        int codePoint = Character.codePointAt(input, pos, pos + 2);
+                        // Translate the code point using the translators
+                        translateCodePoint(codePoint, out);
+                        pos += 2;
+                    } else {
+                        // Write high surrogate as-is (though it's invalid)
+                        out.write(c);
+                        pos++;
+                    }
+                } else if (Character.isLowSurrogate(c)) {
+                    // Low surrogate without preceding high surrogate is invalid
+                    out.write(c);
+                    pos++;
+                } else {
+                    // Normal character
+                    out.write(c);
+                    pos++;
+                }
+            } else {
+                // Update position based on how many characters were consumed
+                pos += consumed;
+            }
+        }
+    }
+
+    private void translateCodePoint(int codePoint, Writer out) throws IOException {
+        // Apply each translator in order until one handles the code point
+        for (CharSequenceTranslator translator : getTranslators()) {
+            if (translator.translateCodePoint(codePoint, out)) {
+                return;
+            }
+        }
+        // If none handled it, write the original character
+        char[] chars = Character.toChars(codePoint);
+        out.write(chars);
+    }
+
+    protected boolean translateCodePoint(int codePoint, Writer out) throws IOException {
+        // Default implementation: do nothing, let subclasses override
+        return false;
+    }
+
+    protected int translate(CharSequence input, int pos, Writer out) throws IOException {
+        // Default implementation: check each character in sequence
+        if (pos >= input.length()) {
+            return 0;
+        }
+
+        char c = input.charAt(pos);
+        if (Character.isHighSurrogate(c)) {
+            // Check if there's a low surrogate following
+            if (pos + 1 < input.length() && Character.isLowSurrogate(input.charAt(pos + 1))) {
+                // Combine surrogates into a code point
+                int codePoint = Character.codePointAt(input, pos, pos + 2);
+                // Translate the codePoint using the translators
+                translateCodePoint(codePoint, out);
+                return 2;
+            } else {
+                // Only a high surrogate, treat as a single character
+                out.write(c);
+                return 1;
+            }
+        } else if (Character.isLowSurrogate(c)) {
+            // Low surrogate without preceding high surrogate is invalid
+            out.write(c);
+            return 1;
+        } else {
+            // Normal character
+            out.write(c);
+            return 1;
+        }
+    }
+}
+```
+
+Okay, I need to fix the issue where StringEscapeUtils.escapeXml is mishandling characters in the Supplementary Planes. Let me look at the provided code.
+
+The problem is in the loop where the code uses Character.codePointCount to determine the length. That's incorrect because codePointCount gives the number of code points, but when dealing with surrogate pairs, we need to process each character correctly. 
+
+Looking at the original code, the loop runs from 0 to len (which is codePointCount), but that's not right. Instead, the loop should iterate over each code unit (char) in the string. So the variable 'len' should be input.length(), not codePointCount. 
+
+Wait, the original code was:
+
+int len = Character.codePointCount(input, 0, input.length());
+
+But that's calculating the number of code points, which would be less than the actual length of the string in terms of code units. For example, a surrogate pair would take two code units but count as one code point. So when processing each code unit, the loop should go up to input.length().

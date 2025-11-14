@@ -1,0 +1,116 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# PAX header entry name ending with / causes problems
+There seems to be a problem when a PAX header entry (link flag is 'x') has a name ending with "/". The TarArchiveEntry.isDirectory() check ends up returning true because of the trailing slash which means no content can be read from the entry. PAX header parsing effectively finds nothing and the stream is not advanced; this leaves the stream in a bad state as the next entry's header is actually read from the header contents.
+If the name is modified to remove the trailing slash when the link flag indicates a PAX header everything seems to work fine. That would be one potential fix in parseTarHeader. Changing isDirectory to return false if isPaxHeader is true (before the trailing "/" check) would probably also fix the issue (though I can't verify that in the debugger like I can with changing the name).
+So far I have only seen this when using Docker to save images that contain a yum database. For example:
+
+docker pull centos:latest && docker save centos:latest | tar x --include "*/layer.tar"
+
+Will produce at least one "layer.tar" that exhibits this issue. If I come across a smaller TAR for testing I will attach it.
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/tar/TarArchiveEntry.java):
+```java
+public boolean isDirectory() {
+    if (file != null) {
+        return file.isDirectory();
+    }
+
+    if (linkFlag == LF_DIR) {
+        return true;
+    }
+
+    if (getName().endsWith("/")) {
+        return true;
+    }
+
+    return false;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+package org.apache.commons.compress.archivers.tar;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.ZipException;
+import org.apache.commons.compress.AbstractTestCase;
+import org.apache.commons.compress.archivers.ArchiveEntry;
+import org.apache.commons.compress.archivers.ArchiveOutputStream;
+import org.apache.commons.compress.utils.IOUtils;
+import org.junit.Test;
+import static org.junit.Assert.*;
+
+/**
+ * Test cases for TarArchiveEntry
+ */
+public class TarArchiveEntryTest {
+
+    @Test
+    public void testGetSetLongName() throws Exception {
+        final TarArchiveEntry entry = new TarArchiveEntry();
+        assertNull("Initial long name should be null", entry.getLongLinkName());
+        entry.setLongLinkName("abc");
+        assertEquals("Set/get long link name", "abc", entry.getLongLinkName());
+
+        try (final ArchiveOutputStream aos = TarArchiveOutputStream
+                .builder().withFile(new File(AbstractTestCase.TEST_CLASSES_DIR, "test.tar")).build()) {
+            aos.putArchiveEntry(entry);
+            assertNotNull("The tar file should not be null", aos.getFileHeader(entry));
+        }
+    }
+
+    private byte[] createContent(final String name) throws IOException {
+        try (final GZIPInputStream gzis = new GZIPInputStream(this.getClass().getResourceAsStream(name))) {
+            return IOUtils.toByteArray(gzis);
+        } catch (final ZipException e) {
+            throw new IllegalStateException(e.getMessage(), e);
+        }
+    }
+
+    @Test
+    public void testIsDirectoryWithTrailingSlash() throws Exception {
+        try (final TarArchiveInputStream tais =
+                     new TarArchiveInputStream(
+                             new java.io.ByteArrayInputStream(createContent("/test-dir-with-trailing-slash.tar.gz")),
+                             StandardCharsets.UTF_8,
+                             1)) {
+            TarArchiveEntry currentEntry = tais.getNextTarEntry();
+            assertNotNull(currentEntry.getName());
+            assertTrue(currentEntry.isDirectory());
+            assertFalse(currentEntry.getName().endsWith("/"));
+            assertNotNull(tais.getNextTarEntry());
+        }
+    }
+
+    @Test
+    public void testIsNotDirectoryWithoutTrailingSlash() throws Exception {
+        try (final TarArchiveInputStream tais =
+                     new TarArchiveInputStream(
+                             new java.io.ByteArrayInputStream(createContent("/test-dir-without-trailing-slash.tar.gz")),
+                             StandardCharsets.UTF_8,
+                             1)) {
+            TarArchiveEntry currentEntry = tais.getNextTarEntry();
+            assertNotNull(currentEntry.getName());
+            assertFalse(currentEntry.isDirectory());
+            assertEquals(currentEntry.getName(), currentEntry.getLinkedFileName());
+            assertFalse(currentEntry.getName().endsWith("/"));
+            assertNotNull(tais.getNextTarEntry());
+        }
+    }
+}
+
+```

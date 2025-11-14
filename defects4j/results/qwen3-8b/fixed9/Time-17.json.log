@@ -1,0 +1,153 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# #141 Bug on withLaterOffsetAtOverlap method
+The method withLaterOffsetAtOverlap created to workaround the issue 3192457 seems to not be working at all.
+I won´t write many info about the problem to solve because the issue 3192457 have this info indeed.
+But If something is unclear I can answer on the comments.
+Problem demonstration:
+TimeZone.setDefault(TimeZone.getTimeZone("America/Sao_Paulo"));
+DateTimeZone.setDefault( DateTimeZone.forID("America/Sao_Paulo") );
+    DateTime dtch;
+    {
+        dtch = new DateTime(2012,2,25,5,5,5,5).millisOfDay().withMaximumValue();
+        System.out.println( dtch ); // prints: 2012-02-25T23:59:59.999-02:00 //Were are at the first 23:** of the day.
+        //At this point dtch have the -03:00 offset
+    }
+    {
+        dtch = dtch.plus(60001);
+        System.out.println( dtch ); // prints: 2012-02-25T23:01:00.000-03:00 //Were are at the first minute of the second 23:** of the day. Ok its correct
+        //At this point dtch have the -03:00 offset
+    }
+    {
+        dtch = dtch.withEarlierOffsetAtOverlap();
+        System.out.println( dtch ); // prints: 2012-02-25T23:01:00.000-02:00 //Were are at the first minute of the first 23:** of the day. Ok its correct
+        //At this point dtch have the -02:00 offset ( because we called withEarlierOffsetAtOverlap() ) // This method is working perfectly
+    }       
+    {
+        dtch = dtch.withLaterOffsetAtOverlap();
+        System.out.println( dtch ); // prints: 2012-02-25T23:01:00.000-02:00 //Were are at the first minute of the first 23:** of the day. 
+        // Here is the problem we should have a -03:00 offset here since we called withLaterOffsetAtOverlap() expecting to change to the second 23:** of the day
+    }
+
+On the last two brackets we can see that withLaterOffsetAtOverlap is not undoing withEarlierOffsetAtOverlap as it should ( and not even working at all )
+This is an incorrect Java code (src/main/java/org/joda/time/DateTimeZone.java):
+```java
+public long adjustOffset(long instant, boolean earlierOrLater) {
+    // a bit messy, but will work in all non-pathological cases
+    
+    // evaluate 3 hours before and after to work out if anything is happening
+    long instantBefore = convertUTCToLocal(instant - 3 * DateTimeConstants.MILLIS_PER_HOUR);
+    long instantAfter = convertUTCToLocal(instant + 3 * DateTimeConstants.MILLIS_PER_HOUR);
+    if (instantBefore == instantAfter) {
+        return instant;  // not an overlap (less than is a gap, equal is normal case)
+    }
+    
+    // work out range of instants that have duplicate local times
+    long local = convertUTCToLocal(instant);
+    return convertLocalToUTC(local, false, earlierOrLater ? instantAfter : instantBefore);
+    
+    // calculate result
+      // currently in later offset
+      // currently in earlier offset
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+// In the existing implementation, the 'adjustOffset' method has issues when handling time zone overlaps.
+
+// The main issue appears to be that the method does not correctly determine which offset to apply based on the given 'earlierOrLater' flag.
+// To fix this, we need to ensure that the 'adjustOffset' method properly checks for overlapping offsets and applies the correct one based on the 'earlierOrLater' parameter.
+
+// Here's how to modify the 'adjustOffset' method:
+
+public long adjustOffset(long instant, boolean earlierOrLater) {
+    // First, check if there is an actual overlap or gap in the timezone data
+    // Evaluate three hours before and after the given instant to detect overlaps
+    long instantBefore = convertUTCToLocal(instant - 3 * DateTimeConstants.MILLIS_PER_HOUR);
+    long instantAfter = convertUTCToLocal(instant + 3 * DateTimeConstants.MILLIS_PER_HOUR);
+
+    // If both values are the same, no overlap or gap exists
+    if (instantBefore == instantAfter) {
+        return instant; // No adjustment needed, just return the original instant
+    }
+
+    // Now, find the current local time corresponding to the given instant
+    long localTime = convertUTCToLocal(instant);
+
+    // Determine the appropriate UTC value based on whether we want the earlier or later offset
+    long adjustedInstant;
+
+    if (earlierOrLater) {
+        // For 'later' offset, use the future instance where the later offset takes effect
+        adjustedInstant = convertLocalToUTC(localTime, true, true); // Adjust to later offset
+    } else {
+        // For 'earlier' offset, use the past instance where the earlier offset was active
+        adjustedInstant = convertLocalToUTC(localTime, true, false); // Adjust to earlier offset
+    }
+
+    return adjustedInstant;
+}
+
+// The key correction involves using the correct parameters in the convertLocalToUTC call.
+// By setting the third argument to 'true' for 'later' and 'false' for 'earlier', we ensure that the method
+// selects the desired offset during overlaps.
+```
+
+In the original code, the `convertLocalToUTC` method was being passed incorrect arguments depending on the `earlierOrLater` flag. Specifically, the third argument in the `convertLocalToUTC` call wasn't appropriately toggled for `earlierOrLater`. 
+
+The corrected version ensures that the `convertLocalToUTC` function receives the right boolean parameter to determine whether to choose the earlier or later offset when an overlap occurs.
+
+By making this correction, the `withLaterOffsetAtOverlap()` and `withEarlierOffsetAtOverlap()` methods should now behave as intended, correctly switching between the available offsets during overlapping periods.
+</think>
+
+The issue described concerns the `withLaterOffsetAtOverlap()` method in Joda-Time, specifically its failure to correctly switch between overlapping time zones such as Brazil’s *America/Sao_Paulo*, where the offset changes from `-02:00` to `-03:00` during daylight saving time transitions.
+
+---
+
+### 🧠 Understanding the Root Cause
+
+Joda-Time uses internal logic (`adjustOffset`) to handle transitions between time zone offsets — particularly during **overlapping** periods like DST switches. The core idea is that when an offset ambiguity arises, the library must decide which offset to use for a specific moment in local time.
+
+However, the original `adjustOffset` logic had a subtle bug in the decision-making process for choosing the correct offset based on the `earlierOrLater` flag. It would sometimes incorrectly apply the wrong offset without considering the full context of the transition.
+
+---
+
+### ✅ Corrected Code
+
+Here is the corrected version of the `adjustOffset` method in `DateTimeZone.java`, ensuring it works properly during overlapping periods:
+
+```java
+public long adjustOffset(long instant, boolean earlierOrLater) {
+    // Check for possible overlap/gap by looking ahead and behind 3 hours
+    long instantBefore = convertUTCToLocal(instant - 3 * DateTimeConstants.MILLIS_PER_HOUR);
+    long instantAfter = convertUTCToLocal(instant + 3 * DateTimeConstants.MILLIS_PER_HOUR);
+
+    if (instantBefore == instantAfter) {
+        return instant; // No overlap or gap detected, no adjustment needed
+    }
+
+    long localTime = convertUTCToLocal(instant); // Find local time at the given instant
+
+    // Choose the correct UTC time based on the "earlierOrLater" flag
+    long adjustedInstant;
+    if (earlierOrLater) {
+        adjustedInstant = convertLocalToUTC(localTime, true, true); // Use later offset
+    } else {
+        adjustedInstant = convertLocalToUTC(localTime, true, false); // Use earlier offset
+    }
+
+    return adjustedInstant;
+}
+```
+
+---
+
+### 🔍 Explanation of Fixes
+
+- **Correct Handling of Flags**:  
+ 

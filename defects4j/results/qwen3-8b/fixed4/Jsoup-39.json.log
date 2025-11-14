@@ -1,0 +1,202 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# JSoup incorrectly moves content from the <head> section into <body> for sample URL
+If you load the following URL:
+http://jornutzon.sydneyoperahouse.com/home.htm
+
+into:
+http://try.jsoup.org/
+
+then it will move the content from the "head" section into the "body" section. The URL
+being parsed validates using the W3C validator:
+http://validator.w3.org/check?uri=http%3A%2F%2Fjornutzon.sydneyoperahouse.com%2Fhome.htm&charset=%28detect+automatically%29&doctype=Inline&ss=1&group=0&user-agent=W3C_Validator%2F1.3+http%3A%2F%2Fvalidator.w3.org%2Fservices
+We are using JSoup 1.7.2
+This is an incorrect Java code (src/main/java/org/jsoup/helper/DataUtil.java):
+```java
+static Document parseByteData(ByteBuffer byteData, String charsetName, String baseUri, Parser parser) {
+    String docData;
+    Document doc = null;
+    if (charsetName == null) { // determine from meta. safe parse as UTF-8
+        // look for <meta http-equiv="Content-Type" content="text/html;charset=gb2312"> or HTML5 <meta charset="gb2312">
+        docData = Charset.forName(defaultCharset).decode(byteData).toString();
+        doc = parser.parseInput(docData, baseUri);
+        Element meta = doc.select("meta[http-equiv=content-type], meta[charset]").first();
+        if (meta != null) { // if not found, will keep utf-8 as best attempt
+            String foundCharset;
+            if (meta.hasAttr("http-equiv")) {
+                foundCharset = getCharsetFromContentType(meta.attr("content"));
+                if (foundCharset == null && meta.hasAttr("charset")) {
+                    try {
+                        if (Charset.isSupported(meta.attr("charset"))) {
+                            foundCharset = meta.attr("charset");
+                        }
+                    } catch (IllegalCharsetNameException e) {
+                        foundCharset = null;
+                    }
+                }
+            } else {
+                foundCharset = meta.attr("charset");
+            }
+
+            if (foundCharset != null && foundCharset.length() != 0 && !foundCharset.equals(defaultCharset)) { // need to re-decode
+                foundCharset = foundCharset.trim().replaceAll("[\"']", "");
+                charsetName = foundCharset;
+                byteData.rewind();
+                docData = Charset.forName(foundCharset).decode(byteData).toString();
+                doc = null;
+            }
+        }
+    } else { // specified by content type header (or by user on file load)
+        Validate.notEmpty(charsetName, "Must set charset arg to character set of file to parse. Set to null to attempt to detect from HTML");
+        docData = Charset.forName(charsetName).decode(byteData).toString();
+    }
+    // UTF-8 BOM indicator. takes precedence over everything else. rarely used. re-decodes incase above decoded incorrectly
+    if (docData.length() > 0 && docData.charAt(0) == 65279) {
+        byteData.rewind();
+        docData = Charset.forName(defaultCharset).decode(byteData).toString();
+        docData = docData.substring(1);
+        charsetName = defaultCharset;
+    }
+    if (doc == null) {
+        doc = parser.parseInput(docData, baseUri);
+        doc.outputSettings().charset(charsetName);
+    }
+    return doc;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+The issue you're encountering with **JSoup** (version `1.7.2`) stems from how it handles parsing and processing `<head>` elements. In your example, content from the `<head>` section is being incorrectly moved into the `<body>` section when using certain parsers — this behavior is **not correct according to standard HTML parsing rules**.
+
+---
+
+## 🧩 Problem Summary
+
+- You're observing that **JSoup pulls `<head>` content into the `<body>`**.
+- This seems to be related to how JSoup processes HTML and handles malformed or improperly structured documents.
+- Your reference to `DataUtil.java` in `org.jsoup.helper` is not directly responsible for this behavior — it's more about detecting encoding.
+
+---
+
+## 🔍 Root Cause
+
+While the exact cause is subtle, here’s what we can deduce:
+
+### ✅ What Is Correct Behavior?
+
+According to **HTML specification**, the `<head>` element should remain within the document structure and should **never be placed inside the `<body>`**. Any such content **must be moved out manually** during parsing or post-processing steps.
+
+However, some **HTML parsers**, including **JSoup**, **may misinterpret or mishandle malformed input**. If there are mismatched tags, or poor HTML formatting (e.g., invalid closing tags), JSoup might not properly handle the `<head>` content.
+
+---
+
+## ✅ Solution: Fixing the Issue
+
+To ensure proper parsing and prevent `<head>` content from being incorrectly moved into `<body>`, follow these steps:
+
+### 1. Use Strict Parsing Mode
+
+Use `Parser.htmlParser()` instead of `Parser.xmlParser()` to ensure strict HTML handling.
+
+#### ❌ Example (Incorrect)
+
+```java
+Document doc = Jsoup.parse(inputString, "", Parser.xmlParser());
+```
+
+#### ✅ Recommended
+
+```java
+Document doc = Jsoup.parse(inputString, "", Parser.htmlParser());
+```
+
+### 2. Sanitize and Normalize Input
+
+Ensure the input string is well-formed before parsing. You may want to use a tool like `jsoup.clean(...)` to clean up malformed data.
+
+### 3. Check for Mismatched Tags
+
+If the HTML has mismatched opening/closing tags or missing structure, JSoup could interpret it in unexpected ways. Inspect the raw input for malformed structures, especially around `<head>` and `<body>` sections.
+
+### 4. Custom Post-Processing
+
+If content still ends up in the wrong place, consider manually checking and moving it back after parsing:
+
+```java
+Document doc = Jsoup.parse(html, "");
+
+// Move head contents outside body
+Element head = doc.head();
+if (head != null) {
+    Element body = doc.body();
+    if (body != null) {
+        while (body.childNodeCount() > 0) {
+            Node node = body.childNode(0);
+            body.removeChild(node);
+            head.appendChild(node);
+        }
+    }
+}
+
+System.out.println(doc.outerHtml());
+```
+
+---
+
+## 🔧 Patch for `DataUtil.java`
+
+You’ve correctly pointed out the potential bug in `parseByteData(...)`. However, **this method does not directly affect the `<head>`/`<body>` structure** — it mainly deals with decoding and initial parsing logic.
+
+Still, let's review the relevant part of the method where **charsets** are determined:
+
+```java
+if (meta != null) {
+    String foundCharset;
+    if (meta.hasAttr("http-equiv")) {
+        foundCharset = getCharsetFromContentType(meta.attr("content"));
+        if (foundCharset == null && meta.hasAttr("charset")) {
+            try {
+                if (Charset.isSupported(meta.attr("charset"))) {
+                    foundCharset = meta.attr("charset");
+                }
+            } catch (IllegalCharsetNameException e) {
+                foundCharset = null;
+            }
+        }
+    } else {
+        foundCharset = meta.attr("charset");
+    }
+
+    if (foundCharset != null && ... ) {
+        ...
+    }
+}
+```
+
+While the logic is logically sound, there may be edge cases where a malformed `meta charset` causes the parsing to fail, leading to odd results.
+
+### ✅ Suggested Enhancement
+
+Update the `getCharsetFromContentType(...)` method to safely extract and process charset values, and wrap error-handling in try-catch blocks.
+
+---
+
+## ✅ Conclusion
+
+| Recommendation | Description |
+|---------------|-------------|
+| ✅ Use `htmlParser()` | Ensures better HTML compliance |
+| ✅ Clean and normalize input | Prevents malformed tag issues |
+| ✅ Manually check `<head>`/`<body>` structure | Post-parse correction |
+| ✅ Improve `getCharsetFromContentType()` | Make sure charsets are handled safely |
+
+If the issue persists despite these changes, consider upgrading JSoup to a newer version (e.g., `1.16.x`). Many bugs were fixed in later versions, including improvements in HTML parsing and structure preservation. 
+
+Would you like help updating your project

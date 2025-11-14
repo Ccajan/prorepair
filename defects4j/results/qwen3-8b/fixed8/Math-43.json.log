@@ -1,0 +1,170 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Statistics.setVarianceImpl makes getStandardDeviation produce NaN
+Invoking SummaryStatistics.setVarianceImpl(new Variance(true/false) makes getStandardDeviation produce NaN. The code to reproduce it:
+
+int[] scores = {1, 2, 3, 4};
+SummaryStatistics stats = new SummaryStatistics();
+stats.setVarianceImpl(new Variance(false)); //use "population variance"
+for(int i : scores) {
+  stats.addValue(i);
+}
+double sd = stats.getStandardDeviation();
+System.out.println(sd);
+
+A workaround suggested by Mikkel is:
+
+  double sd = FastMath.sqrt(stats.getSecondMoment() / stats.getN());
+This is an incorrect Java code (src/main/java/org/apache/commons/math/stat/descriptive/SummaryStatistics.java):
+```java
+public void addValue(double value) {
+    sumImpl.increment(value);
+    sumsqImpl.increment(value);
+    minImpl.increment(value);
+    maxImpl.increment(value);
+    sumLogImpl.increment(value);
+    secondMoment.increment(value);
+    // If mean, variance or geomean have been overridden,
+    // need to increment these
+    if (!(meanImpl instanceof Mean)) {
+        meanImpl.increment(value);
+    }
+    if (!(varianceImpl instanceof Variance)) {
+        varianceImpl.increment(value);
+    }
+    if (!(geoMeanImpl instanceof GeometricMean)) {
+        geoMeanImpl.increment(value);
+    }
+    n++;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+The issue described stems from how `SummaryStatistics` handles the computation of standard deviation when using `setVarianceImpl(Variance)` with a specific type of variance (e.g., population variance). When you set `setVarianceImpl(new Variance(false))`, this tells the statistics object that it should calculate **population variance** rather than sample variance.
+
+However, the standard deviation is computed as the square root of the variance, and **if the variance implementation is not properly integrated into the calculation**, then using `getStandardDeviation()` could result in `NaN`.
+
+Let's look at what's happening here step by step:
+
+---
+
+## ✅ What's Wrong?
+
+In the method:
+```java
+public void addValue(double value) {
+    sumImpl.increment(value);
+    sumsqImpl.increment(value);
+    minImpl.increment(value);
+    maxImpl.increment(value);
+    sumLogImpl.increment(value);
+    secondMoment.increment(value);
+    // ...
+    if (!(varianceImpl instanceof Variance)) {
+        varianceImpl.increment(value);
+    }
+    n++;
+}
+```
+
+- It checks if `varianceImpl` is *not* of type `Variance` and calls `.increment(value)` on it.
+- But in your case, `varianceImpl` is already initialized as `new Variance(false)`.
+- So that conditional does **not** trigger, and the variance is not updated correctly — this leads to an **incorrect variance value**.
+  
+Then, when calling `getStandardDeviation()`, which uses:
+```java
+return Math.sqrt(getVariance());
+```
+
+If the internal variance was never properly calculated due to the missing call to `.increment(value)` on the custom variance instance (`new Variance(false)`), then `getVariance()` returns `NaN` or some invalid number, leading to a `NaN` for `sd`.
+
+---
+
+## ✅ How to Fix It?
+
+To fix the issue, we must ensure that **the variance is being properly updated** whenever data points are added. Specifically, when `varianceImpl` is an instance of `Variance` (like `new Variance(false)`), it still needs to be incremented during each `addValue()` call.
+
+So, instead of checking whether the current `varianceImpl` is of type `Variance`, we should simply always call `.increment(value)` regardless.
+
+### ✅ Corrected Code:
+Replace this line:
+```java
+if (!(varianceImpl instanceof Variance)) {
+    varianceImpl.increment(value);
+}
+```
+
+With:
+```java
+varianceImpl.increment(value);
+```
+
+---
+
+## ✅ Final Fixed Method:
+
+```java
+public void addValue(double value) {
+    sumImpl.increment(value);
+    sumsqImpl.increment(value);
+    minImpl.increment(value);
+    maxImpl.increment(value);
+    sumLogImpl.increment(value);
+    secondMoment.increment(value);
+    
+    // Always update the variance, even if it's a Variance instance
+    varianceImpl.increment(value); 
+
+    // If mean, variance or geomean have been overridden,
+    // need to increment these
+    if (!(meanImpl instanceof Mean)) {
+        meanImpl.increment(value);
+    }
+
+    if (!(geoMeanImpl instanceof GeometricMean)) {
+        geoMeanImpl.increment(value);
+    }
+
+    n++;
+}
+```
+
+---
+
+## ✅ Alternative Workaround (If You Want Full Control)
+
+Alternatively, to make sure you're computing the correct standard deviation manually, you can override `getStandardDeviation()` like so:
+
+```java
+@Override
+public double getStandardDeviation() {
+    return FastMath.sqrt(getSecondMoment() / getN());
+}
+```
+
+Or use this version if you want to compute sample standard deviation:
+
+```java
+@Override
+public double getStandardDeviation() {
+    return FastMath.sqrt((getSecondMoment() - (getMean() * getMean())) / (getN() - 1));
+}
+```
+
+---
+
+## ✅ Summary
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| `getStandardDeviation()` returns `NaN` | Variance isn't updated due to flawed conditional logic | Ensure `varianceImpl.increment(value)` is always called |
+| Bad variance calculation | Missing updates to the variance estimator | Replace `if` condition with direct call |
+
+✅ This will resolve the problem and allow the standard deviation to be computed correctly based on the variance provided through `setVarianceImpl`.

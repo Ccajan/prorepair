@@ -1,0 +1,172 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# DateTimeSerializerBase ignores configured date format when creating contextual
+DateTimeSerializerBase#createContextual creates a new serializer with StdDateFormat.DATE_FORMAT_STR_ISO8601 format instead of re-using the actual format that may have been specified on the configuration. See the following code:
+final String pattern = format.hasPattern()
+                                    ? format.getPattern()
+                                    : StdDateFormat.DATE_FORMAT_STR_ISO8601;
+
+Using the @JsonFormat annotation on a field will therefore reset the format to Jackson's default even if the annotation doesn't specify any custom format.
+DateBasedDeserializer#createContextual behaves differently and tries to re-use the configured format:
+DateFormat df = ctxt.getConfig().getDateFormat();
+// one shortcut: with our custom format, can simplify handling a bit
+if (df.getClass() == StdDateFormat.class) {
+   ...
+   StdDateFormat std = (StdDateFormat) df;
+   std = std.withTimeZone(tz);
+   ...
+} else {
+  // otherwise need to clone, re-set timezone:
+  df = (DateFormat) df.clone();
+  df.setTimeZone(tz);
+}
+
+Shouldn't the serializer follow the same approach ?
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/ser/std/DateTimeSerializerBase.java):
+```java
+    public JsonSerializer<?> createContextual(SerializerProvider serializers,
+            BeanProperty property) throws JsonMappingException
+    {
+        if (property == null) {
+            return this;
+        }
+        JsonFormat.Value format = findFormatOverrides(serializers, property, handledType());
+        if (format == null) {
+            return this;
+        }
+        // Simple case first: serialize as numeric timestamp?
+        JsonFormat.Shape shape = format.getShape();
+        if (shape.isNumeric()) {
+            return withFormat(Boolean.TRUE, null);
+        }
+
+        // 08-Jun-2017, tatu: With [databind#1648], this gets bit tricky..
+        // First: custom pattern will override things
+                if ((shape == JsonFormat.Shape.STRING) || format.hasPattern()
+                                || format.hasLocale() || format.hasTimeZone()) {
+                    TimeZone tz = format.getTimeZone();
+                    final String pattern = format.hasPattern()
+                                    ? format.getPattern()
+                                    : StdDateFormat.DATE_FORMAT_STR_ISO8601;
+            final Locale loc = format.hasLocale()
+                            ? format.getLocale()
+                            : serializers.getLocale();
+                    SimpleDateFormat df = new SimpleDateFormat(pattern, loc);
+                    if (tz == null) {
+                        tz = serializers.getTimeZone();
+                    }
+            df.setTimeZone(tz);
+            return withFormat(Boolean.FALSE, df);
+        }
+
+        // Otherwise, need one of these changes:
+
+
+        // Jackson's own `StdDateFormat` is quite easy to deal with...
+
+        // 08-Jun-2017, tatu: Unfortunately there's no generally usable
+        //    mechanism for changing `DateFormat` instances (or even clone()ing)
+        //    So: require it be `SimpleDateFormat`; can't config other types
+//            serializers.reportBadDefinition(handledType(), String.format(
+            // Ugh. No way to change `Locale`, create copy; must re-crete completely:
+        return this;
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+    public JsonSerializer<?> createContextual(SerializerProvider serializers,
+            BeanProperty property) throws JsonMappingException
+    {
+        if (property == null) {
+            return this;
+        }
+        JsonFormat.Value format = findFormatOverrides(serializers, property, handledType());
+        if (format == null) {
+            return this;
+        }
+        // Simple case first: serialize as numeric timestamp?
+        JsonFormat.Shape shape = format.getShape();
+        if (shape.isNumeric()) {
+            return withFormat(Boolean.TRUE, null);
+        }
+
+        // 08-Jun-2017, taru: With [databind#1648], this gets bit tricky..
+        // First: custom pattern will override things
+        if ((shape == JsonFormat.Shape.STRING) || format.hasPattern()
+                || format.hasLocale() || format.hasTimeZone()) {
+            TimeZone tz = format.getTimeZone();
+            final String pattern = format.hasPattern()
+                    ? format.getPattern()
+                    : StdDateFormat.DATE_FORMAT_STR_ISO8601;
+            final Locale loc = format.hasLocale()
+                    ? format.getLocale()
+                    : serializers.getLocale();
+
+            // Check if the current DateFormat is a SimpleDateFormat or StdDateFormat
+            DateFormat currentDF = getContextualDateFormat(serializers);
+
+            if (currentDF instanceof SimpleDateFormat) {
+                // Clone and update if necessary
+                SimpleDateFormat sdf = (SimpleDateFormat) currentDF.clone();
+                sdf.applyPattern(pattern);
+                sdf.setLocale(loc);
+                if (tz == null) {
+                    tz = serializers.getTimeZone();
+                }
+                sdf.setTimeZone(tz);
+                return withFormat(Boolean.FALSE, sdf);
+            } else if (currentDF instanceof StdDateFormat) {
+                // Reuse StdDateFormat and adjust timezone and locale
+                StdDateFormat std = (StdDateFormat) currentDF;
+                std = std.withTimeZone(tz);
+                std = std.withLocale(loc);
+                return withFormat(Boolean.FALSE, std);
+            } else {
+                // For other DateFormat implementations, recreate a SimpleDateFormat
+                SimpleDateFormat df = new SimpleDateFormat(pattern, loc);
+                if (tz == null) {
+                    tz = serializers.getTimeZone();
+                }
+                df.setTimeZone(tz);
+                return withFormat(Boolean.FALSE, df);
+            }
+        }
+
+        // Otherwise, need one of these changes:
+
+        // Jackson's own `StdDateFormat` is quite easy to deal with...
+        // 08-Jun-2017, tatu: Unfortunately there's no generally usable
+        //    mechanism for changing `DateFormat` instances (or even clone()ing)
+        //    So: require it be `SimpleDateFormat`; can't config other types
+//            serializers.reportBadDefinition(handledType(), String.format(
+        // Ugh. No way to change `Locale`, create copy; must re-creaate completely:
+        return this;
+    }
+
+    /**
+     * Helper method to retrieve the current DateFormat from the SerializerProvider.
+     */
+    private DateFormat getContextualDateFormat(SerializerProvider serializers) {
+        return serializers.getConfig().getDateFormat();
+    }
+```
+
+Okay, I'm going to fix the issue where the DateTimeSerializerBase isn't using the configured date format correctly. Let me look at the original code.
+
+The problem is that in the createContextual method, they're creating a new SimpleDateFormat with the pattern from either the format or the default ISO8601. But they should be reusing the existing DateFormat instance if possible, like what DateBasedDeserializer does.
+
+Looking at the code, after checking for pattern, locale, or timezone, they create a new SimpleDateFormat and set the timezone. However, they don't check if the existing DateFormat is already a SimpleDateFormat or StdDateFormat. Instead, they just create a new one, which might not reuse the existing configuration properly.
+
+So the fix should involve checking the type of the current DateFormat. If it's a SimpleDateFormat, clone it and apply the new pattern, locale, and timezone. If it's a StdDateFormat, adjust its settings. Otherwise, fall back to creating a new SimpleDateFormat.
+
+I also notice that the original code didn't have a helper method to get the current DateFormat, so adding that would help. Then, in the main logic, we check the type of the current DateFormat and handle each case accordingly.
+
+Let me structure the solution step by step. First, add the helper method to get the current DateFormat. Then, in the main loop, check the type of the current DF. For SimpleDateFormat, clone and modify. For StdDateFormat, use with methods. For others, create new. This should ensure that the configured format is reused where possible, rather than always creating a new instance.
+</think>
+
+To address the bug in `DateTimeSerializerBase.createContextual` where the configured date format is ignored in favor of Jackson's default `ISO8601` formatting, we need to improve how the serialization context is updated based on annotations like `@JsonFormat`. The root cause lies in not properly reusing an existing `DateFormat` when one is already configured, leading to unintentional resets of the

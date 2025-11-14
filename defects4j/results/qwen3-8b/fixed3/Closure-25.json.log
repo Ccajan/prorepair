@@ -1,0 +1,170 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# anonymous object type inference behavior is different when calling constructors
+The following compiles fine with:
+java -jar build/compiler.jar --compilation_level=ADVANCED_OPTIMIZATIONS --jscomp_error=accessControls --jscomp_error=checkTypes --jscomp_error=checkVars --js ~/Desktop/reverse.js
+
+reverse.js:
+/**
+ * @param {{prop1: string, prop2: (number|undefined)}} parry
+ */
+function callz(parry) {
+  if (parry.prop2 && parry.prop2 < 5) alert('alright!');
+  alert(parry.prop1);
+}
+
+callz({prop1: 'hi'});
+
+However, the following does not:
+/**
+ * @param {{prop1: string, prop2: (number|undefined)}} parry
+ * @constructor
+ */
+function callz(parry) {
+  if (parry.prop2 && parry.prop2 < 5) alert('alright!');
+  alert(parry.prop1);
+}
+
+new callz({prop1: 'hi'});
+
+/Users/dolapo/Desktop/reverse.js:10: ERROR - actual parameter 1 of callz does not match formal parameter
+found   : {prop1: string}
+required: {prop1: string, prop2: (number|undefined)}
+new callz({prop1: 'hi'});
+
+Thanks!
+This is an incorrect Java code (src/com/google/javascript/jscomp/TypeInference.java):
+```java
+private FlowScope traverseNew(Node n, FlowScope scope) {
+
+  Node constructor = n.getFirstChild();
+  scope = traverse(constructor, scope);
+  JSType constructorType = constructor.getJSType();
+  JSType type = null;
+  if (constructorType != null) {
+    constructorType = constructorType.restrictByNotNullOrUndefined();
+    if (constructorType.isUnknownType()) {
+      type = getNativeType(UNKNOWN_TYPE);
+    } else {
+      FunctionType ct = constructorType.toMaybeFunctionType();
+      if (ct == null && constructorType instanceof FunctionType) {
+        // If constructorType is a NoObjectType, then toMaybeFunctionType will
+        // return null. But NoObjectType implements the FunctionType
+        // interface, precisely because it can validly construct objects.
+        ct = (FunctionType) constructorType;
+      }
+      if (ct != null && ct.isConstructor()) {
+        type = ct.getInstanceType();
+      }
+    }
+  }
+  n.setJSType(type);
+  for (Node arg = constructor.getNext(); arg != null; arg = arg.getNext()) {
+    scope = traverse(arg, scope);
+  }
+  return scope;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+To address this issue, we need to fix the type inference behavior in the JavaScript compiler's `traverseNew` method. The problem arises when inferring types for constructor calls, particularly when dealing with anonymous objects.
+
+### Problem Summary:
+When using the `new` operator to invoke a constructor function, the type inference engine fails to properly infer the required parameters from the anonymous object literal used as an argument. This results in a type mismatch error, even though the object contains all the necessary properties.
+
+### Solution Overview:
+We need to modify the `traverseNew` method to correctly handle the case where the constructor is called with an anonymous object literal. Specifically, we should ensure that the inferred type of the anonymous object includes both `prop1` and `prop2`, even if `prop2` is optional or undefined.
+
+### Steps to Repair:
+1. **Identify the Constructor Type**: When processing a constructor call, determine the type of the constructor function.
+2. **Check for Anonymous Object Literals**: If the first argument of the constructor call is an anonymous object literal, infer its type based on the constructor's expected parameter types.
+3. **Infer Parameters from Object Literal**: For each property in the object literal, check against the constructor's expected parameters and ensure they match.
+
+Here is the corrected version of the relevant code:
+
+```java
+private FlowScope traverseNew(Node n, FlowScope scope) {
+  Node constructor = n.getFirstChild();
+  scope = traverse(constructor, scope);
+  JSType constructorType = constructor.getJSType();
+  JSType type = null;
+
+  if (constructorType != null) {
+    constructorType = constructorType.restrictByNotNullOrUndefined();
+    if (constructorType.isUnknownType()) {
+      type = getNativeType(UNKNOWN_TYPE);
+    } else {
+      FunctionType ct = constructorType.toMaybeFunctionType();
+      if (ct == null && constructorType instanceof FunctionType) {
+        // Handle NoObjectType which may implement FunctionType interface
+        ct = (FunctionType) constructorType;
+      }
+
+      if (ct != null && ct.isConstructor()) {
+        // Check if the first argument is an object literal
+        Node arg = constructor.getNext();
+        if (arg != null && arg.isObjectLit()) {
+          // Infer type from the object literal's properties
+          JSType objType = inferObjectTypeFromLiteral(arg);
+          if (objType != null) {
+            type = objType;
+          }
+        } else {
+          // Default to instance type of the constructor
+          type = ct.getInstanceType();
+        }
+      }
+    }
+  }
+
+  n.setJSType(type);
+
+  for (Node arg = constructor.getNext(); arg != null; arg = arg.getNext()) {
+    scope = traverse(arg, scope);
+  }
+
+  return scope;
+}
+
+// Helper method to infer type from object literal
+private JSType inferObjectTypeFromLiteral(Node objLit) {
+  JSType objectType = getNativeType(OBJECT_TYPE);
+  for (Node prop = objLit.getFirstChild(); prop != null; prop = prop.getNext()) {
+    Node key = prop.getFirstChild();
+    Node value = key.getNext();
+    String propName = key.getString();
+    JSType propType = value.getJSType();
+    if (propType != null) {
+      objectType = objectType.addProperty(propName, propType);
+    }
+  }
+  return objectType;
+}
+```
+
+### Explanation:
+- **`inferObjectTypeFromLiteral` Method**: This helper method analyzes the object literal and constructs a type that includes all properties defined in the literal. It ensures that even if some properties are optional or undefined, their presence is accounted for in the inferred type.
+- **Updated `traverseNew` Logic**: When the constructor is called with an object literal, we use the `inferObjectTypeFromLiteral` method to derive the appropriate type for the object. This allows the type checker to recognize all properties of the object literal, including those that might be optional or undefined.
+
+By making these changes, the type inference should now correctly handle cases where an anonymous object literal is passed to a constructor, ensuring that the expected parameters are recognized and any mismatches are appropriately reported.
+
+If you have any further questions or need additional context, feel free to ask!
+
+```java
+```
+</think>
+
+To resolve the issue with incorrect type inference during constructor calls involving anonymous object literals, the core problem lies in how the JavaScript compiler handles the argument type deduction when an object literal is provided as a parameter to a constructor function.
+
+---
+
+### ✅ Root Cause
+
+When you use an object literal like `{ prop1: "hi" }` as an argument to a constructor, the JavaScript type system should infer that this object is compatible with the constructor's declared parameter type—i.e., `{ prop1: string, prop2: (number | undefined) }`. However, the current implementation fails to perform this correct inference, leading to a type mismatch error.
+
+This happens because the existing logic doesn't account for the structure of the object literal

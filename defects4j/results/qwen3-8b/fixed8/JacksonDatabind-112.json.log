@@ -1,0 +1,163 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# StringCollectionDeserializer fails with custom collection
+Seeing this with Jackson 2.9.8.
+We have a custom collection implementation, which is wired to use its "immutable" version for deserialization. The rationale is that we don't want accidental modifications to the data structures that come from the wire, so they all are forced to be immutable.
+After upgrade from 2.6.3 to 2.9.8, the deserialization started breaking with the message:
+
+Cannot construct instance of XXX (although at least one Creator exists): no default no-arguments constructor found
+
+This happens ONLY when you deserialize a custom collection of strings as a property of the other object. Deserializing the custom collection of strings directly works fine, and so does the deserialization of custom collection of non-strings. I believe either the StringCollectionDeserializer should not be invoked for custom collections, or perhaps it does not handle the delegation as expected.
+Please see comments for repro and workaround.
+Thanks!
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/deser/std/StringCollectionDeserializer.java):
+```java
+public JsonDeserializer<?> createContextual(DeserializationContext ctxt,
+        BeanProperty property) throws JsonMappingException
+{
+    // May need to resolve types for delegate-based creators:
+    JsonDeserializer<Object> delegate = null;
+    if (_valueInstantiator != null) {
+        // [databind#2324]: check both array-delegating and delegating
+        AnnotatedWithParams delegateCreator = _valueInstantiator.getDelegateCreator();
+        if (delegateCreator != null) {
+            JavaType delegateType = _valueInstantiator.getDelegateType(ctxt.getConfig());
+            delegate = findDeserializer(ctxt, delegateType, property);
+        }
+    }
+    JsonDeserializer<?> valueDeser = _valueDeserializer;
+    final JavaType valueType = _containerType.getContentType();
+    if (valueDeser == null) {
+        // [databind#125]: May have a content converter
+        valueDeser = findConvertingContentDeserializer(ctxt, property, valueDeser);
+        if (valueDeser == null) {
+        // And we may also need to get deserializer for String
+            valueDeser = ctxt.findContextualValueDeserializer(valueType, property);
+        }
+    } else { // if directly assigned, probably not yet contextual, so:
+        valueDeser = ctxt.handleSecondaryContextualization(valueDeser, property, valueType);
+    }
+    // 11-Dec-2015, tatu: Should we pass basic `Collection.class`, or more refined? Mostly
+    //   comes down to "List vs Collection" I suppose... for now, pass Collection
+    Boolean unwrapSingle = findFormatFeature(ctxt, property, Collection.class,
+            JsonFormat.Feature.ACCEPT_SINGLE_VALUE_AS_ARRAY);
+    NullValueProvider nuller = findContentNullProvider(ctxt, property, valueDeser);
+    if (isDefaultDeserializer(valueDeser)) {
+        valueDeser = null;
+    }
+    return withResolved(delegate, valueDeser, nuller, unwrapSingle);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+The issue you're encountering is due to how **Jackson's `StringCollectionDeserializer`** handles deserialization of *custom* collections in certain versions — specifically **Jackson 2.9.8**.
+
+In your case, the problem arises because **the deserializer attempts to use a generic string-specific deserializer (`StringCollectionDeserializer`)** even for *custom* collections of strings — even though these custom collections are meant to be **immutable**, and thus might not match any of the constructors or factory methods that Jackson tries to find by default.
+
+---
+
+## 🔍 Root Cause
+
+The following lines in `createContextual()` suggest that Jackson tries to use a special string-aware deserializer even when dealing with a *custom collection*, rather than handling it as a general collection type:
+
+```java
+// This part uses String-specific logic
+if (valueDeser == null) {
+    // And we may also need to get deserializer for String
+    valueDeser = ctxt.findContextualValueDeserializer(valueType, property);
+}
+```
+
+This means **Jackson falls back to finding a deserializer for `String`** instead of properly using your custom collection class.
+
+---
+
+## ✅ Solution
+
+### 🛠️ Fix the `createContextual` method to prevent using string-specific deserializer for custom collections
+
+You can modify the relevant section of `StringCollectionDeserializer.createContextual(...)` like this:
+
+```java
+public JsonDeserializer<?> createContextual(
+        DeserializationContext ctxt, BeanProperty property)
+        throws JsonMappingException {
+
+    JsonDeserializer<?> valueDeser = _valueDeserializer;
+
+    // First, try to find deserializer based on declared type (i.e., your custom collection type)
+    JavaType valueType = _containerType.getContentType();
+
+    if (valueDeser == null) {
+        // Try to find appropriate deserializer for the actual container type
+        valueDeser = ctxt.findContextualValueDeserializer(valueType, property);
+
+        // If still not found, try to look up via converters (optional)
+        if (valueDeser == null) {
+            valueDeser = findConvertingContentDeserializer(ctxt, property, valueDeser);
+        }
+
+        if (valueDeser == null) {
+            // If nothing found, fall back to trying a generic approach
+            // but only if the value type is actually a String or something convertible
+            // For your case, skip this fallback for custom collections
+            if (valueType.getRawClass() != String.class) {
+                valueDeser = ctxt.findContextualValueDeserializer(valueType, property);
+            }
+        }
+    } else {
+        // If already has a deserializer, just contextualize it
+        valueDeser = ctxt.handleSecondaryContextualization(valueDeser, property, valueType);
+    }
+
+    // ... rest of the method remains unchanged ...
+}
+```
+
+### 🧩 Alternative: Custom Type Resolver
+
+Alternatively, create a custom `TypeResolverBuilder` that prevents `StringCollectionDeserializer` from being used for your custom collection types.
+
+For example, implement a `TypeResolverBuilder` such as:
+
+```java
+public class ImmutableCollectionTypeResolver extends AsArrayTypeConstructorResolver {
+    @Override
+    public JsonDeserializer<?> findArrayDeserializer(JavaType type, DeserializationConfig config,
+                                                      BeanDescription beanDesc, TypeFactory typeFactory)
+            throws JsonMappingException {
+        Class<?> rawType = type.getRawClass();
+        if (rawType.getName().startsWith("com.yourcompany.Immutable")) {
+            return new YourCustomDeserializer(); // Or null to let Jackson pick another
+        }
+        return super.findArrayDeserializer(type, config, beanDesc, typeFactory);
+    }
+}
+```
+
+Then register it via configuration:
+
+```java
+ObjectMapper mapper = new ObjectMapper();
+mapper.setAbstractTypeResolver(new ImmutableCollectionTypeResolver());
+```
+
+---
+
+## ✅ Summary of Fixes
+
+| Issue | Fix |
+|------|-----|
+| `StringCollectionDeserializer` incorrectly handles custom string collections | Modify `createContextual()` to avoid string-specific logic for non-String types |
+| Optional alternative | Use a `TypeResolverBuilder` to prevent use of `StringCollectionDeserializer` for custom types |
+
+---
+
+Let me know if you'd like a working full reproduction or a pull request patch against the source code!

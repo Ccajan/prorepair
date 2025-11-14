@@ -1,0 +1,121 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# JsonWriter#value(java.lang.Number) can be lenient, but JsonWriter#value(double) can't,
+In lenient mode, JsonWriter#value(java.lang.Number) can write pseudo-numeric values like NaN, Infinity, -Infinity:
+    if (!lenient
+        && (string.equals("-Infinity") || string.equals("Infinity") || string.equals("NaN"))) {
+      throw new IllegalArgumentException("Numeric values must be finite, but was " + value);
+    }
+But JsonWriter#value(double) behaves in different way:
+    if (Double.isNaN(value) || Double.isInfinite(value)) {
+      throw new IllegalArgumentException("Numeric values must be finite, but was " + value);
+    }
+So, while working with streaming, it's impossible to write semi-numeric value without boxing a double (e. g. out.value((Number) Double.valueOf(Double.NaN))).
+I think, this should be possible, because boxing gives worse performance.
+This is an incorrect Java code (gson/src/main/java/com/google/gson/stream/JsonWriter.java):
+```java
+public JsonWriter value(double value) throws IOException {
+  writeDeferredName();
+  if (Double.isNaN(value) || Double.isInfinite(value)) {
+    throw new IllegalArgumentException("Numeric values must be finite, but was " + value);
+  }
+  beforeValue();
+  out.append(Double.toString(value));
+  return this;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public JsonWriter value(double value) throws IOException {
+  writeDeferredName();
+  if (lenient) {
+    beforeValue();
+    out.append(Double.toString(value));
+    return this;
+  }
+  if (Double.isNaN(value) || Double.isInfinite(value)) {
+    throw new IllegalArgumentException("Numeric values must be finite, but was " + value);
+  }
+  beforeValue();
+  out.append(Double.toString(value));
+  return this;
+}
+```
+
+The issue here is that the `value(double)` method doesn't check the `lenient` flag when determining whether to allow non-finite values like NaN or Infinity. The original code throws an exception for these cases regardless of the leniency setting.
+
+To fix this, we need to modify the method as follows:
+
+1. Check if lenient mode is enabled before performing any validation.
+2. If lenient, directly append the value as a string without checking for finiteness.
+3. If not lenient, perform the standard check for finiteness and throw an exception if necessary.
+
+This would make the behavior consistent with the `value(Number)` method, which does take into account the lenient mode when deciding whether to allow non-finite numeric values.
+
+However, I want to clarify that in JSON, the representation of NaN and Infinity isn't standardized in the same way as JavaScript. In JSON, numbers are typically represented as finite decimal numbers, and special values like NaN or Infinity aren't part of the official specification. Therefore, allowing them might not be appropriate from a strict JSON perspective, even in lenient mode.
+
+But since the user has indicated that they want to maintain consistency between the `value(Number)` and `value(double)` methods regarding leniency, the proposed solution would achieve that.
+</think>
+
+The key difference lies in how `JsonWriter` handles **leniency** when writing numeric values. The existing implementation of `value(double)` enforces strict validity checks regardless of the `lenient` configuration, whereas `value(Number)` respects the `lenient` setting. This discrepancy can lead to unnecessary restrictions in lenient mode.
+
+---
+
+### ✅ Problem Summary
+
+When using `value(double)`, the method strictly disallows:
+- `NaN`
+- `Infinity`
+- `-Infinity`
+
+Regardless of whether `lenient` mode is enabled. This breaks compatibility with the `value(Number)` method, which allows such values in lenient mode (by validating against the input string).
+
+---
+
+### 🔧 Proposed Fix
+
+Update the `value(double)` method to respect the `lenient` setting:
+
+```java
+public JsonWriter value(double value) throws IOException {
+  writeDeferredName();
+
+  // Allow NaN/Infinity/-Infinity only if lenient mode is enabled
+  if (lenient) {
+    beforeValue();
+    out.append(Double.toString(value));
+    return this;
+  }
+
+  // Otherwise, enforce valid finite values
+  if (Double.isNaN(value) || Double.isInfinite(value)) {
+    throw new IllegalArgumentException("Numeric values must be finite, but was " + value);
+  }
+
+  beforeValue();
+  out.append(Double.toString(value));
+  return this;
+}
+```
+
+---
+
+### 🧠 Why This Works
+
+- When **lenient** is true: We treat `double` values like any other number, including those that represent `NaN` or `Infinity`.
+- When **lenient** is false: Enforce JSON correctness by rejecting invalid numbers.
+
+This makes the behavior of `value(double)` consistent with `value(Number)` while maintaining semantic correctness based on the `lenient` mode.
+
+---
+
+### ⚠️ Important Note on JSON Standards
+
+JSON itself does **not support** `NaN` or `Infinity`. These values are interpreted differently in various contexts (e.g., JavaScript), but they are **not defined in the JSON spec**. Hence, allowing them may introduce ambiguity unless explicitly needed for compatibility with external systems expecting such values.
+
+If leniency is required, consider treating such values as strings (`"NaN"`, `"Infinity"`) instead of numeric types, ensuring compliance with both JSON and application requirements.

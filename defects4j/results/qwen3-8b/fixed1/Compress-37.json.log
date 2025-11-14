@@ -1,0 +1,195 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Parsing PAX headers fails with NegativeArraySizeException
+The TarArchiveInputStream.parsePaxHeaders method fails with a NegativeArraySizeException when there is an empty line at the end of the headers.
+The inner loop starts reading the length, but it gets a newline (10) and ends up subtracting '0' (48) from it; the result is a negative length that blows up an attempt to allocate the rest array.
+I would say that a check to see if ch is less the '0' and break the loop if it is.
+I used npm pack aws-sdk@2.2.16 to generate a tarball with this issue.
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/tar/TarArchiveInputStream.java):
+```java
+Map<String, String> parsePaxHeaders(final InputStream i)
+    throws IOException {
+    final Map<String, String> headers = new HashMap<String, String>(globalPaxHeaders);
+    // Format is "length keyword=value\n";
+    while(true){ // get length
+        int ch;
+        int len = 0;
+        int read = 0;
+        while((ch = i.read()) != -1) {
+            read++;
+            if (ch == ' '){
+                // Get keyword
+                final ByteArrayOutputStream coll = new ByteArrayOutputStream();
+                while((ch = i.read()) != -1) {
+                    read++;
+                    if (ch == '='){ // end of keyword
+                        final String keyword = coll.toString(CharsetNames.UTF_8);
+                        // Get rest of entry
+                        final int restLen = len - read;
+                        if (restLen == 1) { // only NL
+                            headers.remove(keyword);
+                        } else {
+                            final byte[] rest = new byte[restLen];
+                            final int got = IOUtils.readFully(i, rest);
+                            if (got != restLen) {
+                                throw new IOException("Failed to read "
+                                                      + "Paxheader. Expected "
+                                                      + restLen
+                                                      + " bytes, read "
+                                                      + got);
+                            }
+                            // Drop trailing NL
+                            final String value = new String(rest, 0,
+                                                      restLen - 1, CharsetNames.UTF_8);
+                            headers.put(keyword, value);
+                        }
+                        break;
+                    }
+                    coll.write((byte) ch);
+                }
+                break; // Processed single header
+            }
+            len *= 10;
+            len += ch - '0';
+        }
+        if (ch == -1){ // EOF
+            break;
+        }
+    }
+    return headers;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.nio.charset.Charset;
+import java.util.HashMap;
+import java.util.Map;
+
+public class TarArchiveInputStream {
+
+    static final String CharsetNames_UTF_8 = "UTF-8";
+
+    public static void main(String[] args) {
+        // Example usage: test parsing pax headers
+        try {
+            // This is just for demonstration; in real scenario, the input stream would be provided.
+            // For testing, we can simulate an input stream here.
+
+            // Simulate an input stream containing some pax headers data.
+            // For example:
+            // "3 name=example_value\n"
+            // "5 other_key=another_value\n"
+
+            // We need to create a byte array input stream that simulates the input.
+            byte[] paxData = "3 name=example_value\n5 other_key=another_value\n".getBytes(CharsetNames_UTF_8);
+
+            // Now use the fixed parsePaxHeaders function
+            Map<String, String> parsedHeaders = parsePaxHeaders(paxData);
+
+            // Output the parsed headers
+            for (Map.Entry<String, String> entry : parsedHeaders.entrySet()) {
+                System.out.println(entry.getKey() + ": " + entry.getValue());
+            }
+
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    static Map<String, String> parsePaxHeaders(byte[] inputBytes) throws IOException {
+        final Map<String, String> headers = new HashMap<>();
+        final ByteArrayInputStream inputStream = new ByteArrayInputStream(inputBytes);
+
+        while (true) {
+            int ch;
+            int len = 0;
+            int read = 0;
+
+            // Read the length part
+            while ((ch = inputStream.read()) != -1) {
+                read++;
+                if (ch == ' ') {
+                    // Found space, start processing the header
+                    break;
+                }
+                // Check for non-digit characters, which might indicate an error or end of data
+                if (ch < '0' || ch > '9') {
+                    // If it's not a digit, consider that we have finished reading the length
+                    break;
+                }
+                len *= 10;
+                len += ch - '0';
+            }
+
+            // Check if we've reached the end of the input stream or encountered invalid character
+            if (ch == -1 || ch < '0' || ch > '9') {
+                // End of input or invalid data, break the loop
+                break;
+            }
+
+            // Now process the actual header content after the space
+            final ByteArrayOutputStream coll = new ByteArrayOutputStream();
+
+            while ((ch = inputStream.read()) != -1) {
+                read++;
+
+                if (ch == '=') {
+                    // Found '=', so we have the keyword
+                    final String keyword = coll.toString(CharsetNames_UTF_8);
+                    coll.reset(); // Reset the buffer for the value
+
+                    // Calculate how much more we need to read
+                    final int restLen = len - read;
+
+                    if (restLen == 1) {
+                        // Only a newline, skip it
+                        headers.remove(keyword);
+                    } else {
+                        final byte[] rest = new byte[restLen];
+                        final int got = IOUtils.readFully(inputStream, rest);
+                        if (got != restLen) {
+                            throw new IOException("Failed to read Pax header. Expected " + restLen + " bytes, read " + got);
+                        }
+                        final String value = new String(rest, 0, restLen - 1, CharsetNames_UTF_8);
+                        headers.put(keyword, value);
+                    }
+
+                    break;
+                } else if (ch == '\n') {
+                    // Encountered a newline, treat as end of header (but handle empty lines)
+                    if (read == 0) {
+                        // Empty line at the end, do nothing
+                        break;
+                    }
+                    // If we reached here without finding '=' then it's an invalid header
+                    break;
+                } else {
+                    coll.write((byte) ch); // Collect characters until '=' is found
+                }
+            }
+
+            // After breaking out of the loop, check if the header was processed properly
+            // For example, ensure that '=' was found
+            // This could be handled with additional checks, but for simplicity, let's assume correct format
+        }
+
+        return headers;
+    }
+}
+```
+
+### Summary of Fixes:
+1. **Check for Digits**: The original code didn't validate that each character read during the length calculation was a digit. This led to potential negative lengths.
+   
+2. **Break on Non-Digit Characters**: Added logic to break out of the length reading loop upon encountering any non-digit character, preventing invalid lengths.
+
+3. **Handle Newlines Correctly**: If a newline is encountered before '=' is found, the header is treated as potentially malformed and skipped. Also handles empty lines appropriately.
+
+4. **General Code Refactoring**: Made the code clearer by separating the length reading from the header

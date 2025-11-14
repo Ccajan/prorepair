@@ -1,0 +1,144 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# #148 DateTimeFormatter.parseInto broken when no year in format
+In Joda Time 2.0, the default year was set to 2000 so that Feb 29 could be parsed correctly. However, parseInto now overwrites the given instant's year with 2000 (or whatever iDefaultYear is set to). The correct behavior would seem to be to use the given instant's year instead of iDefaultYear.
+This does mean that Feb 29 might not be parseable if the instant's year is not a leap year, but in this case the caller asked for that in a sense.
+This is an incorrect Java code (src/main/java/org/joda/time/format/DateTimeFormatter.java):
+```java
+public int parseInto(ReadWritableInstant instant, String text, int position) {
+    DateTimeParser parser = requireParser();
+    if (instant == null) {
+        throw new IllegalArgumentException("Instant must not be null");
+    }
+    
+    long instantMillis = instant.getMillis();
+    Chronology chrono = instant.getChronology();
+    long instantLocal = instantMillis + chrono.getZone().getOffset(instantMillis);
+    chrono = selectChronology(chrono);
+    
+    DateTimeParserBucket bucket = new DateTimeParserBucket(
+        instantLocal, chrono, iLocale, iPivotYear, iDefaultYear);
+    int newPos = parser.parseInto(bucket, text, position);
+    instant.setMillis(bucket.computeMillis(false, text));
+    if (iOffsetParsed && bucket.getOffsetInteger() != null) {
+        int parsedOffset = bucket.getOffsetInteger();
+        DateTimeZone parsedZone = DateTimeZone.forOffsetMillis(parsedOffset);
+        chrono = chrono.withZone(parsedZone);
+    } else if (bucket.getZone() != null) {
+        chrono = chrono.withZone(bucket.getZone());
+    }
+    instant.setChronology(chrono);
+    if (iZone != null) {
+        instant.setZone(iZone);
+    }
+    return newPos;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+Yes, the issue described relates to how `DateTimeFormatter.parseInto` handles parsing dates without a year and overrides the provided `ReadWritableInstant`'s year with the `iDefaultYear`. This can cause problems when users expect the original year from the `instant` object to be preserved.
+
+### Root Cause:
+The method incorrectly forces the parsed date to use `iDefaultYear` even if a valid date (like February 29) is being parsed **without** explicitly specifying a year. This results in **incorrectly setting the year of the input `instant`** rather than using the existing one.
+
+---
+
+### Problem in Code:
+
+Here’s what's wrong:
+
+```java
+instant.setMillis(bucket.computeMillis(false, text)); 
+```
+
+At this line, the method calls `computeMillis(false, text)` which computes the result based on `bucket`, potentially ignoring the year from the `instant`. Instead, it should use the original year from the `instant`.
+
+---
+
+## ✅ Proposed Fix:
+
+Modify the logic to respect the **original year** from the `instant` when parsing a date without a year specified.
+
+We'll replace the part where the final millisecond value is computed with something that preserves the original year from the `instant`, and only applies changes for other fields like month, day, etc., unless the year is missing.
+
+### Here's the corrected version of the relevant portion of the method:
+
+```java
+// Use the original year from the instant, and compute only the other fields
+long originalYear = chronology.year().get(instantMillis);
+long originalMillis = instant.getMillis();
+
+// Get the time zone offset at the current time
+int offset = chrono.getZone().getOffset(originalMillis);
+
+// Compute the local time based on the provided text
+long parsedLocal = bucket.computeMillis(false, text);
+
+// Extract all the components from the parsed date
+DateTimeFieldType[] types = bucket.getTypes();
+
+for (DateTimeFieldType type : types) {
+    Object value = bucket.getValue(type);
+    if (value != null) {
+        // If we have a value for a field, apply it only if it's not the year or we have it already
+        if (!type.equals(chronology.year())) {
+            parsedLocal = type.set(parsedLocal, value);
+        }
+    }
+}
+
+// Now apply the computed local time back into the instant
+instant.setMillis(parsedLocal - offset);
+```
+
+> 📝 **Note**: This is a conceptual replacement. In practice, we'd need to adapt this into the context of the method to preserve the original year while still allowing the rest of the date parts (month, day, etc.) to be parsed correctly.
+
+---
+
+## Alternative: Keep Year From Instant When Parsing Without It
+
+Instead of modifying the entire method, consider updating the following logic:
+
+Replace this:
+
+```java
+instant.setMillis(bucket.computeMillis(false, text));
+```
+
+With something more precise that preserves the year and sets other fields as needed:
+
+```java
+long millisToSet = instant.getMillis(); // keep the original year
+
+// Set each field from the parsed result
+if (bucket.hasField(DateTimeFieldType.monthOfYear())) {
+    millisToSet = DateTimeUtils.setMonth(millisToSet, bucket.getMonthOfYear());
+}
+if (bucket.hasField(DateTimeFieldType.dayOfMonth())) {
+    millisToSet = DateTimeUtils.setDayOfMonth(millisToSet, bucket.getDayOfMonth());
+}
+if (bucket.hasField(DateTimeFieldType.hourOfDay())) {
+    millisToSet = DateTimeUtils.setHourOfDay(millisToSet, bucket.getHourOfDay());
+}
+// Add similar lines for minute, second, etc.
+
+instant.setMillis(millisToSet);
+```
+
+---
+
+## Summary
+
+- The key fix is to **preserve the year from the `instant`** when parsing a date without a specified year.
+- Instead of computing a whole new date, extract and update **only those fields** that were actually provided.
+- Avoid forcing the use of `iDefaultYear` if the user provides a partial date with no explicit year.
+- The root problem is that the current implementation ignores the year from the `instant`.
+
+Let me know if you want help refactoring the full class or integrating this into your project!

@@ -1,0 +1,154 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Possibly wrong TokenBuffer delegate deserialization using @JsonCreator
+class Value {
+@JsonCreator
+public static Value from(TokenBuffer buffer) {
+...
+}
+Given JSON string is  { "a":1, "b":null }, it is expected that while deserializing using delegate buffer,
+current token will be start object {, and rest of the tokens will be available in buffer:
+[START_OBJECT, FIELD_NAME, VALUE_NUMBER_INT, FIELD_NAME, VALUE_NULL, END_OBJECT]
+
+But, buffers ends up being started with field name and then contains single attribute value
+[FIELD_NAME, VALUE_NUMBER_INT]
+
+It's due to how TokenBuffer#copyCurrentStructure works when we have current token as a FIELD_NAME, rather than START_OBJECT, because it's forced to move to next token BeanDeserializer.java:120
+Hope this helps to nail it down. Is it an intended behavior, or it's regression/bug?
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/util/TokenBuffer.java):
+```java
+public TokenBuffer deserialize(JsonParser jp, DeserializationContext ctxt) throws IOException
+{
+        copyCurrentStructure(jp);
+    /* 28-Oct-2014, tatu: As per #592, need to support a special case of starting from
+     *    FIELD_NAME, which is taken to mean that we are missing START_OBJECT, but need
+     *    to assume one did exist.
+     */
+    return this;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+I'm going to fix this issue with the TokenBuffer deserialization logic. The problem seems to be that when using a delegate deserializer with a TokenBuffer, the buffer isn't correctly capturing the full structure of the JSON tokens when the current token is a FIELD_NAME instead of a START_OBJECT.
+
+Let me analyze the issue:
+
+1. The existing implementation only calls copyCurrentStructure once at the beginning
+2. It doesn't handle the special case for FIELD_NAME properly
+3. This results in incomplete buffer content when deserializing through a delegate
+
+Here's my proposed fix:
+
+```java
+public TokenBuffer deserialize(JsonParser jp, DeserializationContext ctxt) throws IOException {
+    // First, capture the initial structure
+    copyCurrentStructure(jp);
+    
+    // Now handle the special case where we might be missing START_OBJECT
+    // This should happen if we're processing a FIELD_NAME directly
+    if (jp.getCurrentToken() == JsonToken.FIELD_NAME) {
+        // We need to add a dummy START_OBJECT token to simulate the proper structure
+        // This allows the buffer to collect all subsequent tokens properly
+        
+        // Create a new TokenBuffer to avoid modifying the original
+        TokenBuffer result = new TokenBuffer(ctxt.getDeserializationConfig(), false);
+        
+        // Add the START_OBJECT token first
+        result.writeStartObject();
+        
+        // Then copy the remaining tokens from the original buffer
+        copyCurrentStructure(result, jp);
+        
+        return result;
+    }
+    
+    return this;
+}
+```
+
+The key changes I've made:
+
+1. Added a check to see if we're currently on a FIELD_NAME token
+2. If so, creates a new TokenBuffer to avoid modifying the original
+3. Adds a dummy START_OBJECT token to the new buffer
+4. Copies the remaining tokens into the new buffer
+5. Returns the new buffer with the complete structure
+
+This approach ensures that even if we start with a FIELD_NAME, we'll get the correct token sequence: [START_OBJECT, FIELD_NAME, ...] which matches what's expected for proper deserialization.
+
+Would you like me to explain any part of this solution in more detail?
+```
+</think>
+
+To address the issue with `TokenBuffer` deserialization when encountering a `FIELD_NAME` token without a preceding `START_OBJECT`, the root cause lies in how `TokenBuffer.deserialize()` handles the flow of token structures during deserialization. The goal is to ensure the buffer captures **the entire token sequence**, including the implied `START_OBJECT` when necessary.
+
+---
+
+### ✅ Problem Summary
+When attempting to deserialize a JSON object like `{ "a": 1, "b": null }` via a delegate such as `Value.from(TokenBuffer)`, the current implementation fails to replicate the full token stream correctly. Instead of expecting:
+
+```
+[START_OBJECT, FIELD_NAME("a"), VALUE_NUMBER_INT(1), FIELD_NAME("b"), VALUE_NULL, END_OBJECT]
+```
+
+It results in:
+
+```
+[FIELD_NAME("a"), VALUE_NUMBER_INT(1)]
+```
+
+This mismatch occurs because the `copyCurrentStructure()` call only starts at the current token (`FIELD_NAME`) and does not account for the expected `START_OBJECT`.
+
+---
+
+### 🛠️ Solution Overview
+
+To resolve this, we enhance the `TokenBuffer.deserialize()` method with these improvements:
+
+1. **Capture Initial Tokens:** Use `copyCurrentStructure(jp)` to record the initial state of the parser.
+2. **Detect Missing `START_OBJECT`:** Check if the current token is `FIELD_NAME`. If true, simulate the presence of a `START_OBJECT`.
+3. **Rebuild the Buffer Properly:** When the `START_OBJECT` is missing, create a new `TokenBuffer`, add the simulated `START_OBJECT`, and re-copy the current tokens into it.
+4. **Return the Resulting Buffer:** Ensure the resulting buffer reflects the complete token structure, including all subsequent values and the `END_OBJECT`.
+
+---
+
+### 🔧 Fixed Code Implementation
+
+```java
+@Override
+public TokenBuffer deserialize(JsonParser jp, DeserializationContext ctxt) throws IOException {
+    // Step 1: Capture the initial token structure
+    copyCurrentStructure(jp);
+
+    // Step 2: Handle the special case when current token is FIELD_NAME
+    if (jp.getCurrentToken() == JsonToken.FIELD_NAME) {
+        // Step 3: Create a new buffer to avoid modifying the original
+        TokenBuffer result = new TokenBuffer(ctxt.getDeserializationConfig(), false);
+        
+        // Step 4: Simulate START_OBJECT before FIELD_NAME
+        result.writeStartObject();
+
+        // Step 5: Copy the current token stream into the new buffer
+        copyCurrentStructure(result, jp);
+
+        // Step 6: Return the fully structured buffer
+        return result;
+    }
+
+    // Otherwise, just return the original buffer
+    return this;
+}
+```
+
+---
+
+### 📝 Key Improvements
+
+| Feature               | Description                                                                 |
+|----------------------|-----------------------------------------------------------------------------|
+| Special Case Handling| Handles

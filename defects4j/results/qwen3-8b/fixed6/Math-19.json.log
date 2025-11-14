@@ -1,0 +1,207 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Wide bounds to CMAESOptimizer result in NaN parameters passed to fitness function
+If you give large values as lower/upper bounds (for example -Double.MAX_VALUE as a lower bound), the optimizer can call the fitness function with parameters set to NaN.  My guess is this is due to FitnessFunction.encode/decode generating NaN when normalizing/denormalizing parameters.  For example, if the difference between the lower and upper bound is greater than Double.MAX_VALUE, encode could divide infinity by infinity.
+This is an incorrect Java code (src/main/java/org/apache/commons/math3/optimization/direct/CMAESOptimizer.java):
+```java
+private void checkParameters() {
+    final double[] init = getStartPoint();
+    final double[] lB = getLowerBound();
+    final double[] uB = getUpperBound();
+
+    // Checks whether there is at least one finite bound value.
+    boolean hasFiniteBounds = false;
+    for (int i = 0; i < lB.length; i++) {
+        if (!Double.isInfinite(lB[i]) ||
+            !Double.isInfinite(uB[i])) {
+            hasFiniteBounds = true;
+            break;
+        }
+    }
+    // Checks whether there is at least one infinite bound value.
+    boolean hasInfiniteBounds = false;
+    if (hasFiniteBounds) {
+        for (int i = 0; i < lB.length; i++) {
+            if (Double.isInfinite(lB[i]) ||
+                Double.isInfinite(uB[i])) {
+                hasInfiniteBounds = true;
+                break;
+            }
+        }
+
+        if (hasInfiniteBounds) {
+            // If there is at least one finite bound, none can be infinite,
+            // because mixed cases are not supported by the current code.
+            throw new MathUnsupportedOperationException();
+        } else {
+            // Convert API to internal handling of boundaries.
+            boundaries = new double[2][];
+            boundaries[0] = lB;
+            boundaries[1] = uB;
+
+            // Abort early if the normalization will overflow (cf. "encode" method).
+        }
+    } else {
+        // Convert API to internal handling of boundaries.
+        boundaries = null;
+    }
+
+    if (inputSigma != null) {
+        if (inputSigma.length != init.length) {
+            throw new DimensionMismatchException(inputSigma.length, init.length);
+        }
+        for (int i = 0; i < init.length; i++) {
+            if (inputSigma[i] < 0) {
+                throw new NotPositiveException(inputSigma[i]);
+            }
+            if (boundaries != null) {
+                if (inputSigma[i] > boundaries[1][i] - boundaries[0][i]) {
+                    throw new OutOfRangeException(inputSigma[i], 0, boundaries[1][i] - boundaries[0][i]);
+                }
+            }
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+The provided code has several issues that need fixing:
+
+1. The initial logic to determine whether we have infinite bounds is flawed
+2. The error checking for infinite bounds is incorrect
+3. The early termination condition is problematic
+4. We need to properly handle cases with infinite bounds
+
+Here's a revised version of the code:
+
+```java
+private void checkParameters() {
+    final double[] init = getStartPoint();
+    final double[] lB = getLowerBound();
+    final double[] uB = getUpperBound();
+
+    // Check if all bounds are finite or infinite
+    boolean allFinite = true;
+    boolean allInfinite = true;
+    for (int i = 0; i < lB.length; i++) {
+        if (!Double.isFinite(lB[i])) {
+            allFinite = false;
+        }
+        if (!Double.isFinite(uB[i])) {
+            allInfinite = false;
+        }
+    }
+
+    // Determine if we have any finite bounds
+    boolean hasFiniteBounds = false;
+    for (int i = 0; i < lB.length; i++) {
+        if (!Double.isInfinite(lB[i]) || !Double.isInfinite(uB[i])) {
+            hasFiniteBounds = true;
+            break;
+        }
+    }
+
+    // Determine if we have any infinite bounds
+    boolean hasInfiniteBounds = false;
+    for (int i = 0; i < lB.length; i++) {
+        if (Double.isInfinite(lB[i]) || Double.isInfinite(uB[i])) {
+            hasInfiniteBounds = true;
+            break;
+        }
+    }
+
+    // Mixed bounds are not supported
+    if (hasFiniteBounds && hasInfiniteBounds) {
+        throw new MathUnsupportedOperationException("Mixed bounds are not supported");
+    }
+
+    // Handle different cases
+    if (allInfinite) {
+        // All bounds are infinite, no constraints needed
+        boundaries = null;
+    } else if (allFinite) {
+        // All bounds are finite, convert to internal format
+        boundaries = new double[2][];
+        boundaries[0] = lB;
+        boundaries[1] = uB;
+        
+        // Early termination if normalization would overflow
+        if (Double.compare(Double.POSITIVE_INFINITY, 
+                         Double.MAX_VALUE / Double.MIN_VALUE) == 0) {
+            throw new MathArithmeticException(
+                "Normalization range too large for floating point precision");
+        }
+    } else {
+        // Some bounds are infinite, handle specially
+        boundaries = new double[2][];
+        boundaries[0] = lB;
+        boundaries[1] = uB;
+    }
+
+    if (inputSigma != null) {
+        if (inputSigma.length != init.length) {
+            throw new DimensionMismatchException(inputSigma.length, init.length);
+        }
+        for (int i = 0; i < init.length; i++) {
+            if (inputSigma[i] < 0) {
+                throw new NotPositiveException(inputSigma[i]);
+            }
+            if (boundaries != null) {
+                double range = boundaries[1][i] - boundaries[0][i];
+                if (range == 0) {
+                    // No range, sigma must be zero
+                    if (inputSigma[i] > 0) {
+                        throw new OutOfRangeException(inputSigma[i], 0, 0);
+                    }
+                } else {
+                    // Check if the range is within floating point limits
+                    if (inputSigma[i] > range) {
+                        throw new OutOfRangeException(
+                            inputSigma[i], 0, range);
+                    }
+                    
+                    // Check if the range is so large it would cause numerical issues
+                    if (Double.compare(range, 
+                                    Double.MAX_VALUE / Double.MIN_VALUE) == 0) {
+                        throw new MathArithmeticException(
+                            "Parameter range too large for floating point precision");
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+The key changes include:
+
+1. Properly distinguishing between finite and infinite bounds
+2. Correctly identifying mixed bounds cases
+3. Improved handling of infinite bounds
+4. Better checks for potential numerical issues
+5. More accurate error messages
+6. Added specific handling for ranges that might cause numerical problems
+
+The code now handles:
+- Purely finite bounds
+- Purely infinite bounds
+- Mixed bounds (which are still not allowed)
+- Cases where parameter ranges might cause numerical instability
+
+I've also added more descriptive error messages to make it clearer what went wrong.
+
+Note: The actual implementation details might vary depending on the specific requirements of the CMA-ES algorithm and how it handles boundary conditions.
+</think>
+
+To address the issue where passing wide bounds (like `-Double.MAX_VALUE`) causes the `CMAESOptimizer` to pass `NaN` parameters to the fitness function, we need to improve the bounds validation and normalization logic in the `checkParameters()` method.
+
+---
+
+### ✅ **Summary of Fixes**
+
+

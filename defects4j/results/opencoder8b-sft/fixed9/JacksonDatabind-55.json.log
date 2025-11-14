@@ -1,0 +1,163 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# EnumMap keys not using enum's `@JsonProperty` values unlike Enum values
+Based on these issues:
+https://github.com/FasterXML/jackson-databind/issues/677
+https://github.com/FasterXML/jackson-databind/issues/1148
+https://github.com/FasterXML/jackson-annotations/issues/96
+
+I implemented @JsonProperty for my enum constants and they show up nicely when they are property values. But I also have an EnumMap which uses the enum, and it's generated JSON uses the original enum names for the keys and not the JsonProperty values.
+
+Using 2.8.1 (in spring boot 4.3.2)
+
+Thanks!
+
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/ser/std/StdKeySerializers.java):
+```java
+@SuppressWarnings("unchecked")
+    public static JsonSerializer<Object> getFallbackKeySerializer(SerializationConfig config,
+            Class<?> rawKeyType)
+    {
+        if (rawKeyType != null) {
+            // 29-Sep-2015, tatu: Odd case here, of `Enum`, which we may get for `EnumMap`; not sure
+            //   if that is a bug or feature. Regardless, it seems to require dynamic handling
+            //   (compared to getting actual fully typed Enum).
+            //  Note that this might even work from the earlier point, but let's play it safe for now
+            // 11-Aug-2016, tatu: Turns out we get this if `EnumMap` is the root value because
+            //    then there is no static type
+            if (rawKeyType == Enum.class) {
+                return new Dynamic();
+            }
+            if (rawKeyType.isEnum()) {
+                return new Default(Default.TYPE_ENUM, rawKeyType);
+            }
+        }
+        return DEFAULT_KEY_SERIALIZER;
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+package com.fasterxml.jackson.databind.ser.std;
+
+import java.io.IOException;
+import java.util.*;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.databind.BeanProperty;
+import com.fasterxml.jackson.databind.JavaType;
+import com.fasterxml.jackson.databind.JsonMappingException;
+import com.fasterxml.jackson.databind.KeyDeserializer;
+import com.fasterxml.jackson.databind.SerializerProvider;
+import com.fasterxml.jackson.databind.ser.ContextualSerializer;
+import com.fasterxml.jackson.databind.type.TypeFactory;
+import com.fasterxml.jackson.databind.jsontype.TypeSerializer;
+
+/**
+ * Key serializer used when using an {@link EnumMap}.
+ */
+public class StdKeySerializer extends StdSerializer<Object>
+    implements ContextualSerializer
+{
+    private final transient JavaType _enumType;
+    protected final transient String[] _names;
+
+    /**
+     * Constructor called to use default (type-based) enumeration name resolution.
+     *
+     * @since 2.7
+     */
+    protected StdKeySerializer(Class<? extends Enum<?>> enumClass)
+    {
+        super(Enum.class);
+        this._enumType = TypeFactory.defaultInstance().constructSimpleType(enumClass);
+        this._names = EnumUtils.getNames(enumClass);
+    }
+
+    /**
+     * Constructor that will be invoked via contextualization, allowing for custom name mappings.
+     *
+     * @param enumType Enum type being serialized
+     * @param names Name strings to use in serialization (if non-null)
+     */
+    protected StdKeySerializer(Class<? extends Enum<?>> enumType, String[] names)
+    {
+        super(Enum.class);
+        this._enumType = TypeFactory.defaultInstance().constructSimpleType(enumType);
+        this._names = names;
+    }
+
+    @Override
+    public void serialize(Object key, JsonGenerator jgen, SerializerProvider provider) throws IOException
+    {
+        if (_names != null) { 
+            jgen.writeString(_names[((Enum<?>)key).ordinal()]);
+        } else { 
+            Enum<?> enm = (Enum<?>)key;
+            jgen.writeString(enm.name());
+        }
+    }
+
+    @Override
+    public boolean isEmpty(SerializerProvider prov, Object value)
+    {
+        return false;
+    }
+
+    @Override
+    public JsonSerializer<?> createContextual(SerializerProvider prov, BeanProperty property)
+        throws JsonMappingException
+    {
+        if (_names != null) {
+            return this;
+        }
+        // First, check if we can actually use annotations from properties:
+        if (property != null && property.getType() == _enumType) {
+            // Let's see whether `@JsonFormat` could give us hints:
+            JsonProperty propDef = property.findExpectedFormat(prov.getConfig()).findProperty("key");
+            if (propDef != null) {
+                String[] names = EnumUtils.getNames(propDef.value(), prov.getConfig(), _enumType.getRawClass());
+                if (names != null) {
+                    return new StdKeySerializer(_enumType.getRawClass(), names);
+                }
+            }
+        }
+        return this;
+    }
+
+    /*
+    /**********************************************************
+    /* Helper methods, mostly Enum-related utility
+    /**********************************************************
+     */
+
+    static final class EnumUtils
+    {
+        public static <E extends Enum<E>> String[] getNames(String[] explicitNames, SerializerProvider provider, Class<E> enumType)
+        {
+            if (explicitNames != null) { // already customized
+                return explicitNames;
+            }
+            E[] enums = enumType.getEnumConstants(); 
+            if (enums != null && enums.length > 0) {
+                Map<String,String> map = new LinkedHashMap<>();
+                for (int i = 0, len = enums.length; i < len; ++i) {
+                    E e = enums[i];
+                    JsonProperty annotation = e.getDeclaringClass().getAnnotation(JsonProperty.class);
+                    String name = (annotation != null) ? annotation.value() : e.name();
+                    if (!map.containsKey(name)) { 
+                        map.put(name, e.name()); 
+                    } 
+                }
+                return map.values().toArray(new String[0]);
+            }
+            return null;
+        }
+    }
+}
+```

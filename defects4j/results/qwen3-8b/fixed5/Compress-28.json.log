@@ -1,0 +1,165 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# TarArchiveInputStream silently finished when unexpected EOF occured
+I just found the following test case didn't raise an IOException as it used to be for a tar trimmed on purpose 
+@Test
+  public void testCorruptedBzip2() throws IOException {
+    String archivePath = PathUtil.join(testdataDir, "test.tar.bz2");
+    TarArchiveInputStream input = null;
+    input = new TarArchiveInputStream(new BZip2CompressorInputStream(
+        GoogleFile.SYSTEM.newInputStream(archivePath), true));
+    ArchiveEntry nextMatchedEntry = input.getNextEntry();
+    while (nextMatchedEntry != null) 
+{
+      logger.infofmt("Extracting %s", nextMatchedEntry.getName());
+      String outputPath = PathUtil.join("/tmp/", nextMatchedEntry.getName());
+      OutputStream out = new FileOutputStream(outputPath);
+      ByteStreams.copy(input, out);
+      out.close();
+      nextMatchedEntry = input.getNextEntry();
+    }
+  }
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/tar/TarArchiveInputStream.java):
+```java
+public int read(byte[] buf, int offset, int numToRead) throws IOException {
+	int totalRead = 0;
+
+    if (hasHitEOF || entryOffset >= entrySize) {
+        return -1;
+    }
+
+    if (currEntry == null) {
+        throw new IllegalStateException("No current tar entry");
+    }
+
+    numToRead = Math.min(numToRead, available());
+    
+    totalRead = is.read(buf, offset, numToRead);
+    count(totalRead);
+    
+    if (totalRead == -1) {
+        hasHitEOF = true;
+    } else {
+        entryOffset += totalRead;
+    }
+
+    return totalRead;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public int read(byte[] buf, int offset, int numToRead) throws IOException {
+    int totalRead = 0;
+
+    if (hasHitEOF || entryOffset >= entrySize) {
+        // Check if we have hit the end of the file or the entry size
+        return -1;
+    }
+
+    if (currEntry == null) {
+        throw new IllegalStateException("No current tar entry");
+    }
+
+    numToRead = Math.min(numToRead, available());
+
+    totalRead = is.read(buf, offset, numToRead);
+    count(totalRead);
+
+    if (totalRead == -1) {
+        hasHitEOF = true;
+    } else {
+        entryOffset += totalRead;
+    }
+
+    // Check if we have reached the end of the current entry
+    if (entryOffset >= entrySize) {
+        // End of current entry reached, move to the next one
+        nextEntry();
+    }
+
+    return totalRead;
+}
+```
+
+The issue in the original code was that it didn't properly check if the end of the current entry had been reached after reading data. This could lead to situations where the stream would silently finish instead of throwing an exception when an unexpected EOF occurred.
+
+In the revised code, after reading data, we check if `entryOffset` has reached or exceeded `entrySize`. If so, we call `nextEntry()` to move to the next entry. This ensures that any unexpected EOF within an entry will cause the stream to advance to the next entry or finish appropriately.
+
+However, there's another potential problem with this approach: if the entire archive is corrupted and we reach the end of the file before finishing the last entry, the stream should probably throw an exception rather than silently moving to the next entry. But based on your description, it seems like the intention was to allow the stream to continue processing entries even if some are incomplete or truncated.
+
+If the goal is to strictly validate the integrity of each entry and throw an exception when an unexpected EOF occurs during reading an entry, then we need to modify the logic further. Here's an alternative version:
+
+```java
+public int read(byte[] buf, int offset, int numToRead) throws IOException {
+    int totalRead = 0;
+
+    if (hasHitEOF || entryOffset >= entrySize) {
+        // Check if we have hit the end of the file or the entry size
+        return -1;
+    }
+
+    if (currEntry == null) {
+        throw new IllegalStateException("No current tar entry");
+        // This may not be necessary if the stream is properly managed
+    }
+
+    numToRead = Math.min(numToRead, available());
+
+    totalRead = is.read(buf, offset, numToRead);
+    count(totalRead);
+
+    if (totalRead == -1) {
+        hasHitEOF = true;
+    } else {
+        entryOffset += totalRead;
+    }
+
+    // Check if we have reached the end of the current entry
+    if (entryOffset >= entrySize) {
+        // If we've reached the end of the entry but haven't yet read all of it,
+        // it indicates a possible corruption
+        if (entryOffset > entrySize) {
+            throw new IOException("Unexpected EOF in entry: " + currEntry.getName());
+        }
+        // Move to the next entry
+        nextEntry();
+    }
+
+    return totalRead;
+}
+```
+
+This version introduces a more strict validation by checking whether we've surpassed the expected entry size. If so, it throws an `IOException` indicating that the entry was prematurely ended.
+</think>
+
+To address the issue in the provided `TarArchiveInputStream.read()` method, we must ensure that **unexpected End Of File (EOF)** errors during entry reading do not go unnoticed — they should either **raise an appropriate exception** or at least **signal that something went wrong** in the context of the archive processing.
+
+---
+
+### ✅ Problem Summary:
+The current implementation silently returns `-1` upon hitting EOF, which can result in **incomplete extraction**, **unhandled exceptions**, or **corruption undetected** due to premature termination without explicit error signaling.
+
+---
+
+### 🧠 Root Cause:
+- The method does not explicitly detect when the stream reaches **the end of a tar entry** (i.e., `entryOffset >= entrySize`) **before hitting the end of the underlying input stream** (`is.read(...) == -1`).
+- It also fails to differentiate between **natural end-of-entry behavior** and **early EOF due to corruption**.
+  
+This causes subtle bugs where the user might not know if the file is corrupted or simply incomplete.
+
+---
+
+### 🔧 Solution Strategy:
+We introduce three key improvements:
+1. Detect when a read operation reaches the **end of the current entry**.
+2. **Signal early EOF in a malformed/unfinished entry** via an `IOException`.
+3. Only proceed to the next entry once the **entire current entry** has been fully read.
+
+Here’s how we fix the `read()` function:
+
+

@@ -1,0 +1,153 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# 1.10 regression (StackOverflowError) with interface where generic type has itself as upper bound
+Add this to GenericMetadataSupportTest:
+    interface GenericsSelfReference<T extends GenericsSelfReference<T>> {
+        T self();
+    }
+
+    @Test
+    public void typeVariable_of_self_type() {
+        GenericMetadataSupport genericMetadata = inferFrom(GenericsSelfReference.class).resolveGenericReturnType(firstNamedMethod("self", GenericsSelfReference.class));
+
+        assertThat(genericMetadata.rawType()).isEqualTo(GenericsSelfReference.class);
+    }
+It fails on master and 1.10.8 with this:
+java.lang.StackOverflowError
+    at sun.reflect.generics.reflectiveObjects.TypeVariableImpl.hashCode(TypeVariableImpl.java:201)
+    at java.util.HashMap.hash(HashMap.java:338)
+    at java.util.HashMap.get(HashMap.java:556)
+    at org.mockito.internal.util.reflection.GenericMetadataSupport.getActualTypeArgumentFor(GenericMetadataSupport.java:193)
+    at org.mockito.internal.util.reflection.GenericMetadataSupport.getActualTypeArgumentFor(GenericMetadataSupport.java:196)
+    at org.mockito.internal.util.reflection.GenericMetadataSupport.getActualTypeArgumentFor(GenericMetadataSupport.java:196)
+
+It worked on 1.9.5. May be caused by the changes in ab9e9f3 (cc @bric3).
+(Also note that while the above interface looks strange, it is commonly used for builder hierarchies, where base class methods want to return this with a more specific type.)
+This is an incorrect Java code (src/org/mockito/internal/util/reflection/GenericMetadataSupport.java):
+```java
+protected void registerTypeVariablesOn(Type classType) {
+    if (!(classType instanceof ParameterizedType)) {
+        return;
+    }
+    ParameterizedType parameterizedType = (ParameterizedType) classType;
+    TypeVariable[] typeParameters = ((Class<?>) parameterizedType.getRawType()).getTypeParameters();
+    Type[] actualTypeArguments = parameterizedType.getActualTypeArguments();
+    for (int i = 0; i < actualTypeArguments.length; i++) {
+        TypeVariable typeParameter = typeParameters[i];
+        Type actualTypeArgument = actualTypeArguments[i];
+
+        if (actualTypeArgument instanceof WildcardType) {
+            contextualActualTypeParameters.put(typeParameter, boundsOf((WildcardType) actualTypeArgument));
+        } else {
+            contextualActualTypeParameters.put(typeParameter, actualTypeArgument);
+        }
+        // logger.log("For '" + parameterizedType + "' found type variable : { '" + typeParameter + "(" + System.identityHashCode(typeParameter) + ")" + "' : '" + actualTypeArgument + "(" + System.identityHashCode(typeParameter) + ")" + "' }");
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+The issue arises from the recursive nature of the `GenericsSelfReference` interface, which defines a type parameter that refers back to itself (`T extends GenericsSelfReference<T>`). Mockito's `GenericMetadataSupport` is not handling such self-referential types correctly, leading to a **`StackOverflowError`** due to infinite recursion during the resolution of type arguments.
+
+---
+
+### 🔍 Problem Analysis:
+
+In the method `registerTypeVariablesOn(...)`, Mockito attempts to collect type variables and their resolved actual type arguments from a `ParameterizedType`. However, when there is a **self-referential generic type**, like:
+
+```java
+interface GenericsSelfReference<T extends GenericsSelfReference<T>> {
+    T self();
+}
+```
+
+the system tries to resolve `T` recursively, leading to an unbounded loop. The `getActualTypeArguments()` returns an array of raw types or nulls, which Mockito then treats as type parameters, causing the same logic to execute again and again.
+
+This results in the infamous `StackOverflowError`.
+
+---
+
+### ✅ Solution:
+
+To prevent infinite recursion, we need to modify how type variables are registered, especially when dealing with self-referential types.
+
+Here’s a **corrected version** of the `registerTypeVariablesOn(...)` method:
+
+```java
+protected void registerTypeVariablesOn(Type classType) {
+    if (!(classType instanceof ParameterizedType)) {
+        return;
+    }
+
+    ParameterizedType parameterizedType = (ParameterizedType) classType;
+    Class<?> rawType = (Class<?>) parameterizedType.getRawType();
+
+    TypeVariable[] typeParameters = rawType.getTypeParameters();
+    Type[] actualTypeArguments = parameterizedType.getActualTypeArguments();
+
+    // Avoid cycles by tracking visited type variables
+    Set<TypeVariable<?>> visited = new HashSet<>();
+
+    for (int i = 0; i < typeParameters.length && i < actualTypeArguments.length; i++) {
+        TypeVariable<?> typeParam = typeParameters[i];
+        Type actualArg = actualTypeArguments[i];
+
+        if (visited.contains(typeParam)) {
+            continue; // Skip already processed type parameters to avoid loops
+        }
+
+        // Check for cyclic dependencies using identity hash codes
+        int hash = System.identityHashCode(typeParam);
+        boolean hasCycle = false;
+
+        // Simple cycle detection by checking whether the type parameter
+        // was previously seen with the same hash code
+        for (TypeVariable<?> t : visited) {
+            if (System.identityHashCode(t) == hash) {
+                hasCycle = true;
+                break;
+            }
+        }
+
+        if (!hasCycle) {
+            visited.add(typeParam);
+
+            if (actualArg instanceof WildcardType) {
+                contextualActualTypeParameters.put(typeParam, boundsOf((WildcardType) actualArg));
+            } else {
+                contextualActualTypeParameters.put(typeParam, actualArg);
+            }
+        }
+    }
+}
+```
+
+---
+
+### 📝 Key Improvements:
+
+- **Cycle Detection**: We track visited type variables via a `Set<TypeVariable<?>>` and use `System.identityHashCode` to detect potential self-references.
+- **Avoid Infinite Loops**: By skipping already processed variables, we avoid re-processing the same type variable multiple times.
+- **Safe Handling of Self-Referential Types**: This approach safely handles recursive generics like `GenericsSelfReference<T extends GenericsSelfReference<T>>`.
+
+---
+
+### 💡 Additional Notes:
+
+- Make sure that the rest of `GenericMetadataSupport` properly handles `null` or non-parameterized types in `actualTypeArguments`.
+- Ensure any additional logic downstream (like `getActualTypeArgumentFor(...)`) also checks for cycles before further processing.
+
+---
+
+### ✅ Final Verdict:
+
+Yes, this solution should **repair the incorrect Java code** and allow the test case for `GenericsSelfReference` to pass without causing a `StackOverflowError`.
+
+Let me know if you'd like me to provide a refactored version of the whole class!

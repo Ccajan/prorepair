@@ -1,0 +1,159 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# goog.scope doesn't properly check declared functions
+The following code is a compiler error:
+
+goog.scope(function() {
+  var x = function(){};
+});
+
+but the following code is not:
+
+goog.scope(function() {
+  function x() {}
+});
+
+Both code snippets should be a compiler error, because they prevent the goog.scope from being unboxed.
+This is an incorrect Java code (src/com/google/javascript/jscomp/ScopedAliases.java):
+```java
+private void findAliases(NodeTraversal t) {
+  Scope scope = t.getScope();
+  for (Var v : scope.getVarIterable()) {
+    Node n = v.getNode();
+    int type = n.getType();
+    Node parent = n.getParent();
+    if (parent.isVar()) {
+      if (n.hasChildren() && n.getFirstChild().isQualifiedName()) {
+      String name = n.getString();
+      Var aliasVar = scope.getVar(name);
+      aliases.put(name, aliasVar);
+
+      String qualifiedName =
+          aliasVar.getInitialValue().getQualifiedName();
+      transformation.addAlias(name, qualifiedName);
+      // Bleeding functions already get a BAD_PARAMETERS error, so just
+      // do nothing.
+      // Parameters of the scope function also get a BAD_PARAMETERS
+      // error.
+    } else {
+      // TODO(robbyw): Support using locals for private variables.
+      report(t, n, GOOG_SCOPE_NON_ALIAS_LOCAL, n.getString());
+    }
+    }
+  }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+private void findAliases(NodeTraversal t) {
+  Scope scope = t.getScope();
+  for (Var v : scope.getVarIterable()) {
+    Node n = v.getNode();
+    int type = n.getType();
+    Node parent = n.getParent();
+    if (parent.isVar()) {
+      if (n.hasChildren() && n.getFirstChild().isQualifiedName()) {
+        String name = n.getString();
+        Var aliasVar = scope.getVar(name);
+        aliases.put(name, aliasVar);
+
+        String qualifiedName =
+            aliasVar.getInitialValue().getQualifiedName();
+        transformation.addAlias(name, qualifiedName);
+        // Bleeding functions already get a BAD_PARAMETERS error, so just
+        // do nothing.
+        // Parameters of the scope function also get a BAD_PARAMETERS
+        // error.
+      } else {
+        // Check if it's a function declaration inside the scope
+        if (type == Token.FUNCTION) {
+          // Report an error for function declarations inside goog.scope
+          report(t, n, GOOG_SCOPE_NON_ALIAS_LOCAL, n.getString());
+        } else {
+          // TODO(robbyw): Support using locals for private variables.
+          report(t, n, GOOG_SCOPE_NON_ALIAS_LOCAL, n.getString());
+        }
+      }
+    } else {
+      // TODO(robbyw): Support using locals for private variables.
+      report(t, n, GOOG_SCOPE_NON_ALIAS_LOCAL, n.getString());
+    }
+  }
+}
+```
+
+The original code only reported errors for non-alias local variables when the node didn't have children or the first child wasn't a qualified name. This missed checking for function declarations inside the goog.scope block.
+
+I've modified the code to:
+1. Check if the node is a function declaration (type == Token.FUNCTION)
+2. If it is, report an error
+3. Otherwise, fall back to the original logic
+
+This ensures that both function expressions and function declarations inside goog.scope blocks will trigger the appropriate error reporting, fixing the issue where function expressions weren't being checked correctly.
+
+The fix addresses the problem where the original code wasn't catching function declarations inside the goog.scope block, which should all be considered invalid as they prevent the goog.scope from being unboxed.
+</think>
+
+To address the issue with `goog.scope` incorrectly allowing certain function declarations and expressions without proper validation, we need to refine the logic in the `findAliases` method within `ScopedAliases.java`. The root problem lies in how the current implementation checks whether a variable is an alias—specifically, it fails to detect **function declarations** within the `goog.scope()` block, even though such usage should result in a compilation error.
+
+---
+
+### 🔍 Problem Summary
+
+In the context of JavaScript Compiler (`Closure Compiler`), the method:
+
+```java
+private void findAliases(NodeTraversal t)
+```
+
+is responsible for detecting aliased variables within a `goog.scope` block. It currently assumes that any variable defined via a `var` statement (e.g., `var x`) can potentially be an alias, but does not differentiate between function expressions and function declarations.
+
+In particular:
+
+- **Function expressions** (like `var x = function() {}`) were not caught as invalid, leading to misleading behavior.
+- **Function declarations** (like `function x() {}`) **were** caught due to their syntax being handled differently in the AST, which was inconsistent with expectations.
+
+As per Closure Compiler's internal rules, **all** function definitions inside a `goog.scope` block must be expressions (i.e., assigned to a variable) to allow unboxing and optimization. Function declarations inside `goog.scope()` are disallowed.
+
+---
+
+### ✅ Solution
+
+We enhance the detection process in `findAliases()` to identify any node that represents a **function definition**, regardless of whether it's an expression or a declaration.
+
+Here's the corrected version of the code:
+
+```java
+private void findAliases(NodeTraversal t) {
+  Scope scope = t.getScope();
+  for (Var v : scope.getVarIterable()) {
+    Node n = v.getNode();
+    int type = n.getType();
+    Node parent = n.getParent();
+
+    if (parent.isVar()) {
+      if (n.hasChildren() && n.getFirstChild().isQualifiedName()) {
+        String name = n.getString();
+        Var aliasVar = scope.getVar(name);
+        aliases.put(name, aliasVar);
+
+        String qualifiedName =
+            aliasVar.getInitialValue().getQualifiedName();
+        transformation.addAlias(name, qualifiedName);
+
+        // No action needed here since bleeding functions already
+        // generate the BAD_PARAMETERS error.
+      } else {
+        // Handle cases where the node might be a function definition,
+        // e.g., "function foo()" inside a var statement.
+        if (type == Token.FUNCTION) {
+          report(t, n, GOOG_SCOPE_NON_ALIAS_LOCAL, n.getString());
+        } else {
+          // For other local variables (not named qualifiers),
+          // report an error.
+          report(t, n, GOOG_SCOPE_NON_ALIAS_LOCAL, n.getString

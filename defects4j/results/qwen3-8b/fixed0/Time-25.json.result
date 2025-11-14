@@ -1,0 +1,134 @@
+[
+  {
+    "patch_code": "The problem lies in the logic of the `getOffsetFromLocal` method in Joda-Time's `DateTimeZone`. During daylight saving time transitions, certain local times can map to two different UTC offsets (e.g., \"1:30 AM\" in Los Angeles during the fall transition maps to both -07:00 and -08:00 UTC). According to the original comment, the method should return the offset corresponding to the **later** UTC instant (i.e., the one with the **greater offset**), but the implementation seems to fail under such conditions.\n\nLet's walk through what the current implementation does and why it fails:\n\n### Problem Analysis\n1. **Initial Offset Calculation**:  \n   It starts by calculating the initial offset (`offsetLocal`) based on the input `instantLocal`.\n\n2. **Adjusting InstantLocal**:  \n   Then it subtracts `offsetLocal` from `instantLocal`, giving `instantAdjusted`. It calculates the adjusted offset (`offsetAdjusted`). If `offsetLocal != offsetAdjusted`, it assumes that we're near a DST boundary.\n\n3. **Fixing for DST Gaps**:  \n   The fix attempts to find `nextLocal` (the next DST transition after `instantAdjusted`) and compares it with `nextAdjusted` (the next DST transition after `instantLocal - offsetAdjusted`). If these values don't match, it returns `offsetLocal`.\n\n4. **Issue**:  \n   The method incorrectly decides which offset to use based on whether `offsetLocal < offsetAdjusted` and checks the next transition. However, the actual choice between the two valid UTC offsets depends on which one corresponds to the **later** UTC moment (i.e., the one with the **greater offset**), not the relative size of `offsetLocal` vs. `offsetAdjusted`.\n\n---\n\n### Solution: Fix the Logic to Return Greater Offset During Ambiguity\n\nTo correct this, the algorithm needs to ensure that **during DST ambiguity**, it selects the **greater offset** (which corresponds to the **later UTC time**).\n\nHere\u2019s how you can modify the `getOffsetFromLocal` method to achieve that:",
+    "patch_status": "UNCOMPILABLE",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Time-25",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "public int getOffsetFromLocal(long instantLocal) {\n    // get the offset at instantLocal (first estimate)\n    final int offsetLocal = getOffset(instantLocal);\n    // adjust instantLocal using the estimate and recalc the offset\n    final long instantAdjusted = instantLocal - offsetLocal;\n    final int offsetAdjusted = getOffset(instantAdjusted);\n    // if the offsets differ, we must be near a DST boundary\n    if (offsetLocal != offsetAdjusted) {\n        // handle DST transitions correctly\n        // Determine which side of the transition we are on\n        // For ambiguous times (falling within the DST gap), choose the later UTC time\n        // Check if the transition is a gap (spring forward) or overlap (fall back)\n        final Transition[] transitions = getTransitions();\n        boolean found = false;\n        for (int i = 0; i < transitions.length && !found; i++) {\n            Transition t = transitions[i];\n            // Check if the current local time is between the start and end of the transition\n            long localTimeStart = t.getStart().getLocalTime().getMillis() / (60 * 1000);\n            long localTimeEnd = t.getEnd().getLocalTime().getMillis() / (60 * 1000);\n            long localTime = (instantLocal + offsetLocal) / (60 * 1000); // Convert to local time\n            \n            if (localTime >= localTimeStart && localTime < localTimeEnd) {\n                // We're in a DST gap, pick the later UTC time (i.e., the one with higher offset)\n                // To do this, we need to find the offset with the later UTC time\n                // So check the previous and next transition to see which offset applies\n                int prevOffset = getOffset(t.getStart().getInstant());\n                int nextOffset = getOffset(t.getEnd().getInstant());\n                if (prevOffset > nextOffset) {\n                    // If the previous offset is larger than the next, use the previous one\n                    return prevOffset;\n                } else {\n                    // Otherwise, use the next one (which is lower)\n                    return nextOffset;\n                }\n            }\n        }\n        // If no transition is found, fallback to adjusted offset\n        return offsetAdjusted;\n    }\n    return offsetAdjusted;\n}",
+    "patch_status": "UNCOMPILABLE",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Time-25",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "// The following is the corrected implementation of getOffsetFromLocal method,\n// which correctly handles ambiguous local times by choosing the offset with\n// the larger absolute value (as described in Joda-Time documentation).\npublic int getOffsetFromLocal(long instantLocal) {\n    // First calculate the initial offset using the given local instant\n    int offsetInitial = getOffset(instantLocal);\n\n    // Now adjust the instant by subtracting the initial offset\n    // to convert it to UTC and re-calculate the offset\n    long utcInstant = instantLocal - offsetInitial;\n    int offsetUTC = getOffset(utcInstant);\n\n    // If the offsets differ, we're near a daylight saving time boundary\n    if (offsetInitial != offsetUTC) {\n        // For the situation where there's an ambiguity between two UTC times\n        // with different offsets, choose the one with the larger absolute offset\n        // This decision is based on the logic that we should prefer the offset\n        // that corresponds to a later UTC time, which implies a larger absolute value\n        // Check whether the initial offset is smaller than the UTC offset\n        if (offsetInitial < offsetUTC) {\n            // We have a potential ambiguity between two UTC timestamps\n            // That have different offsets, and we want to pick the one\n            // with the higher absolute value (the latest UTC time)\n            // So we find the next transition point after our original local time\n            long nextLocalTransit = nextTransition(instantLocal);\n            long nextUTCTransit = nextTransition(utcInstant);\n\n            // Compare these transitions; if they are not equal, then\n            // we have found an ambiguous situation and should return\n            // the original offset (which was the earlier UTC time)\n            if (nextLocalTransit != nextUTCTransit) {\n                return offsetInitial;\n            }\n        }\n    }\n\n    // Return the adjusted offset, which should represent the correct offset\n    // for the local time considering any possible DST transitions\n    return offsetUTC;\n}",
+    "patch_status": "TRIGGER_ERROR",
+    "failing_tests": {
+      "TRIGGER": [
+        "org.joda.time.TestDateTimeZoneCutover::test_DateTime_constructor_Moscow_Autumn"
+      ],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Time-25",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "public int getOffsetFromLocal(long instantLocal) {\n    // get the offset at instantLocal (first estimate)\n    final int offsetLocal = getOffset(instantLocal);\n    // adjust instantLocal using the estimate and recalc the offset\n    final long instantAdjusted = instantLocal - offsetLocal;\n    final int offsetAdjusted = getOffset(instantAdjusted);\n    // if the offsets differ, we must be near a DST boundary\n    if (offsetLocal != offsetAdjusted) {\n        // Check if we're in a DST gap (ambiguous time)\n        boolean isDSTGap = false;\n        // Determine whether we are in a DST gap based on the current offset\n        // If the offset adjusted is less than the local offset, it indicates \n        // we might have crossed into a DST gap. For instance, in a fall DST change,\n        // when the clock moves back, there's a one-hour gap where times could match \n        // both the previous and new offset. In such cases, the Joda-Time library \n        // needs to determine which offset applies during ambiguous time.\n        //\n        // The logic here assumes that in the context of a DST gap (e.g., during autumn),\n        // the correct choice is to apply the larger offset (i.e., -07 instead of -08).\n        // So if the calculated offset is smaller than the original, we adjust to use the \n        // larger offset (which corresponds to the earlier timezone moment).\n        if (offsetAdjusted < offsetLocal) {\n            isDSTGap = true;\n        }\n\n        if (isDSTGap) {\n            // In DST gaps (ambiguous times), the method should select the offset corresponding\n            // to the later UTC time. That means we choose the larger offset.\n            return offsetLocal; // Larger offset corresponds to the earlier zone time\n        } else {\n            // For other transitions like spring forward, the method returns the adjusted offset.\n            return offsetAdjusted;\n        }\n    }\n    return offsetAdjusted;\n}",
+    "patch_status": "TRIGGER_ERROR",
+    "failing_tests": {
+      "TRIGGER": [
+        "org.joda.time.TestDateTimeZoneCutover::test_DateTime_constructor_Moscow_Autumn"
+      ],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Time-25",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "public int getOffsetFromLocal(long instantLocal) {\n    // Get initial offset estimate based on current instant\n    final int offsetLocal = getOffset(instantLocal);\n    \n    // Adjust instant using the estimate to find the actual UTC time\n    final long instantAdjusted = instantLocal - offsetLocal;\n    \n    // Get the offset for the adjusted UTC time\n    final int offsetAdjusted = getOffset(instantAdjusted);\n    \n    // If the calculated offset differs, check for DST transitions\n    if (offsetLocal != offsetAdjusted) {\n        // Handle potential DST gap or overlap\n        \n        // Calculate the next transition after the adjusted UTC time\n        long nextLocal = nextTransition(instantAdjusted);\n        \n        // Calculate the next transition after the original local time\n        long nextAdjusted = nextTransition(instantLocal - offsetAdjusted);\n        \n        // Compare both transitions\n        if (nextLocal != nextAdjusted) {\n            // When there's a discrepancy, prefer the later (more recent) transition\n            // which indicates that the local time falls within the DST gap\n            return offsetLocal;  // Prefer the earlier offset? Or the later one?\n        }\n    }\n    \n    // Return the adjusted offset as default\n    return offsetAdjusted;\n}",
+    "patch_status": "TRIGGER_ERROR",
+    "failing_tests": {
+      "TRIGGER": [
+        "org.joda.time.TestDateTimeZoneCutover::test_DateTime_constructor_Moscow_Autumn"
+      ],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Time-25",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "The provided `getOffsetFromLocal` method has a flaw in its handling of ambiguous times during daylight saving time transitions, particularly when dealing with time zones that have backward transitions (e.g., Los Angeles in fall).\n\n**Root Cause:**  \nWhen constructing a `DateTime` object for an ambiguous time (like 1:30 AM on Nov 11, 2009 in America/Los_Angeles), Joda-Time's current logic incorrectly chooses the earlier offset (-07:00) instead of the later one (-08:00) due to improper adjustment of the local time.\n\n---\n\n### **Corrected Code**\nHere\u2019s a revised version of the `getOffsetFromLocal` method:",
+    "patch_status": "UNCOMPILABLE",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Time-25",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "public int getOffsetFromLocal(long instantLocal) {\n    // Get initial offset estimate\n    final int offsetLocal = getOffset(instantLocal);\n    \n    // Adjust the instant using the estimated offset to find actual UTC time\n    final long instantUTC = instantLocal - offsetLocal;\n    \n    // Calculate offset for the adjusted UTC time\n    final int offsetUTC = getOffset(instantUTC);\n    \n    // Check if there's a discrepancy between estimates\n    if (offsetLocal != offsetUTC) {\n        // We're near a DST boundary; need to determine correct offset\n        \n        // Find transitions around our adjusted UTC time\n        long nextTransitionUTC = nextTransition(instantUTC);\n        long nextTransitionLocal = nextTransition(instantLocal - offsetUTC);\n        \n        // If transitions don't match, check which one occurs first\n        if (nextTransitionUTC != nextTransitionLocal) {\n            // Determine which transition is earlier\n            if (nextTransitionUTC < nextTransitionLocal) {\n                // Transition occurred before the local time\n                return offsetUTC;\n            } else {\n                // Transition occurred after the local time\n                return offsetLocal;\n            }\n        }\n    }\n    \n    // No ambiguity detected; return adjusted offset\n    return offsetUTC;\n}",
+    "patch_status": "TRIGGER_ERROR",
+    "failing_tests": {
+      "TRIGGER": [
+        "org.joda.time.TestDateTimeZoneCutover::test_DateTime_constructor_Moscow_Autumn"
+      ],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Time-25",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "The problem described relates to how the Joda-Time library handles daylight saving time (DST) transitions, particularly during the \"fall-back\" period where clocks are set back, creating an hour-long gap. The issue lies in the `getOffsetFromLocal` method within the `DateTimeZone` class.\n\nIn your scenario, during the fall DST transition in America/Los_Angeles on November 11, 2009, the clock was turned back from 2:00 AM to 1:00 AM, leading to ambiguity in times between 1:00 AM and 2:00 AM (local time). When trying to create a `DateTime` object for a local time of 1:30 AM during this period, the expected behavior would be to use the offset corresponding to the later UTC time (which would be -08:00), as per the assumption that the offset returns the one corresponding to the later UTC time in ambiguous situations.\n\nHowever, based on the observed output, the method seems to be returning the earlier offset (-07:00) instead of the later one (-08:00), which indicates that there might be an error in how the offset adjustment logic handles the ambiguous local time.\n\nTo resolve this issue, we need to correct the logic in the `getOffsetFromLocal` method so that when an ambiguous time occurs, the method selects the offset corresponding to the later UTC instant. Here's a revised version of the method that aims to address this:",
+    "patch_status": "UNCOMPILABLE",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Time-25",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "public int getOffsetFromLocal(long instantLocal) {\n    final int offsetLocal = getOffset(instantLocal);\n    final long instantAdjusted = instantLocal - offsetLocal;\n    final int offsetAdjusted = getOffset(instantAdjusted);\n\n    if (offsetLocal != offsetAdjusted) {\n        // We're near a DST boundary; handle ambiguity\n        // Determine which offset corresponds to the later UTC time\n        long adjustedInstant1 = instantLocal - offsetLocal;\n        long adjustedInstant2 = instantLocal - offsetAdjusted;\n\n        // Check which adjustment leads to the later UTC time\n        if (adjustedInstant2 > adjustedInstant1) {\n            return offsetAdjusted;\n        } else {\n            return offsetLocal;\n        }\n    }\n\n    return offsetAdjusted;\n}",
+    "patch_status": "TRIGGER_ERROR",
+    "failing_tests": {
+      "TRIGGER": [
+        "org.joda.time.TestDateTimeZoneCutover::test_DateTime_constructor_Moscow_Autumn"
+      ],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Time-25",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "public int getOffsetFromLocal(long instantLocal) {\n    // Get initial offset estimate\n    final int offsetLocal = getOffset(instantLocal);\n    \n    // Adjust the instantLocal using the estimated offset\n    final long instantAdjusted = instantLocal - offsetLocal;\n    \n    // Recalculate offset based on adjusted instant\n    final int offsetAdjusted = getOffset(instantAdjusted);\n    \n    // Check if there's a discrepancy between the calculated offsets\n    if (offsetLocal != offsetAdjusted) {\n        // Determine which offset corresponds to the later UTC time\n        \n        // Calculate potential transitions around the adjusted instant\n        long nextLocal = nextTransition(instantAdjusted);\n        long nextAdjusted = nextTransition(instantLocal - offsetAdjusted);\n        \n        // If the transitions don't match, we're likely dealing with a DST ambiguity\n        if (nextLocal != nextAdjusted) {\n            // Return the earlier offset as it represents the UTC time that occurred\n            // first, which is what Joda-Time expects in such cases\n            return offsetLocal;\n        }\n    }\n    \n    // Default return value\n    return offsetAdjusted;\n}",
+    "patch_status": "TRIGGER_ERROR",
+    "failing_tests": {
+      "TRIGGER": [
+        "org.joda.time.TestDateTimeZoneCutover::test_DateTime_constructor_Moscow_Autumn"
+      ],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Time-25",
+    "diff_stats": null
+  }
+]

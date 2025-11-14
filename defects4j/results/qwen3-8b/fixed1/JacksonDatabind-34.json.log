@@ -1,0 +1,129 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Regression in 2.7.0-rc2, for schema/introspection for BigDecimal
+(found via Avro module, but surprisingly json schema module has not test to catch it)
+Looks like schema type for BigDecimal is not correctly produced, due to an error in refactoring (made to simplify introspection for simple serializers): it is seen as BigInteger (and for Avro, for example, results in long getting written).
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/ser/std/NumberSerializer.java):
+```java
+public void acceptJsonFormatVisitor(JsonFormatVisitorWrapper visitor, JavaType typeHint) throws JsonMappingException
+{
+    if (_isInt) {
+        visitIntFormat(visitor, typeHint, JsonParser.NumberType.BIG_INTEGER);
+    } else {
+        Class<?> h = handledType();
+        if (h == BigDecimal.class) {
+            visitFloatFormat(visitor, typeHint, JsonParser.NumberType.BIG_INTEGER);
+        } else {
+            // otherwise bit unclear what to call... but let's try:
+            /*JsonNumberFormatVisitor v2 =*/ visitor.expectNumberFormat(typeHint);
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public void acceptJsonFormatVisitor(JsonFormatVisitorWrapper visitor, JavaType typeHint) throws JsonMappingException
+{
+    if (_isInt) {
+        visitIntFormat(visitor, typeHint, JsonParser.NumberType.BIG_INTEGER);
+    } else {
+        Class<?> h = handledType();
+        if (h == BigDecimal.class) {
+            visitFloatFormat(visitor, typeHint, JsonParser.NumberType.DECIMAL);
+        } else {
+            // otherwise bit unclear what to call... but let's try:
+            /*JsonNumberFormatVisitor v2 =*/ visitor.expectNumberFormat(typeHint);
+        }
+    }
+}
+```
+
+The issue is that the `BigDecimal` class should be associated with the JSON number format of `DECIMAL`, not `BIG_INTEGER`. The original code incorrectly uses `BIG_INTEGER` when handling `BigDecimal`, which causes it to be serialized as a `BigInteger` instead of a decimal value. 
+
+By changing the line from:
+
+```java
+visitFloatFormat(visitor, typeHint, JsonParser.NumberType.BIG_INTEGER);
+```
+
+to:
+
+```java
+visitFloatFormat(visitor, typeHint, JsonParser.NumberType.DECIMAL);
+```
+
+we ensure that `BigDecimal` values are properly represented as decimal numbers in the JSON output, aligning with their intended behavior and resolving the regression issue.
+</think>
+
+To fix the regression issue where `BigDecimal` is being misclassified as `BigInteger` during schema introspection, we need to correct how the Jackson library maps types to their corresponding JSON formats.
+
+---
+
+### ✅ **Problem Summary**
+
+In the method `acceptJsonFormatVisitor` within `NumberSerializer.java`, there is a logic branch that checks whether the handled type (`handledType()`) is `BigDecimal`. However, the code incorrectly associates `BigDecimal` with `JsonParser.NumberType.BIG_INTEGER`, leading to serialization issues—particularly when using frameworks like Apache Avro, where this mismatch results in `BigDecimal` values being treated as `long`s or `BigInteger`s rather than proper decimal representations.
+
+---
+
+### 🛠️ **Fix Explanation**
+
+The key correction lies in mapping `BigDecimal` to the appropriate JSON format type: `JsonParser.NumberType.DECIMAL`.
+
+#### ❌ **Incorrect Code**
+```java
+visitFloatFormat(visitor, typeHint, JsonParser.NumberType.BIG_INTEGER);
+```
+
+#### ✅ **Corrected Code**
+```java
+visitFloatFormat(visitor, typeHint, JsonParser.NumberType.DECIMAL);
+```
+
+This change ensures that when `BigDecimal` is encountered during schema introspection, it will now use the correct JSON number type (`DECIMAL`) rather than `BIG_INTEGER`.
+
+---
+
+### 🔍 Why This Works
+
+- `BigDecimal` is designed for high-precision decimal arithmetic and should always be interpreted as `DECIMAL` in JSON context, especially when working with schema-based systems like Avro or JSON Schema.
+- Using `BIG_INTEGER` would cause loss of precision and may lead to incorrect deserialization unless explicitly cast back to `BigDecimal`.
+- The `visitFloatFormat(...)` method handles the generation of appropriate JSON structure based on the `NumberType`, so assigning `DECIMAL` is necessary to ensure correct output formatting.
+
+---
+
+### 📌 Final Fixed Code Snippet
+
+Here’s the corrected version of the relevant block:
+
+```java
+public void acceptJsonFormatVisitor(JsonFormatVisitorWrapper visitor, JavaType typeHint) throws JsonMappingException
+{
+    if (_isInt) {
+        visitIntFormat(visitor, typeHint, JsonParser.NumberType.BIG_INTEGER);
+    } else {
+        Class<?> h = handledType();
+        if (h == BigDecimal.class) {
+            visitFloatFormat(visitor, typeHint, JsonParser.NumberType.DECIMAL);
+        } else {
+            // otherwise bit unclear what to call... but let's try:
+            /*JsonNumberFormatVisitor v2 =*/ visitor.expectNumberFormat(typeHint);
+        }
+    }
+}
+```
+
+---
+
+### 🧪 Verification Suggestion
+
+After applying this fix, consider running tests that:
+1. Serialize both `BigInteger` and `BigDecimal` objects.
+2. Ensure they produce valid JSON types (`"type": "integer"` vs `"type": "number"`, optionally `"format": "decimal"`).
+3. Test against schema-aware libraries such as Avro or JSON Schema validators to confirm correctness.
+
+This change will resolve the regression in behavior observed in versions prior to this fix, ensuring accurate schema introspection and correct serialization for `BigDecimal`.

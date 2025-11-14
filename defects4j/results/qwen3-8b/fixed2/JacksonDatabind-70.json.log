@@ -1,0 +1,173 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# ACCEPT_CASE_INSENSITIVE_PROPERTIES fails with @JsonUnwrapped
+(note: moved from FasterXML/jackson-dataformat-csv#133)
+When trying to deserialize type like:
+public class Person {
+  @JsonUnwrapped(prefix = "businessAddress.")
+  public Address businessAddress;
+}
+
+public class Address {
+  public String street;
+  public String addon;
+  public String zip = "";
+  public String town;    
+  public String country;
+}
+with case-insensitive mapper (mapper.enable(MapperFeature.ACCEPT_CASE_INSENSITIVE_PROPERTIES);) I get exception:
+java.util.NoSuchElementException: No entry 'businessAddress' found, can't remove
+	at com.fasterxml.jackson.databind.deser.impl.BeanPropertyMap.remove(BeanPropertyMap.java:447)
+	at com.fasterxml.jackson.databind.deser.BeanDeserializerBase.resolve(BeanDeserializerBase.java:534)
+	at com.fasterxml.jackson.databind.deser.DeserializerCache._createAndCache2(DeserializerCache.java:293)
+   ...
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/deser/impl/BeanPropertyMap.java):
+```java
+public void remove(SettableBeanProperty propToRm)
+{
+    ArrayList<SettableBeanProperty> props = new ArrayList<SettableBeanProperty>(_size);
+    String key = getPropertyName(propToRm);
+    boolean found = false;
+
+    for (int i = 1, end = _hashArea.length; i < end; i += 2) {
+        SettableBeanProperty prop = (SettableBeanProperty) _hashArea[i];
+        if (prop == null) {
+            continue;
+        }
+        if (!found) {
+            // 09-Jan-2017, tatu: Important: must check name slot and NOT property name,
+            //   as only former is lower-case in case-insensitive case
+            found = key.equals(prop.getName());
+            if (found) {
+                // need to leave a hole here
+                _propsInOrder[_findFromOrdered(prop)] = null;
+                continue;
+            }
+        }
+        props.add(prop);
+    }
+    if (!found) {
+        throw new NoSuchElementException("No entry '"+propToRm.getName()+"' found, can't remove");
+    }
+    init(props);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+The issue seems to be that when using `ACCEPT_CASE_INSENSITIVE_PROPERTIES` with `@JsonUnwrapped`, Jackson's deserialization process is failing because it's not correctly handling the case-insensitive matching of properties. The error message indicates that it's trying to find a property named "businessAddress" but doesn't find it.
+
+Looking at the provided code, the problem likely lies in how the `remove()` method checks for a match between the property name and the one being removed. In particular, the comment suggests that in case-insensitive scenarios, it should use the name slot (which is lower-case) rather than the actual property name.
+
+Here's my proposed fix:
+
+```java
+public void remove(SettableBeanProperty propToRm)
+{
+    ArrayList<SettableBeanProperty> props = new ArrayList<SettableBeanProperty>(_size);
+    String key = getPropertyName(propToRm);
+    boolean found = false;
+
+    for (int i = 1, end = _hashArea.length; i < end; i += 2) {
+        SettableBeanProperty prop = (SettableBeanProperty) _hashArea[i];
+        if (prop == null) {
+            continue;
+        }
+        if (!found) {
+            // Check against the name slot (lowercase), which is what's used for case-insensitive comparisons
+            String propNameLower = prop.getName().toLowerCase();
+            String keyLower = key.toLowerCase();
+            found = propNameLower.equals(keyLower);
+            if (found) {
+                // Need to leave a hole here
+                _propsInOrder[_findFromOrdered(prop)] = null;
+                continue;
+            }
+        }
+        props.add(prop);
+    }
+    if (!found) {
+        throw new NoSuchElementException("No entry '" + propToRm.getName() + "' found, can't remove");
+    }
+    init(props);
+}
+```
+
+Explanation:
+1. Instead of comparing the exact names (`key.equals(prop.getName())`), we convert both to lowercase and compare them.
+2. This change ensures that the comparison is done based on the name slot (which is already in lowercase for case-insensitive operations).
+3. It maintains the original functionality while making the comparison case-insensitive, aligning with the behavior enabled by `ACCEPT_CASE_INSENSITIVE_PROPERTIES`.
+
+I would also recommend checking if there are other parts of the codebase where similar logic is applied, especially around property mapping and deserialization, to ensure consistency.
+</think>
+
+The issue described involves a bug in Jackson's deserialization process when using the `ACCEPT_CASE_INSENSITIVE_PROPERTIES` feature alongside the `@JsonUnwrapped` annotation. This results in a `NoSuchElementException` due to improper handling of case-insensitive property matches during bean property map operations.
+
+---
+
+### 🔍 Problem Summary
+
+Jackson attempts to remove a `SettableBeanProperty` from a `BeanPropertyMap` based on the **property name**, but it’s mistakenly using the **actual name** instead of the **lowercased name** that gets stored internally during case-insensitive parsing. As a result, when the `remove()` method tries to locate a property, it fails to find the expected key due to a mismatch in casing.
+
+This happens specifically in scenarios involving nested beans (like `@JsonUnwrapped`) where the base class may have a field that maps to multiple sub-properties dynamically.
+
+---
+
+### 🛠️ Proposed Fix
+
+The core issue is with this line:
+
+```java
+found = key.equals(prop.getName());
+```
+
+Instead, the comparison should happen on **lowercase versions of the names**—since the internal `getName()` already returns the normalized form (lowercase). Here's how we can update the `remove()` method accordingly:
+
+```java
+public void remove(SettableBeanProperty propToRm)
+{
+    ArrayList<SettableBeanProperty> props = new ArrayList<>(_size);
+    String key = getPropertyName(propToRm);
+    boolean found = false;
+
+    for (int i = 1, end = _hashArea.length; i < end; i += 2) {
+        SettableBeanProperty prop = (SettableBeanProperty) _hashArea[i];
+        if (prop == null) {
+            continue;
+        }
+
+        if (!found) {
+            String propNameLower = prop.getName();       // Lowercase, already normalized
+            String keyLower = key.toLowerCase();        // Convert input to lowercase
+            found = propNameLower.equals(keyLower);
+
+            if (found) {
+                // Mark as found and skip adding to list
+                _propsInOrder[_findFromOrdered(prop)] = null;
+                continue;
+            }
+        }
+
+        props.add(prop);
+    }
+
+    if (!found) {
+        throw new NoSuchElementException(
+            "No entry '" + propToRm.getName() + "' found, can't remove"
+        );
+    }
+
+    init(props);
+}
+```
+
+---
+
+### ✅ Key Improvements
+
+- Uses the **normalized name** returned by `prop.getName()` (which is always lowercase for case-insensitive features).
+

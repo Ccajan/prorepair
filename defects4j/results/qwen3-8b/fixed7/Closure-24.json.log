@@ -1,0 +1,188 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# goog.scope doesn't properly check declared functions
+The following code is a compiler error:
+
+goog.scope(function() {
+  var x = function(){};
+});
+
+but the following code is not:
+
+goog.scope(function() {
+  function x() {}
+});
+
+Both code snippets should be a compiler error, because they prevent the goog.scope from being unboxed.
+This is an incorrect Java code (src/com/google/javascript/jscomp/ScopedAliases.java):
+```java
+private void findAliases(NodeTraversal t) {
+  Scope scope = t.getScope();
+  for (Var v : scope.getVarIterable()) {
+    Node n = v.getNode();
+    int type = n.getType();
+    Node parent = n.getParent();
+    if (parent.isVar()) {
+      if (n.hasChildren() && n.getFirstChild().isQualifiedName()) {
+      String name = n.getString();
+      Var aliasVar = scope.getVar(name);
+      aliases.put(name, aliasVar);
+
+      String qualifiedName =
+          aliasVar.getInitialValue().getQualifiedName();
+      transformation.addAlias(name, qualifiedName);
+      // Bleeding functions already get a BAD_PARAMETERS error, so just
+      // do nothing.
+      // Parameters of the scope function also get a BAD_PARAMETERS
+      // error.
+    } else {
+      // TODO(robbyw): Support using locals for private variables.
+      report(t, n, GOOG_SCOPE_NON_ALIAS_LOCAL, n.getString());
+    }
+    }
+  }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+private void findAliases(NodeTraversal t) {
+  Scope scope = t.getScope();
+  for (Var v : scope.getVarIterable()) {
+    Node n = v.getNode();
+    int type = n.getType();
+    Node parent = n.getParent();
+    if (parent.isVar()) {
+      if (n.hasChildren() && n.getFirstChild().isQualifiedName()) {
+        String name = n.getString();
+        Var aliasVar = scope.getVar(name);
+        aliases.put(name, aliasVar);
+
+        String qualifiedName =
+            aliasVar.getInitialValue().getQualifiedName();
+        transformation.addAlias(name, qualifiedName);
+        // Bleeding functions already get a BAD_PARAMETERS error, so just
+        // do nothing.
+        // Parameters of the scope function also get a BAD_PARAMETERS
+        // error.
+      } else {
+        // TODO(robbyw): Support using locals for private variables.
+        report(t, n, GOOG_SCOPE_NON_ALIAS_LOCAL, n.getString());
+      }
+    } else {
+      // Check if it's a function declaration inside the scope
+      if (type == Token.FUNCTION && !v.isFunction()) {
+        report(t, n, GOOG_SCOPE_NON_ALIAS_LOCAL, n.getString());
+      }
+    }
+  }
+}
+```
+
+I've fixed the Java code by adding a check for function declarations that aren't functions in the scope. This will correctly identify when a function is declared but not properly handled by the goog.scope mechanism.
+
+The original issue was that the code wasn't checking for function declarations inside the scope. The fix adds this check to ensure that we're only considering valid aliases and reporting errors for invalid ones.
+
+Let me know if you need further clarification or have additional questions about this fix!
+</think>
+
+To address the issue with `goog.scope` incorrectly handling function declarations, let’s first understand why both forms of the code behave differently and how the current implementation fails to detect certain issues.
+
+---
+
+### ✅ **Understanding the Issue**
+
+The code block:
+
+```javascript
+goog.scope(function() {
+  var x = function() {};
+});
+```
+
+should produce a compiler error **because** the variable `x` is assigned via `var`, which makes it eligible for **unboxing** — i.e., the optimizer might treat it as a local without any name mangling or scoping, violating the intent of `goog.scope`.
+
+However, this is **not** reported as an error in some implementations. On the other hand:
+
+```javascript
+goog.scope(function() {
+  function x() {}
+});
+```
+
+is **correctly flagged**, as `function x()` is a function declaration, and the compiler can properly handle its scoping within `goog.scope`.
+
+So the problem lies in how the JS compiler parses and checks **function expressions vs. function declarations** within `goog.scope`.
+
+---
+
+### 🛠️ **Root Cause in Java Code**
+
+In the given Java method:
+
+```java
+private void findAliases(NodeTraversal t) {
+  ...
+  if (parent.isVar()) { /* ... */}
+  ...
+}
+```
+
+It seems the existing logic **does not distinguish between function declarations and expressions**, leading to missed violations where a function is expressed via `var` assignment instead of direct declaration.
+
+This oversight causes the compiler to miss the cases where `goog.scope` could potentially break due to lack of aliasing.
+
+---
+
+### ✅ **Fixing the Java Logic**
+
+We need to **explicitly detect function declarations** (as opposed to function expressions), and ensure they are **properly scoped**.
+
+Here is the corrected version of the method:
+
+```java
+private void findAliases(NodeTraversal t) {
+  Scope scope = t.getScope();
+  for (Var v : scope.getVarIterable()) {
+    Node n = v.getNode();
+    int type = n.getType();
+    Node parent = n.getParent();
+
+    if (parent.isVar()) {
+      if (n.hasChildren() && n.getFirstChild().isQualifiedName()) {
+        String name = n.getString();
+        Var aliasVar = scope.getVar(name);
+        aliases.put(name, aliasVar);
+
+        String qualifiedName =
+            aliasVar.getInitialValue().getQualifiedName();
+        transformation.addAlias(name, qualifiedName);
+      } else {
+        // Report non-aliasable names (e.g. "var x = function()" etc.)
+        report(t, n, GOOG_SCOPE_NON_ALIAS_LOCAL, n.getString());
+      }
+    } else {
+      // Handle function declarations explicitly
+      if (type == Token.FUNCTION && !v.isFunction()) {
+        report(t, n, GOOG_SCOPE_NON_ALIAS_LOCAL, n.getString());
+      }
+    }
+  }
+}
+```
+
+---
+
+### 💡 **What Changed?**
+
+1. We added:
+   ```java
+   if (type == Token.FUNCTION && !v.isFunction())
+   ```
+   This ensures that any node identified as a function (`Token.FUNCTION`) that isn’t marked as a `Function` (i.e., a function expression via `var`, `let`, `const`) gets a proper error flag.
+
+2. We ensured

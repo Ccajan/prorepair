@@ -1,0 +1,137 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Generic type returned from type id resolver seems to be ignored
+https://github.com/benson-basis/jackson-custom-mess-tc
+Here's the situation, with Jackson 2.7.4.
+I have a TypeIdResolver that returns a JavaType for a generic type. However, something seems to be forgetting/erasing the generic, as it is failing to use the generic type param to understand the type of a field in the class.
+All the information is in the test case, so I'm not putting any code to read here in the issue.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/jsontype/impl/TypeDeserializerBase.java):
+```java
+protected final JsonDeserializer<Object> _findDeserializer(DeserializationContext ctxt,
+        String typeId) throws IOException
+{
+    JsonDeserializer<Object> deser = _deserializers.get(typeId);
+    if (deser == null) {
+        /* As per [Databind#305], need to provide contextual info. But for
+         * backwards compatibility, let's start by only supporting this
+         * for base class, not via interface. Later on we can add this
+         * to the interface, assuming deprecation at base class helps.
+         */
+        JavaType type = _idResolver.typeFromId(ctxt, typeId);
+        if (type == null) {
+            // As per [JACKSON-614], use the default impl if no type id available:
+            deser = _findDefaultImplDeserializer(ctxt);
+            if (deser == null) {
+                // 10-May-2016, tatu: We may get some help...
+                JavaType actual = _handleUnknownTypeId(ctxt, typeId, _idResolver, _baseType);
+                if (actual == null) { // what should this be taken to mean?
+                    // TODO: try to figure out something better
+                    return null;
+                }
+                // ... would this actually work?
+                deser = ctxt.findContextualValueDeserializer(actual, _property);
+            }
+        } else {
+            /* 16-Dec-2010, tatu: Since nominal type we get here has no (generic) type parameters,
+             *   we actually now need to explicitly narrow from base type (which may have parameterization)
+             *   using raw type.
+             *
+             *   One complication, though; can not change 'type class' (simple type to container); otherwise
+             *   we may try to narrow a SimpleType (Object.class) into MapType (Map.class), losing actual
+             *   type in process (getting SimpleType of Map.class which will not work as expected)
+             */
+            if ((_baseType != null)
+                    && _baseType.getClass() == type.getClass()) {
+                /* 09-Aug-2015, tatu: Not sure if the second part of the check makes sense;
+                 *   but it appears to check that JavaType impl class is the same which is
+                 *   important for some reason?
+                 *   Disabling the check will break 2 Enum-related tests.
+                 */
+                // 19-Jun-2016, tatu: As per [databind#1270] we may actually get full
+                //   generic type with custom type resolvers. If so, should try to retain them.
+                //  Whether this is sufficient to avoid problems remains to be seen, but for
+                //  now it should improve things.
+                    type = ctxt.getTypeFactory().constructSpecializedType(_baseType, type.getRawClass());
+            }
+            deser = ctxt.findContextualValueDeserializer(type, _property);
+        }
+        _deserializers.put(typeId, deser);
+    }
+    return deser;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+The core issue lies in how the `JavaType` object returned from the `TypeIdResolver` is being used in the `_findDeserializer()` method of `TypeDeserializerBase`. Specifically, the current implementation uses `_baseType` and tries to construct a specialized type based on that when trying to find a deserializer.
+
+In cases where a `TypeIdResolver` provides a fully resolved `JavaType`, including its **generic type parameters**, this logic **ignores** those generics unless they match exactly with `_baseType`.
+
+---
+
+### ✅ Problem Summary:
+
+If your custom `TypeIdResolver` returns a fully parameterized `JavaType` (e.g., `List<String>` or `Map<SomeType, AnotherType>`), then the code currently ignores the generic type and falls back to using the raw class (`List.class`) instead of the actual generic type (`List<String>`). This leads to deserialization errors when the generic types are crucial to correctly instantiate the right deserializer.
+
+---
+
+### 🔧 Solution
+
+We need to **use the `type` directly** without modifying it with `_baseType`. That means removing the conditional that attempts to specialize the base type, and just passing the returned `JavaType` from the `TypeIdResolver` to `ctxt.findContextualValueDeserializer(type, _property)`.
+
+Here’s the corrected version of the `_findDeserializer()` method:
+
+```java
+protected final JsonDeserializer<Object> _findDeserializer(DeserializationContext ctxt,
+        String typeId) throws IOException
+{
+    JsonDeserializer<Object> deser = _deserializers.get(typeId);
+    if (deser == null) {
+        JavaType type = _idResolver.typeFromId(ctxt, typeId);
+        if (type == null) {
+            deser = _findDefaultImplDeserializer(ctxt);
+            if (deser == null) {
+                JavaType actual = _handleUnknownTypeId(ctxt, typeId, _idResolver, _baseType);
+                if (actual == null) {
+                    return null;
+                }
+                deser = ctxt.findContextualValueDeserializer(actual, _property);
+            }
+        } else {
+            deser = ctxt.findContextualValueDeserializer(type, _property);
+        }
+        _deserializers.put(typeId, deser);
+    }
+    return deser;
+}
+```
+
+---
+
+### 📌 Key Fixes
+
+1. **Removed unnecessary type specialization**: The line
+   ```java
+   type = ctxt.getTypeFactory().constructSpecializedType(_baseType, type.getRawClass());
+   ```
+   was erroneously attempting to derive a more specific `JavaType` from the base type, which erased any generic information.
+
+2. **Used `type` directly**: Instead of working with `_baseType`, pass the exact `JavaType` from the `TypeIdResolver` into `findContextualValueDeserializer`.
+
+---
+
+### 🧪 Testing Considerations
+
+Ensure that the `TypeIdResolver` truly returns a `JavaType` with all necessary generic type information. For example, if the resolver returns a `List<String>`, ensure that the generic type is preserved and not erased during deserialization.
+
+You may also want to override the `constructSpecializedType()` method in your own `TypeResolverBuilder` if needed — but make sure it respects the generic type structure provided by your `TypeIdResolver`.
+
+---
+
+Let me know if you'd like further clarification or support on implementing a correct `TypeIdResolver`!

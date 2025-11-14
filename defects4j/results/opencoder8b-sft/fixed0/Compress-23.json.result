@@ -1,0 +1,124 @@
+[
+  {
+    "patch_code": "package apache_seven_zip;\n\nimport java.io.File;\nimport java.io.IOException;\nimport org.apache.commons.compress.archivers.sevenz.SevenZFile;\npublic class Test {\n    \n public static void main(String[] args){\n     \n   try{\n     File arcName = new File(\"/tmp/archive.7z\");   \n     SevenZFile sevenZFile = new SevenZFile(arcName);     \n\n   }catch(Exception e){\n     System.out.println(e.getMessage());\n   }\n\n }  \n\n}\n\nclass Coders {\n\n    InputStream decode(final InputStream in, final Coder coder,\n            byte[] password) throws IOException {\n        byte propsByte = coder.properties[0];\n        int dictSizePropIndex = 0;\n        if (coder.methodNumber == METHOD_LZMA) {\n            dictSizePropIndex = 1;\n        } else if (coder.methodNumber == METHOD_PPMD) {\n            // For PPMD, there's no dictSizePropIndex. Instead, we need\n            // to calculate it based on the coder.order and other properties.\n            // This requires more context than this method currently has access to.\n            // Therefore, we'll just hard-code the value for now.\n            // TODO: Refactor to properly handle PPMD.\n            dictSizePropIndex = 3;\n        } else {\n            return null;\n        }\n        \n        long dictSize = coder.properties[dictSizePropIndex];\n        for (int i = 1; i < 4; i++) {\n            dictSize |= ((long)(coder.properties[i + dictSizePropIndex]) & 0xFF) << (8 * i);\n        }\n        \n        // Check for overflow before converting to int, which would truncate to MAX_VALUE on overflow\n        if(dictSize != 0 && Integer.MAX_VALUE / dictSize < 4){            \n            throw new IOException(\"LZMA dictionary is too big for this implementation\");\n        }\n        \n        return new LZMAInputStream(in, -1, propsByte, (int) dictSize);\n    }\n}",
+    "patch_status": "UNCOMPILABLE",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Compress-23",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "package org.apache.commons.compress.archivers.sevenz;\n\nimport java.io.IOException;\nimport java.io.InputStream;\nimport org.apache.commons.compress.utils.IOUtils;\nimport org.tukaani.xz.*;\nimport org.apache.commons.compress.archivers.ArchiveEntry;\nimport org.apache.commons.compress.archivers.zip.ZipArchiveEntry;\npublic class Coders {\n    public static InputStream decode(\n            final InputStream in, final Coder coder, final byte[] password)\n            throws IOException {\n        // Corrected this part\n        byte propsByte = coder.properties[0];\n        int lowDictBits = propsByte & 0x1F;\n        int highDictBits = (propsByte >> 5) & 0x07;\n        int dictSize = 1 << lowDictBits | (highDictBits == 0x02 ? 256 : 0);\n        return new LZMAInputStream(in, -1, propsByte, dictSize);\n    }\n\n    static void addDecoder(final Decoder decoder, final Coders coders)\n            throws UnsupportedOptionsException {\n        final String id = decoder.getId();\n        if (\"lzma\".equals(id)) {\n            coders.coderMap.put(id, new Coder() {\n                @Override\n                public InputStream decode(final InputStream in, final Coder coder,\n                        final byte[] password) throws IOException {\n                    return decode(in, coder, password);\n                }\n            });\n        } else {\n            throw new UnsupportedOptionsException(id + \" is not supported.\");\n        }\n    }\n\n    private static final class SupportedMethod implements Method {\n        @Override\n        public String getId() {\n            return \"lzma\";\n        }\n\n        @Override\n        public InputStream createDecoderInputStream(final InputStream in,\n                final byte[] properties) throws IOException {\n            byte propsByte = properties[0];\n            long dictSize = properties[1];\n            for (int i = 1; i < 4; i++) {\n                dictSize |= ((long) properties[i + 1]) << (8 * i);\n            }\n            if (dictSize > LZMAInputStream.DICT_SIZE_MAX) {\n                throw new UnsupportedOptionsException(\"LZMA dictionary is too big for this implementation\");\n            }\n            return new LZMAInputStream(in, -1, propsByte, (int) dictSize);\n        }\n\n        @Override\n        public OutputStream createEncoderOutputStream(final OutputStream out,\n                final byte[] properties) throws IOException {\n            throw new UnsupportedOptionsException(getId() + \" doesn't support writing archives\");\n        }\n    }\n}\n\npublic class SevenZFile extends ArchiveFile {\n    public SevenZFile(File archive, String entrySeparatorChar)\n            throws IOException {\n        super(archive, entrySeparatorChar);\n    }\n\n    public SevenZFile(InputStream in, boolean isStreamingMode)\n            throws IOException {\n        super(isStreamingMode ? null : IOUtils.toByteArray(in), \".7z\",\n                isStreamingMode);\n    }\n\n    protected void readEntries() throws IOException {\n        forEachEntry(new EntryAction() {\n            @Override\n            public void perform(ArchiveEntry entry) throws IOException {\n                add(entry);\n            }\n        });\n    }\n\n    public void extractEntryTo(String entryPathname, OutputStream os)\n            throws IOException {\n        doExtractEntryTo(createArchiveEntry(entryPathname),\n                createNIOFile(entryPathname), os);\n    }\n}\n\npublic abstract class ArchiveFile implements AutoCloseable {\n    public ArchiveFile(File archive, String entrySeparatorChar)\n            throws IOException {\n        initializeArchiveInputStream(null);\n        this.entrySeparatorChar = entrySeparatorChar;\n        if (!archive.exists()) {\n            throw new IllegalArgumentException(archive.toString()\n                    + \" does not exist\");\n        }\n    }\n\n    public ArchiveFile(byte[] bytes, String suffix, boolean isStreamingMode)\n            throws IOException {\n        this.bytes = bytes;\n        initializeArchiveInputStream(suffix);\n        this.entrySeparatorChar = \"/\";\n        this.isStreamingMode = isStreamingMode;\n    }\n\n    private void initializeArchiveInputStream(String suffix) throws IOException {\n        final SeekableByteChannel sbc =\n                ByteBuffer.wrap(bytes).asReadOnlyBuffer().position(0).limit(bytes.length).rewind().asSeekableByteChannel();\n        Coder coder = getCoder();\n        final InputStream decoderInput = coder.createDecoderInputStream(\n                new ChannelInputStream(sbc), new byte[]{});\n        this.entries = parse(decoderInput);\n        if (suffix != null && !this.entries.stream().anyMatch(e -> e.getName().endsWith(suffix))) {\n            throw new IOException(suffix + \" suffix does not exist in archive\");\n        }\n    }\n}",
+    "patch_status": "UNCOMPILABLE",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Compress-23",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "package compress;\n\nimport java.io.File;\nimport java.io.FileInputStream;\nimport java.io.IOException;\nimport java.util.zip.ZipEntry;\nimport java.util.zip.ZipOutputStream;\nimport org.apache.commons.compress.archivers.ArchiveStreamFactory;\n\npublic class SevenZipError {\n\n    public static void main(String[] args) throws IOException {\n        String arcName = \"C:\\\\Users\\\\tanya\\\\Downloads\\\\compress-1.7-src.7z\";\n        try (SevenZFile input = new SevenZFile(new File(arcName))) {\n            ZipOutputStream zos = new ZipOutputStream(System.out);\n            for (; ; ) {\n                ZipEntry entry = input.getNextEntry();\n                if (entry == null) {\n                    break;\n                }\n                System.out.println(entry.getName());\n                zos.putNextEntry(entry);\n                byte[] buffer = new byte[1024];\n                int len;\n                while ((len = input.read(buffer)) != -1) {\n                    zos.write(buffer, 0, len);\n                }\n                zos.closeEntry();\n                input.closeEntry();\n            }\n            zos.finish();\n        } catch (IOException ex) {\n            ex.printStackTrace();\n        }\n    }\n\n}",
+    "patch_status": "UNCOMPILABLE",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Compress-23",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "InputStream decode(final InputStream in, final Coder coder,\n        byte[] password) throws IOException {\n    byte propsByte = coder.properties[0];\n    long dictSize = coder.properties[1];\n    for (int i = 1; i < 4; i++) {\n        dictSize |= ((long) (coder.properties[i + 1] & 0xFF)) << (8 * i);\n    }\n    if (dictSize > Integer.MAX_VALUE) {\n        throw new UnsupportedOptionsException(\n                \"LZMA dictionary is too big for this implementation\");\n    }\n    return new LZMAInputStream(in, -1, propsByte, (int) dictSize);\n}",
+    "patch_status": "UNCOMPILABLE",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Compress-23",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "public class Coders {\n    \n    private static final int DICT_SIZE_MAX = Integer.MAX_VALUE;\n    \n    public static void addDecoder(Coder coder) throws UnsupportedOptionsException {\n        byte propsByte = coder.properties[0];\n        long dictSize = coder.properties[1];\n        for (int i = 1; i < 4; i++) {\n            dictSize |= ((long) coder.properties[i + 1] << (8 * i));\n        }\n        if (dictSize > DICT_SIZE_MAX) {\n            throw new UnsupportedOptionsException(\n                    \"LZMA dictionary is too big for this implementation.\");\n        }\n        \n        InputStream in = null;\n        try {\n            in = new LZMAInputStream(System.in, -1, propsByte, (int) dictSize);\n        } catch (IOException e) {\n            System.err.println(e.getMessage());\n        } finally {\n            try {\n                in.close();\n            } catch (IOException e) {\n                // Ignore exception on close\n            }\n        }\n    }\n}",
+    "patch_status": "UNCOMPILABLE",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Compress-23",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "import java.io.IOException;\nimport java.io.InputStream;\n\npublic class Coders {\n\n    public static void main(String[] args) throws IOException {\n        // Test cases to verify the solution correctness\n        try {\n            InputStream inputStream = decode(null, null, null); // Replace with actual values\n            System.out.println(\"Decoding successful.\");\n        } catch (IOException e) {\n            System.err.println(\"Decoding failed: \" + e.getMessage());\n        }\n    }\n\n    static InputStream decode(final InputStream in, final Coder coder,\n                             byte[] password) throws IOException {\n        byte propsByte = coder.properties[0];\n        long dictSize = coder.properties[1];\n        for (int i = 1; i < 4; i++) {\n            dictSize |= ((long) coder.properties[i + 1] << (8 * i));\n        }\n        if (dictSize > Long.MAX_VALUE || dictSize > LZMAInputStream.DICT_SIZE_MAX) {\n            throw new UnsupportedOptionsException(\"LZMA dictionary is too big for this implementation\");\n        }\n        return new LZMAInputStream(in, -1, propsByte, (int) dictSize);\n    }\n}",
+    "patch_status": "UNCOMPILABLE",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Compress-23",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "package org.apache.commons.compress.archivers.sevenz;\n\nimport java.io.ByteArrayOutputStream;\nimport java.io.IOException;\nimport java.io.InputStream;\nimport org.tukaani.xz.*;\n\npublic class Coders {\n    public static final int DICT_SIZE_MAX = (1024 * 1024) * 4096;\n    \n    static InputStream decode(final InputStream in, final Coder coder, byte[] password) throws IOException {\n        byte propsByte = coder.properties[0];\n        long dictSize = coder.properties[1];\n        for (int i = 1; i < 4; i++) {\n            dictSize |= ((long) coder.properties[i + 1]) << (i * 8);\n        }\n        if (dictSize > LZMAInputStream.DICT_SIZE_MAX) {\n            throw new UnsupportedOptionsException(\"LZMA dictionary is too big for this implementation.\");\n        }\n        ByteArrayOutputStream baos = new ByteArrayOutputStream();\n        baos.write(propsByte);\n        for (int j = 0; j < 8; j++) {\n            baos.write(coder.properties[j + 2]);\n        }\n        return new LZMAInputStream(in, baos.toByteArray(), (int) dictSize);\n    }\n}\n\nclass SevenZipError {\n    public static void main(String[] args) {\n        String arcName = \"Archive.7z\";\n        try (SevenZFile input = new SevenZFile(new File(arcName))) {\n            // Process the archive here\n        } catch (IOException e) {\n            e.printStackTrace();\n        }\n    }\n}",
+    "patch_status": "UNCOMPILABLE",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Compress-23",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "package org.apache.commons.compress.archivers.sevenz;\n\nimport java.io.EOFException;\nimport java.io.FilterInputStream;\nimport java.io.IOException;\nimport java.io.InputStream;\n\nimport org.tukaani.xz.*;\n\npublic class LargeDictionaryWorkaround extends FilterInputStream {\n\n    public LargeDictionaryWorkaround(InputStream in) {\n        super(in);\n    }\n\n    @Override\n    public void close() throws IOException {\n        super.close();\n    }\n\n    @Override\n    public int read() throws IOException {\n        return in.read();\n    }\n\n    @Override\n    public int read(byte[] b, int off, int len) throws IOException {\n        return in.read(b, off, len);\n    }\n\n    static InputStream decode(final InputStream in, final Coder coder, byte[] password) throws IOException {\n        byte propsByte = coder.properties[0];\n        long dictSize = coder.properties[1];\n        for (int i = 1; i < 4; i++) {\n            dictSize |= ((long)coder.properties[i + 1] << (8 * i));\n        }\n        \n        // Skip check for dictionary size. It's too large\n        /*if (dictSize > LZMAInputStream.DICT_SIZE_MAX) {\n            throw new IOException(\"Dictionary larger than 4GiB maximum size\");\n        }*/\n        \n        return new LZMAInputStream(in, -1, propsByte, (int) dictSize);\n    }  \n}\n\n// Usage example\ntry (LargeDictionaryWorkaround sevenZFile = new LargeDictionaryWorkaround(new FileInputStream(\"archive.7z\"))) {\n    // Process the archive content here...\n} catch (IOException e) {\n    e.printStackTrace();\n}",
+    "patch_status": "UNCOMPILABLE",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Compress-23",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "InputStream decode(final InputStream in, final Coder coder,\n        byte[] password) throws IOException {\n    byte propsByte = coder.properties[0];\n    long dictSize = coder.properties[1];\n    for (int i = 1; i < 4; i++) {\n        dictSize |= ((long) coder.properties[i + 1] << (8 * i));\n    }\n    return new LZMAInputStream(in, -1, propsByte, (int) dictSize);\n}",
+    "patch_status": "TRIGGER_ERROR",
+    "failing_tests": {
+      "TRIGGER": [
+        "org.apache.commons.compress.archivers.sevenz.SevenZFileTest::testCompressedHeaderWithNonDefaultDictionarySize"
+      ],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Compress-23",
+    "diff_stats": null
+  },
+  {
+    "patch_code": "public static void main(String []args){\n    System.out.println(System.getProperty(\"os.name\"));\n    System.out.println(System.getProperty(\"os.version\"));\n    System.out.println(System.getProperty(\"os.arch\"));\n\n    String arcName=\"C:\\\\Users\\\\Public\\\\Documents\\\\compress-1.7.zip.7z\";\n    try{\n        SevenZFile input=new SevenZFile(new File(arcName));\n    }catch(Exception e){\n        System.out.println(e.getMessage());\n    }\n\n}\n\npublic static InputStream decode(\n        final InputStream in, final Coder coder, byte[] password)\n        throws IOException {\n    byte propsByte = coder.properties[0];\n    int dictSize = Integer.parseInt(coder.properties[1]);\n    return new LZMAInputStream(in, -1, propsByte, dictSize);\n}",
+    "patch_status": "UNCOMPILABLE",
+    "failing_tests": {
+      "TRIGGER": [],
+      "RELEVANT": [],
+      "TIMEOUT": []
+    },
+    "val_cnt": 1,
+    "bug_name": "Compress-23",
+    "diff_stats": null
+  }
+]

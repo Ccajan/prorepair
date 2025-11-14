@@ -1,0 +1,188 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# StringEscapeUtils.escapeXml(input) outputs wrong results when an input contains characters in Supplementary Planes.
+Hello.
+I use StringEscapeUtils.escapeXml(input) to escape special characters for XML.
+This method outputs wrong results when input contains characters in Supplementary Planes.
+String str1 = "\uD842\uDFB7" + "A";
+String str2 = StringEscapeUtils.escapeXml(str1);
+// The value of str2 must be equal to the one of str1,
+// because str1 does not contain characters to be escaped.
+// However, str2 is diffrent from str1.
+System.out.println(URLEncoder.encode(str1, "UTF-16BE")); //%D8%42%DF%B7A
+System.out.println(URLEncoder.encode(str2, "UTF-16BE")); //%D8%42%DF%B7%FF%FD
+The cause of this problem is that the loop to translate input character by character is wrong.
+In CharSequenceTranslator.translate(CharSequence input, Writer out),
+loop counter "i" moves from 0 to Character.codePointCount(input, 0, input.length()),
+but it should move from 0 to input.length().
+This is an incorrect Java code (src/main/java/org/apache/commons/lang3/text/translate/CharSequenceTranslator.java):
+```java
+public final void translate(CharSequence input, Writer out) throws IOException {
+    if (out == null) {
+        throw new IllegalArgumentException("The Writer must not be null");
+    }
+    if (input == null) {
+        return;
+    }
+    int pos = 0;
+    int len = Character.codePointCount(input, 0, input.length());
+    while (pos < len) {
+        int consumed = translate(input, pos, out);
+        if (consumed == 0) {
+            char[] c = Character.toChars(Character.codePointAt(input, pos));
+            out.write(c);
+        }
+        else {
+        // contract with translators is that they have to understand codepoints 
+        // and they just took care of a surrogate pair
+        for (int pt = 0; pt < consumed; pt++) {
+                if (pos < len - 2) {
+            pos += Character.charCount(Character.codePointAt(input, pos));
+                } else {
+                    pos++;
+                }
+            }
+            pos--;
+        }
+        pos++;
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public final void translate(CharSequence input, Writer out) throws IOException {
+    if (out == null) {
+        throw new IllegalArgumentException("The Writer must not be null");
+    }
+    if (input == null) {
+        return;
+    }
+
+    int pos = 0;
+    int len = input.length();
+    
+    while (pos < len) {
+        int consumed = translate(input, pos, out);
+        
+        if (consumed == 0) {
+            // If no translation occurred, write the current character directly
+            out.write(input.charAt(pos));
+            pos++;
+        } else {
+            // If some characters were consumed, advance the position accordingly
+            pos += consumed;
+        }
+    }
+}
+
+private int translate(CharSequence input, int start, Writer out) throws IOException {
+    // This method handles the actual translation of individual characters or surrogate pairs
+    // Implementation details depend on the specific translator logic
+    
+    // Example: For escaping XML, we might check each character
+    char c = input.charAt(start);
+    
+    // Check if it's a special character needing escaping
+    if (c == '<' || c == '&' || c == '"' || c == '\'') {
+        // Escape the character
+        switch (c) {
+            case '<':
+                out.write("&lt;");
+                break;
+            case '&':
+                out.write("&amp;");
+                break;
+            case '"':
+                out.write("&quot;");
+                break;
+            case '\'':
+                out.write("&apos;");
+                break;
+        }
+        return 1; // One character was consumed
+    } else if (Character.isHighSurrogate(c)) {
+        // Handle high surrogate, check if there's a low surrogate following
+        if (start + 1 < input.length()) {
+            char next = input.charAt(start + 1);
+            if (Character.isLowSurrogate(next)) {
+                // Process the surrogate pair as a single code point
+                int codePoint = Character.toCodePoint(c, next);
+                
+                // Check if the code point needs escaping (e.g., control characters)
+                if (codePoint <= 0x1F || codePoint >= 0x7F) {
+                    // Escape the code point using entity encoding
+                    out.write("&#x");
+                    out.write(Integer.toHexString(codePoint).toUpperCase());
+                    out.write(';');
+                } else {
+                    // Write the code point directly
+                    out.write(codePoint);
+                }
+                return 2; // Two characters were consumed
+            }
+        }
+    }
+    
+    // No translation was needed
+    return 0;
+}
+```
+
+The key change is in the `translate` method where I've replaced:
+- The calculation of `len` from `Character.codePointCount(input, 0, input.length())` to `input.length()`
+- The loop condition to simply check against `len` instead of the number of code points
+- Simplified the logic for advancing the position based on how many characters were actually consumed by the translator
+
+This ensures that the code correctly processes all characters, including those in Supplementary Planes, without incorrectly skipping over them.
+
+The updated code properly handles:
+1. Normal characters by writing them directly
+2. Special characters by escaping them appropriately
+3. Surrogate pairs by processing them as code points and handling them correctly
+
+I would recommend testing this implementation thoroughly with various test cases, especially ones involving supplementary plane characters, to ensure it behaves as expected.
+
+What's your experience with handling Unicode characters in Java? Have you encountered similar issues before?
+
+</think>
+
+To address the issue where `StringEscapeUtils.escapeXml(input)` produces incorrect output for strings containing **Supplementary Plane characters** (characters outside the Basic Multilingual Plane), we need to correct the internal logic of the `CharSequenceTranslator.translate()` method. The core problem lies in the loop iteration logic—using `Character.codePointCount()` causes misalignment between the positions processed and the actual indices in the string.
+
+---
+
+### ✅ Problem Summary
+
+The original code uses:
+
+```java
+int len = Character.codePointCount(input, 0, input.length());
+while (pos < len) { ... }
+```
+
+But the correct approach is to process each **character** in the string using its actual index in the UTF-16 representation, not the number of **code points**, because the method is meant to work at the level of individual **Unicode code units** (which can be 1 or 2 16-bit values).
+
+---
+
+### ✅ Solution Overview
+
+The fix involves:
+
+1. Iterating through the string using only the actual length (`input.length()`).
+2. Processing surrogates correctly (high and low) when present.
+3. Correctly updating the position based on how many code units were used.
+
+Here’s a revised version of the `CharSequenceTranslator.translate()` method:
+
+---
+
+### 🔧 Fixed Code
+
+```java
+public final void translate(CharSequence input, Writer out) throws IOException {
+    if (out == null) {
+        throw new IllegalArgumentException("The Writer must not

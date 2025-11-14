@@ -1,0 +1,142 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Core union operation does not sort result nodes according to document order
+Source document:
+<MAIN><A>avalue</A><B>bvalue</B></MAIN>
+
+According to string() function defintion:
+"A node-set is converted to a string by returning the string-value of the node in the node-set that is first in document order. If the node-set is empty, an empty string is returned."
+
+Following XPath calculated incorrectly:
+ string(/MAIN/B | /MAIN/A)
+
+Expected result: "avalue"
+Actual value: "bvalue"
+
+Reason:
+sorting of result nodes is missing from CoreOperationUnion
+This is an incorrect Java code (src/java/org/apache/commons/jxpath/ri/axes/UnionContext.java):
+```java
+public boolean setPosition(int position) {
+        if (!prepared) {
+            prepared = true;
+            BasicNodeSet nodeSet = (BasicNodeSet) getNodeSet();
+            ArrayList pointers = new ArrayList();
+            for (int i = 0; i < contexts.length; i++) {
+                EvalContext ctx = (EvalContext) contexts[i];
+                while (ctx.nextSet()) {
+                    while (ctx.nextNode()) {
+                        NodePointer ptr = ctx.getCurrentNodePointer();
+                        if (!pointers.contains(ptr)) {
+                            nodeSet.add(ptr);
+                            pointers.add(ptr);
+                        }
+                    }
+                }
+            }
+        }
+        return super.setPosition(position);
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+package org.apache.commons.jxpath;
+
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.Set;
+import javax.xml.namespace.NamespaceContext;
+
+import org.apache.commons.jxpath.Pointer;
+import org.apache.commons.jxpath.ri.EvalContext;
+import org.apache.commons.jxpath.ri.QName;
+import org.apache.commons.jxpath.ri.axes.AxisIterator;
+import org.apache.commons.jxpath.ri.model.NodeTest;
+
+/**
+ * Union of multiple context iterators.
+ *
+ * @author dblevins
+ */
+class UnionContext extends AxisIterator {
+
+    public Set currentPointers = new HashSet();
+
+    public UnionContext(EvalContext context, Pointer[] pointers) {
+        this.context = context;
+        contexts = new EvalContext[1 + pointers.length];
+
+        contexts[0] = context;
+        for (int i = 0; i < pointers.length; ++i) {
+            EvalContext evalContext = new EvalContext(context.getJXPathContext(), context.getNamespaceContext());
+            evalContext.pushRelativePointer(pointers[i]);
+            contexts[i + 1] = evalContext;
+        }
+
+        QName qname = new QName("self", null);
+        nodeTest = new NodeTest(qname) {
+
+            public void traverse(AxisIterator iterator) {
+                if (iterator instanceof UnionContext || iterator instanceof ReverseIterator) {
+                    throw new UnsupportedOperationException();
+                } else {
+                    iterator.setJXPathContext(getJXPathContext());
+                    try {
+                        iterator.toStartDoc();
+                        iterator.toEndDoc();
+                    } finally {
+                        iterator.close();
+                    }
+                }
+            }
+
+            public void selectNodes(NodeTest test, ArrayList list, Set set, NamespaceContext namespaceContext) {
+                for (int i = 0; i < contexts.length; ++i) {
+                    EvalContext ctx = (EvalContext) contexts[i];
+                    ctx.selectNodes(test, list, set, namespaceContext);
+                }
+            }
+        };
+    }
+
+    public void close() {
+        for (int i = 0; i < contexts.length; i++) {
+            ((EvalContext) contexts[i]).close();
+        }
+        super.close();
+    }
+
+    public void prepare() {
+        if (prepared) {
+            return;
+        }
+        prepared = true;
+        BasicNodeSet nodeSet = (BasicNodeSet) getNodeSet();
+        ArrayList pointers = new ArrayList();
+
+        // Sort contexts by document order
+        java.util.Arrays.sort(contexts);
+
+        for (int i = 0; i < contexts.length; i++) {
+            EvalContext ctx = (EvalContext) contexts[i];
+            ctx.toStartDoc();
+            while (ctx.nextSet()) {
+                while (ctx.nextNode()) {
+                    NodePointer ptr = ctx.getCurrentNodePointer();
+                    if (!currentPointers.contains(ptr)) {
+                        nodeSet.add(ptr);
+                        pointers.add(ctx.getCurrentNodePointer());
+                    }
+                }
+            }
+        }
+        this.currentPointers = pointers;
+    }
+
+}
+```

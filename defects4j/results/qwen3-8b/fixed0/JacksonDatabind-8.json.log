@@ -1,0 +1,151 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Problem with bogus conflict between single-arg-String vs CharSequence constructor
+Although it is good idea to allow recognizing CharSequence as almost like an alias for String, this can cause problems for classes like StringBuilder that have separate constructors for both.
+This actually throws a bogus exception for 2.5.0, due to introduction of ability to recognize CharSequence.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/deser/impl/CreatorCollector.java):
+```java
+protected void verifyNonDup(AnnotatedWithParams newOne, int typeIndex, boolean explicit)
+{
+    final int mask = (1 << typeIndex);
+    _hasNonDefaultCreator = true;
+    AnnotatedWithParams oldOne = _creators[typeIndex];
+    // already had an explicitly marked one?
+    if (oldOne != null) {
+
+        if ((_explicitCreators & mask) != 0) { // already had explicitly annotated, leave as-is
+            // but skip, if new one not annotated
+            if (!explicit) {
+                return;
+            }
+            // both explicit: verify
+            // otherwise only verify if neither explicitly annotated.
+        }
+
+        // one more thing: ok to override in sub-class
+        if (oldOne.getClass() == newOne.getClass()) {
+            // [databind#667]: avoid one particular class of bogus problems
+
+                throw new IllegalArgumentException("Conflicting "+TYPE_DESCS[typeIndex]
+                        +" creators: already had explicitly marked "+oldOne+", encountered "+newOne);
+            // otherwise, which one to choose?
+                // new type more generic, use old
+            // new type more specific, use it
+        }
+    }
+    if (explicit) {
+        _explicitCreators |= mask;
+    }
+    _creators[typeIndex] = _fixAccess(newOne);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+// The issue here is that when comparing AnnotatedWithParams instances, we should not compare their actual class types,
+// since some types may be compatible via inheritance or interfaces, leading to false positives.
+
+// Solution: Replace the direct class comparison with checking whether the new instance is an instance of the old class.
+// This way, even if they're different objects, they could still be compatible.
+
+if (oldOne != null) {
+    if ((_explicitCreators & mask) != 0) {
+        // already had explicitly annotated, leave as-is
+        if (!explicit) {
+            return;
+        }
+        // both explicit: verify
+        // otherwise only verify if neither explicitly annotated.
+    }
+
+    // Check compatibility using instanceof instead of == 
+    if (oldOne.getClass().isAssignableFrom(newOne.getClass())) {
+        // If old is a superclass/supertype of new, keep old
+        return;
+    } else if (newOne.getClass().isAssignableFrom(oldOne.getClass())) {
+        // If new is a subclass/subtype of old, replace with new
+        _creators[typeIndex] = _fixAccess(newOne);
+        return;
+    } else {
+        // Neither is a supertype of the other; conflicting types
+        throw new IllegalArgumentException("Conflicting "+TYPE_DESCS[typeIndex]
+                +" creators: already had explicitly marked "+oldOne+", encountered "+newOne);
+    }
+}
+
+// Rest of the code remains unchanged
+```
+
+The key change here is replacing the `==` operator with `instanceof` checks to determine compatibility between classes. This prevents the false positive conflicts that occur when comparing object references directly.
+
+I would also recommend adding some comments explaining why this change was made, and perhaps enhancing the error message to indicate that the conflict is due to incompatible types rather than duplicate definitions.
+
+Would you like me to make any additional changes or explain anything further about this fix?
+</think>
+
+To address the problem with the **bogus conflict** between single-argument `String` and `CharSequence` constructors in the context of Jackson's `CreatorCollector`, the core issue lies in how the framework handles creator configuration during deserialization. Specifically, the current logic attempts to compare the actual class (`getClass()`) of two `AnnotatedWithParams` instances when determining if there’s a conflict. However, this approach leads to false negatives (like treating `StringBuilder` with a `CharSequence` constructor as a conflict).
+
+---
+
+### ✅ **Root Cause**
+
+When a class such as `StringBuilder` has multiple constructors (e.g., `StringBuilder(CharSequence)`), the existing logic blindly compares the exact class of each constructor (`AnnotatedWithParams`). This results in:
+
+- False positives: A `CharSequence` argument (which is technically a valid constructor parameter for `StringBuilder`) is treated as incompatible because its actual class doesn't match exactly with a `String` class (e.g., when `String` is considered equivalent to `CharSequence`).
+- False negatives: The framework incorrectly treats different but functionally similar constructors as **conflicts**, where no real duplication exists (i.e., `String` is a subtype of `CharSequence`, so the latter shouldn’t override the former).
+
+---
+
+### 🛠️ **Fix Strategy**
+
+Instead of comparing the exact class via `.equals()` or `==`, we need to check **class hierarchy compatibility**:
+
+- Use `isAssignableFrom()` to determine if one type is compatible with another.
+- Avoid unnecessary conflicts if the new constructor is a *subclass* or implements a method of the old one.
+
+---
+
+### 🔧 Final Fixed Code
+
+Here is the corrected version of the relevant section:
+
+```java
+protected void verifyNonDup(AnnotatedWithParams newOne, int typeIndex, boolean explicit)
+{
+    final int mask = (1 << typeIndex);
+    _hasNonDefaultCreator = true;
+    AnnotatedWithParams oldOne = _creators[typeIndex];
+
+    if (oldOne != null) {
+        if ((_explicitCreators & mask) != 0) {
+            // Already had explicitly annotated, leave as-is
+            if (!explicit) {
+                return;
+            }
+            // Both explicit: verify compatibility
+        } else {
+            // Only verify if neither explicitly annotated
+            if (!explicit && !oldOne.isExplicitlyMarked()) {
+                return;
+            }
+        }
+
+        // Determine if newOne is compatible with oldOne via inheritance/hierarchy
+        Class<?> oldClass = oldOne.getJavaType();
+        Class<?> newClass = newOne.getJavaType();
+
+        if (oldClass.isAssignableFrom(newClass)) {
+            // New is more general — keep the old one
+            return;
+        } else if (newClass.isAssignableFrom(oldClass)) {
+            // New is more specific — replace with the new one
+            _creators[typeIndex] = _fixAccess(newOne);
+            return;
+        } else {
+            // Incompatible types – treat as a real conflict
+            throw new IllegalArgumentException(
+                    "Conflicting " + TYPE_DESCS[typeIndex]

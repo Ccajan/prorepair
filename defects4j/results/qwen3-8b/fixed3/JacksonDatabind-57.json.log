@@ -1,0 +1,122 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# ObjectReader.readValues() ignores offset and length when reading an array
+ObjectReader.readValues ignores offset and length when reading an array. If _dataFormatReaders it will always use the full array:
+https://github.com/FasterXML/jackson-databind/blob/2.7/src/main/java/com/fasterxml/jackson/databind/ObjectReader.java#L1435
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/ObjectReader.java):
+```java
+public <T> MappingIterator<T> readValues(byte[] src, int offset, int length)
+    throws IOException, JsonProcessingException
+{
+    if (_dataFormatReaders != null) {
+        return _detectBindAndReadValues(_dataFormatReaders.findFormat(src, offset, length), false);
+    }
+    return _bindAndReadValues(_considerFilter(_parserFactory.createParser(src), 
+            true));
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public <T> MappingIterator<T> readValues(byte[] src, int offset, int length)
+    throws IOException, JsonProcessingException
+{
+    if (_dataFormatReaders != null) {
+        // Find the appropriate data format reader that supports the given byte range
+        DataFormatReader dfReader = _dataFormatReaders.findFormat(src, offset, length);
+        if (dfReader != null) {
+            return _detectBindAndReadValues(dfReader, false);
+        } else {
+            // Fallback to default parser if no suitable data format is found
+            return _bindAndReadValues(_considerFilter(_parserFactory.createParser(src), true));
+        }
+    }
+    return _bindAndReadValues(_considerFilter(_parserFactory.createParser(src), true));
+}
+```
+
+The problem with the original implementation was that it only called findFormat() but didn't check if it actually returned a valid DataFormatReader before using it. The revised code adds a null check for dfReader and falls back to the default parser if no suitable data format is found.
+
+I've also added comments to explain what each part does. This ensures that we properly handle the case where the specified byte range doesn't match any registered data format readers.
+</think>
+
+The issue described is that `ObjectReader.readValues()` in Jackson's `databind` module is not respecting the provided `offset` and `length` parameters when reading arrays. Specifically, the method fails to ensure that the correct data format reader is used for the specific portion of the input array defined by these parameters. 
+
+Here’s a detailed analysis and resolution of this issue:
+
+---
+
+## ✅ Problem Summary
+
+In the original code:
+- `_dataFormatReaders.findFormat(src, offset, length)` is called.
+- However, even if `findFormat()` returns a non-null result, there is **no explicit validation** or usage of the result within the call chain to ensure it respects the `offset` and `length`.
+- As a result, the actual parsing logic may still be applied on the entire input (`src`) rather than just the subarray from `offset` to `offset + length`.
+
+The `readValues()` method should respect the bounds set by `offset` and `length`, which is especially important for streaming JSON or binary inputs where memory efficiency matters.
+
+---
+
+## 🔧 Solution Overview
+
+We need to make sure that:
+
+1. We correctly identify a matching `DataFormatReader` based on the provided input range.
+2. That identified reader must then be used specifically for the subarray defined by `offset` and `length`.
+3. If no such reader exists, fall back to the standard parser mechanism.
+
+---
+
+## 🛠️ Corrected Implementation
+
+```java
+public <T> MappingIterator<T> readValues(byte[] src, int offset, int length)
+    throws IOException, JsonProcessingException
+{
+    if (_dataFormatReaders != null) {
+        DataFormatReader dfReader = _dataFormatReaders.findFormat(src, offset, length);
+        if (dfReader != null) {
+            // Ensure that the selected reader supports reading from the specified slice
+            if (dfReader.supportsSlice()) {
+                // Create a sliced view of the byte array for the reader
+                byte[] slice = Arrays.copyOfRange(src, offset, offset + length);
+                return _detectBindAndReadValues(dfReader, slice);
+            } else {
+                // Fallback: Not all data format readers support slicing; use the default parser
+                return _bindAndReadValues(_considerFilter(_parserFactory.createParser(src), true));
+            }
+        } else {
+            // No matching format reader found; fallback to standard parser
+            return _bindAndReadValues(_considerFilter(_parserFactory.createParser(src), true));
+        }
+    }
+    return _bindAndReadValues(_considerFilter(_parserFactory.createParser(src), true));
+}
+```
+
+---
+
+## 💡 Explanation
+
+### 1. **Check for Slice Support**
+   - Some data format readers might not support reading slices of the input array. Before attempting to use a format reader for a slice, we must verify whether it provides `supportsSlice()` functionality.
+
+### 2. **Create Sliced Array**
+   - Use `Arrays.copyOfRange(src, offset, offset + length)` to get a new byte array representing only the desired segment of the source array.
+
+### 3. **Pass the Sliced View to Reader**
+   - The `dfReader` now reads from the sliced array instead of the original input, ensuring that `offset` and `length` constraints are respected.
+
+### 4. **Fallback Handling**
+   - In cases where the identified reader either doesn’t support slicing or doesn't match the requested range, revert to the default parser behavior.
+
+---
+
+## ⚠️ Additional Notes
+
+- You'll want to ensure your custom `DataFormatReader` implementations include proper `supportsSlice()` checks and can operate correctly on the passed `byte[]` slice.
+- Also, consider adding internal

@@ -1,0 +1,160 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# JsonIdentityInfo incorrectly serializing forward references
+I wrote this small test program to demonstrate the issue:
+import com.fasterxml.jackson.annotation.JsonIdentityInfo;
+import com.fasterxml.jackson.annotation.JsonIdentityReference;
+import com.fasterxml.jackson.annotation.ObjectIdGenerators;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+public class ObjectIdTest {
+
+    public static class Foo {
+
+        @JsonIdentityReference(alwaysAsId = true)
+        public Bar bar1;
+
+        @JsonIdentityReference()
+        public Bar bar2;
+    }
+
+    @JsonIdentityInfo(generator = ObjectIdGenerators.IntSequenceGenerator.class)
+    public static class Bar {
+
+    }
+
+    public static void main(String[] args) throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+
+        // create structure to serialize
+        Foo mo = new Foo();
+        mo.bar1 = new Bar();
+        mo.bar2 = mo.bar1;
+
+        // serialize it
+        System.out.println(mapper.writeValueAsString(mo));
+    }
+
+}
+When executing this test program in the latest version (2.7.4), the output will be {"bar1":1,"bar2":{"@id":2}} - the second field will be written with a new id even though both fields reference the same object. Because of this, writing forward references is essentially impossible.
+The issue seems to be the fact that BeanSerializerBase will always call WritableObjectId.generateId if the referenced object has not been written in plain format yet (https://github.com/FasterXML/jackson-databind/blob/master/src/main/java/com/fasterxml/jackson/databind/ser/std/BeanSerializerBase.java#L600). This will also happen if an id has been generated before.
+It might also be smarter to only generate a new id in WritableObjectId.generateId if that hasn't happened before; as that method doesn't have a javadoc I can't tell how it is supposed to work.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/ser/impl/WritableObjectId.java):
+```java
+public Object generateId(Object forPojo) {
+    // 04-Jun-2016, tatu: As per [databind#1255], need to consider possibility of
+    //    id being generated for "alwaysAsId", but not being written as POJO; regardless,
+    //    need to use existing id if there is one:
+        id = generator.generateId(forPojo);
+    return id;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public Object generateId(Object forPojo) {
+    // Check if we've already generated an ID for this object
+    if (id != null) {
+        return id;
+    }
+    // Otherwise, generate the ID using the generator
+    id = generator.generateId(forPojo);
+    return id;
+}
+```
+
+This fix ensures that `generateId` only generates a new ID if one hasn't been generated yet. The original implementation would always call `generator.generateId()` regardless of whether an ID had already been generated, leading to incorrect behavior when dealing with forward references.
+
+Here's why this works:
+
+1. The check `if (id != null)` prevents redundant generation of IDs
+2. It maintains the existing functionality where the first ID generation uses the generator
+3. It solves the problem where identical objects would get different IDs when they should have the same ID
+
+This change aligns with the intended behavior described in databind#1255 and fixes the issue where forward references were getting incorrect IDs.
+</think>
+
+To resolve the issue of **incorrect serialization of forward references** in Jackson when using `@JsonIdentityInfo` and `@JsonIdentityReference`, we must understand the root cause and apply a targeted fix.
+
+---
+
+### 📌 Problem Summary
+
+In your example, two fields (`bar1` and `bar2`) refer to the **same instance** of the `Bar` class. However, during JSON serialization, **both fields receive different IDs**, which breaks expected behavior for identity-based serialization.
+
+#### Why does this happen?
+
+Jackson’s internal logic, specifically the `WritableObjectId.generateId()` method, **re-generates the ID every time** it's called — even after it has already been generated. This leads to duplicate or inconsistent IDs when dealing with circular or forward references.
+
+This behavior results from the current implementation:
+
+```java
+public Object generateId(Object forPojo) {
+    id = generator.generateId(forPojo);
+    return id;
+}
+```
+
+Even if the `id` variable was previously assigned, it still regenerates it each time the method is invoked. That's why in your case, `bar1` gets one ID, and `bar2` (pointing to the same object) receives another.
+
+---
+
+### ✅ Solution
+
+We fix this by **ensuring that an object's ID is only generated once** — even if multiple parts of the tree reference it. This avoids unnecessary re-generation and preserves the integrity of the serialized graph.
+
+Here’s the corrected version of the `generateId` method:
+
+```java
+public Object generateId(Object forPojo) {
+    // If ID has already been generated, just return it
+    if (id != null) {
+        return id;
+    }
+    
+    // Generate the ID the first time
+    id = generator.generateId(forPojo);
+    return id;
+}
+```
+
+---
+
+### 🔍 Explanation of the Fix
+
+- **Check for existing ID:** The `if (id != null)` condition checks whether an ID has already been assigned.
+- **Only generate on first call:** If no ID exists, the method proceeds to generate it using the configured generator.
+- **Reuse existing ID afterward:** Any subsequent calls to `generateId` will immediately return the precomputed value without regeneration.
+
+---
+
+### ✅ Benefits of the Fix
+
+- Ensures consistent identity tracking across all references
+- Correctly handles forward and circular references
+- Prevents unnecessary recomputation, improving performance
+- Aligns with intended behavior for `@JsonIdentityReference(alwaysAsId = true)`
+
+---
+
+### 📦 Implementation Notes
+
+Make sure to update the file located at:
+
+> `src/main/java/com/fasterxml/jackson/databind/ser/impl/WritableObjectId.java`
+
+Once this change is made and tested, the original test program should now produce the correct output:
+
+```
+{"bar1":1,"bar2":1}
+```
+
+This means both references correctly identify the **same object**, as expected.
+
+---
+
+Let me know if you'd like guidance on testing or integrating this change into your project.

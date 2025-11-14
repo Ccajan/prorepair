@@ -1,0 +1,196 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Type of prototype property incorrectly inferred to string
+What steps will reproduce the problem?
+1. Compile the following code:
+
+/** @param {Object} a */
+function f(a) {
+  a.prototype = '__proto';
+}
+
+/** @param {Object} a */
+function g(a) {
+  a.prototype = function(){};
+}
+
+What is the expected output? What do you see instead?
+
+Should type check. Instead, gives error:
+
+WARNING - assignment to property prototype of Object
+found   : function (): undefined
+required: string
+  a.prototype = function(){};
+  ^
+This is an incorrect Java code (src/com/google/javascript/jscomp/TypedScopeCreator.java):
+```java
+private boolean isQualifiedNameInferred(
+    String qName, Node n, JSDocInfo info,
+    Node rhsValue, JSType valueType) {
+  if (valueType == null) {
+    return true;
+  }
+
+  // Prototypes of constructors and interfaces are always declared.
+  if (qName != null && qName.endsWith(".prototype")) {
+      return false;
+  }
+
+  boolean inferred = true;
+  if (info != null) {
+    inferred = !(info.hasType()
+        || info.hasEnumParameterType()
+        || (isConstantSymbol(info, n) && valueType != null
+            && !valueType.isUnknownType())
+        || FunctionTypeBuilder.isFunctionTypeDeclaration(info));
+  }
+
+  if (inferred && rhsValue != null && rhsValue.isFunction()) {
+    if (info != null) {
+      return false;
+    } else if (!scope.isDeclared(qName, false) &&
+        n.isUnscopedQualifiedName()) {
+
+      // Check if this is in a conditional block.
+      // Functions assigned in conditional blocks are inferred.
+      for (Node current = n.getParent();
+           !(current.isScript() || current.isFunction());
+           current = current.getParent()) {
+        if (NodeUtil.isControlStructure(current)) {
+          return true;
+        }
+      }
+
+      // Check if this is assigned in an inner scope.
+      // Functions assigned in inner scopes are inferred.
+      AstFunctionContents contents =
+          getFunctionAnalysisResults(scope.getRootNode());
+      if (contents == null ||
+          !contents.getEscapedQualifiedNames().contains(qName)) {
+        return false;
+      }
+    }
+  }
+  return inferred;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+The issue seems to be that when assigning a function to the prototype property of an object, the type system is incorrectly inferring the value as a string instead of a function. The goal is to fix the `isQualifiedNameInferred` method to correctly handle assignments to `prototype` properties.
+
+Let me review the code and identify the issue:
+
+The warning message indicates that the right-hand side of the assignment is a function, but the compiler thinks it should be a string. This suggests that the type checker is not correctly recognizing that the `prototype` property can take a function.
+
+Looking at the code:
+- If the qualified name ends with ".prototype", we return false (which might be a bug).
+- There's logic checking if the RHS is a function and then doing some checks.
+
+The key problem likely lies in how we're handling assignments to `prototype`. When we assign a function to `a.prototype`, the type system should recognize this as valid, rather than treating it as a string assignment.
+
+I'll modify the code to properly handle these cases. Here's my suggested fix:
+
+```java
+private boolean isQualifiedNameInferred(
+    String qName, Node n, JSDocInfo info,
+    Node rhsValue, JSType valueType) {
+  if (valueType == null) {
+    return true;
+  }
+
+  // Special case: Prototype properties should always be declared
+  if (qName != null && qName.endsWith(".prototype")) {
+    // Don't infer if the name has been explicitly declared
+    if (scope.isDeclared(qName, false)) {
+      return false;
+    }
+    // If no type information, assume it's being assigned properly
+    return valueType != null;
+  }
+
+  boolean inferred = true;
+  if (info != null) {
+    inferred = !(info.hasType()
+        || info.hasEnumParameterType()
+        || (isConstantSymbol(info, n) && valueType != null
+            && !valueType.isUnknownType())
+        || FunctionTypeBuilder.isFunctionTypeDeclaration(info));
+  }
+
+  if (inferred && rhsValue != null && rhsValue.isFunction()) {
+    if (info != null) {
+      return false;
+    } else if (!scope.isDeclared(qName, false) &&
+        n.isUnscopedQualifiedName()) {
+
+      // Check if this is in a conditional block.
+      // Functions assigned in conditional blocks are inferred.
+      for (Node current = n.getParent();
+           !(current.isScript() || current.isFunction());
+           current = current.getParent()) {
+        if (NodeUtil.isControlStructure(current)) {
+          return true;
+        }
+      }
+
+      // Check if this is assigned in an inner scope.
+      // Functions assigned in inner scopes are inferred.
+      AstFunctionContents contents =
+          getFunctionAnalysisResults(scope.getRootNode());
+      if (contents == null ||
+          !contents.getEscapedQualifiedNames().contains(qName)) {
+        return false;
+      }
+    }
+  }
+  return inferred;
+}
+```
+
+The main changes I made are:
+1. Added a special case for names ending with ".prototype"
+2. In that special case, I now check if the name is already declared
+3. If not declared, I return whether there's a type (since we expect a function)
+
+This should allow the compiler to correctly recognize that assigning a function to a prototype property is valid, rather than treating it as a string assignment.
+
+Would you like me to explain any part of this change in more detail?
+</think>
+
+To address the issue where TypeScript or similar static type-checkers incorrectly infer the `prototype` property of an object as a `string` instead of accepting a function, we need to refine the logic in the `isQualifiedNameInferred` method of the TypeScript compiler or its equivalent JSCompiler implementation.
+
+---
+
+### 🔍 **Understanding the Problem**
+
+When assigning a function to an object's `.prototype` property (e.g., `a.prototype = function(){}`), the type inference should accept a function type, not a string. However, the current implementation misinterprets such an assignment as attempting to assign a string — leading to a misleading error message.
+
+This flaw typically arises because the existing logic is overly conservative about what types are acceptable for `.prototype`.
+
+---
+
+### ✅ **Fixing the Logic**
+
+We modify the method so that:
+
+1. Any assignment to a property named `.prototype` is treated specially.
+2. We don’t infer the type unless the variable is already explicitly typed (i.e., the user defines a specific type).
+3. For untyped `.prototype` accesses, we default to allowing functions — which is valid since `prototype` can hold functions, particularly when used in constructor contexts.
+
+Here’s the fixed version of the relevant method:
+
+```java
+private boolean isQualifiedNameInferred(
+    String qName, Node n, JSDocInfo info,
+    Node rhsValue, JSType valueType) {
+  
+  // If no type information available, safely assume it's correct
+  if (valueType == null) {
+    return true;
+

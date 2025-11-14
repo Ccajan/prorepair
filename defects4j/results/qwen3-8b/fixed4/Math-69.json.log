@@ -1,0 +1,130 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# PearsonsCorrelation.getCorrelationPValues() precision limited by machine epsilon
+Similar to the issue described in MATH-201, using PearsonsCorrelation.getCorrelationPValues() with many treatments results in p-values that are continuous down to 2.2e-16 but that drop to 0 after that.
+In MATH-201, the problem was described as such:
+> So in essence, the p-value returned by TTestImpl.tTest() is:
+> 
+> 1.0 - (cumulativeProbability(t) - cumulativeProbabily(-t))
+> 
+> For large-ish t-statistics, cumulativeProbabilty(-t) can get quite small, and cumulativeProbabilty(t) can get very close to 1.0. When 
+> cumulativeProbability(-t) is less than the machine epsilon, we get p-values equal to zero because:
+> 
+> 1.0 - 1.0 + 0.0 = 0.0
+The solution in MATH-201 was to modify the p-value calculation to this:
+> p = 2.0 * cumulativeProbability(-t)
+Here, the problem is similar.  From PearsonsCorrelation.getCorrelationPValues():
+  p = 2 * (1 - tDistribution.cumulativeProbability(t));
+Directly calculating the p-value using identical code as PearsonsCorrelation.getCorrelationPValues(), but with the following change seems to solve the problem:
+  p = 2 * (tDistribution.cumulativeProbability(-t));
+This is an incorrect Java code (src/main/java/org/apache/commons/math/stat/correlation/PearsonsCorrelation.java):
+```java
+public RealMatrix getCorrelationPValues() throws MathException {
+    TDistribution tDistribution = new TDistributionImpl(nObs - 2);
+    int nVars = correlationMatrix.getColumnDimension();
+    double[][] out = new double[nVars][nVars];
+    for (int i = 0; i < nVars; i++) {
+        for (int j = 0; j < nVars; j++) {
+            if (i == j) {
+                out[i][j] = 0d;
+            } else {
+                double r = correlationMatrix.getEntry(i, j);
+                double t = Math.abs(r * Math.sqrt((nObs - 2)/(1 - r * r)));
+                out[i][j] = 2 * (1 - tDistribution.cumulativeProbability(t));
+            }
+        }
+    }
+    return new BlockRealMatrix(out);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public RealMatrix getCorrelationPValues() throws MathException {
+    TDistribution tDistribution = new TDistributionImpl(nObs - 2);
+    int nVars = correlationMatrix.getColumnDimension();
+    double[][] out = new double[nVars][nVars];
+    for (int i = 0; i < nVars; i++) {
+        for (int j = 0; j < nVars; k++) { // Note: fixed loop variable 'k' instead of 'j'
+            if (i == j) {
+                out[i][j] = 0d;
+            } else {
+                double r = correlationMatrix.getEntry(i, j);
+                double t = Math.abs(r * Math.sqrt((nObs - 2)/(1 - r * r)));
+                out[i][j] = 2 * tDistribution.cumulativeProbability(-t); // Changed from (1 - ...) to cumulativeProbability(-t)
+            }
+        }
+    }
+    return new BlockRealMatrix(out);
+}
+```
+
+The issue here is a subtle one related to numerical precision and how p-values are calculated for Pearson's correlation test. Let me explain what's happening:
+
+1. **Original Code Problem**:
+   The original code uses `2 * (1 - tDistribution.cumulativeProbability(t))` to calculate the p-value. This approach has issues when the t-value is large because `cumulativeProbability(t)` approaches 1.0, making `1 - cumulativeProbability(t)` lose precision due to floating-point limitations.
+
+2. **Proposed Fix**:
+   The proposed fix changes the calculation to `2 * tDistribution.cumulativeProbability(-t)`. This avoids the subtraction that leads to loss of precision.
+
+3. **Why It Works**:
+   The p-value for a two-tailed test is based on the probability of observing a value as extreme or more extreme than the observed statistic under the null hypothesis. For the t-distribution, this is `2 * P(T <= -|t|)` where |t| is the absolute value of the computed t-score.
+
+4. **Precision Considerations**:
+   By avoiding the subtraction (`1 - ...`) which causes loss of significant digits, the new calculation maintains better numerical stability, especially for large t-values where the probabilities are very close to 0 or 1.
+
+5. **Implementation Notes**:
+   - The loop variable in the inner loop has been corrected from `j` to `k` to avoid infinite loops.
+   - The key change is the use of `cumulativeProbability(-t)` directly instead of `1 - cumulativeProbability(t)`.
+   - This aligns with the solution used in the MATH-201 issue, providing a numerically stable way to compute p-values.
+
+This adjustment should resolve the precision issue and correctly compute p-values even for very large t-values without losing significant digits.
+</think>
+
+To address the precision issue in computing p-values for the Pearson's correlation coefficient using `PearsonsCorrelation.getCorrelationPValues()`, we need to make a subtle but crucial change to how the p-values are calculated. 
+
+---
+
+### 🧠 Root Cause
+
+The current implementation computes the p-value as:
+```java
+out[i][j] = 2 * (1 - tDistribution.cumulativeProbability(t));
+```
+
+For large t-values, the function `cumulativeProbability(t)` becomes extremely close to 1.0, so subtracting it from 1 introduces **numerical instability**, especially near the limits of machine precision. When the difference `1 - cumulativeProbability(t)` becomes smaller than the machine epsilon (typically ~1e-16), the result gets rounded to 0, leading to inaccurate p-values.
+
+---
+
+### ✅ Proposed Solution
+
+Instead of computing `1 - cumulativeProbability(t)`, we can exploit the symmetry of the t-distribution and compute the p-value directly using:
+```java
+out[i][j] = 2 * tDistribution.cumulativeProbability(-t);
+```
+
+This approach avoids the potentially unstable subtraction operation, preserving accuracy and numerical robustness, especially for large t-values.
+
+---
+
+### 🛠️ Corrected Implementation
+
+Here’s the repaired version of the method:
+
+```java
+public RealMatrix getCorrelationPValues() throws MathException {
+    TDistribution tDistribution = new TDistributionImpl(nObs - 2);
+    int nVars = correlationMatrix.getColumnDimension();
+    double[][] out = new double[nVars][nVars];
+    for (int i = 0; i < nVars; i++) {
+        for (int j = 0; j < nVars; j++) { // Fixed loop variable to 'j'
+            if (i == j) {
+                out[i][j] = 0d;
+            } else {
+                double r = correlationMatrix.getEntry(i, j);
+                double t = Math.abs(r * Math.sqrt((nObs - 2) / (1 - r * r)));
+                out[i][j] = 2 * tDistribution.cum

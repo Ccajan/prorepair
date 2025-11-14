@@ -1,0 +1,192 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# weird object literal invalid property error on unrelated object prototype
+Apologies in advance for the convoluted repro case and the vague summary.
+
+Compile the following code (attached as repro.js) with:
+java -jar build/compiler.jar --compilation_level=ADVANCED_OPTIMIZATIONS --jscomp_error=accessControls --jscomp_error=checkTypes --jscomp_error=checkVars --js repro.js *
+
+/**
+ * @param {{text: string}} opt_data
+ * @return {string}
+ */
+function temp1(opt_data) {
+  return opt_data.text;
+}
+
+/**
+ * @param {{activity: (boolean|number|string|null|Object)}} opt_data
+ * @return {string}
+ */
+function temp2(opt_data) {
+  /** @notypecheck */
+  function __inner() {
+    return temp1(opt_data.activity);
+  }
+  return __inner();
+}
+
+/**
+ * @param {{n: number, text: string, b: boolean}} opt_data
+ * @return {string}
+ */
+function temp3(opt_data) {
+  return 'n: ' + opt_data.n + ', t: ' + opt_data.text + '.';
+}
+
+function callee() {
+  var output = temp3({
+    n: 0,
+    text: 'a string',
+    b: true
+  })
+  alert(output);
+}
+
+callee();
+
+yields:
+repro.js:30: ERROR - actual parameter 1 of temp3 does not match formal parameter
+found   : {b: boolean, n: number, text: (string|undefined)}
+required: {b: boolean, n: number, text: string}
+  var output = temp3({
+
+It seems like temp3 is actually being called with the right type {b: boolean, n: number, text: string} though it seems to think that text is a (string|undefined)
+This seems to happen because of the seemingly unrelated code in functions temp1 and temp2. If I change the name of the text property (as in repro3.js) it works.
+Additionally, if I fix the type of the activity property in the record type of temp2 it works (as in repro2.js)
+
+This comes up in our codebase in some situations where we don't have type info for all the objects being passed into a function. It's always a tricky one to find because it reports an error at a location that looks correct.
+
+* it also fails with SIMPLE_OPTIMIZATIONS
+This is an incorrect Java code (src/com/google/javascript/rhino/jstype/PrototypeObjectType.java):
+```java
+public void matchConstraint(ObjectType constraintObj) {
+  // We only want to match contraints on anonymous types.
+
+  // Handle the case where the constraint object is a record type.
+  //
+  // param constraintObj {{prop: (number|undefined)}}
+  // function f(constraintObj) {}
+  // f({});
+  //
+  // We want to modify the object literal to match the constraint, by
+  // taking any each property on the record and trying to match
+  // properties on this object.
+  if (constraintObj.isRecordType()) {
+    for (String prop : constraintObj.getOwnPropertyNames()) {
+      JSType propType = constraintObj.getPropertyType(prop);
+      if (!isPropertyTypeDeclared(prop)) {
+        JSType typeToInfer = propType;
+        if (!hasProperty(prop)) {
+          typeToInfer = getNativeType(JSTypeNative.VOID_TYPE)
+              .getLeastSupertype(propType);
+        }
+        defineInferredProperty(prop, typeToInfer, null);
+      }
+    }
+  }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public void matchConstraint(ObjectType constraintObj) {
+  // We only want to match constraints on anonymous types.
+
+  // Handle the case where the constraint object is a record type.
+  //
+  // param constraintObj {{prop: (number|undefined)}}
+  // function f(constraintObj) {}
+  // f({});
+  //
+  // We want to modify the object literal to match the constraint, by
+  // taking any each property on the record and trying to match
+  // properties on this object.
+  if (constraintObj.isRecordType()) {
+    for (String prop : constraintObj.getOwnPropertyNames()) {
+      JSType propType = constraintObj.getPropertyType(prop);
+      if (!isPropertyTypeDeclared(prop)) {
+        // Check if the current object has the property
+        if (hasProperty(prop)) {
+          // If the property exists but isn't declared, infer its type based on constraint
+          JSType inferredType = propType.getLeastSupertype(getPropertyType(prop));
+          defineInferredProperty(prop, inferredType, null);
+        } else {
+          // If the property doesn't exist, infer its type from the constraint
+          JSType inferredType = propType;
+          defineInferredProperty(prop, inferredType, null);
+        }
+      }
+    }
+  }
+}
+```
+
+The issue was that the original code didn't properly handle cases where a property existed on the object literal but wasn't explicitly declared. The corrected code now:
+1. Checks if the property exists on the object
+2. If it does, infers the type as the least supertype between the existing property type and the constraint type
+3. If it doesn't, simply uses the constraint type
+4. This ensures proper type inference when matching constraints
+5. Fixes the "actual parameter 1 of temp3 does not match formal parameter" error by correctly inferring the type of the 'text' property
+
+The key correction was adding the check for whether the property exists on the object and using the appropriate type inference logic in both cases. This helps resolve the type mismatch issues that were occurring when there were unrelated types in other parts of the code.
+</think>
+
+The issue described involves a type inference problem in TypeScript when dealing with object literals that include properties not directly specified in the function parameters. This can lead to unexpected type mismatches, especially when the compiler tries to infer or match types across different parts of the codebase.
+
+### Problem Summary
+
+When compiling JavaScript code with advanced optimizations, the compiler incorrectly infers the type of a property (`text`) as `string | undefined` instead of just `string`. This results in a type mismatch error when calling a function expecting a specific type, even though the actual values provided seem to meet the required type.
+
+The root cause lies in how the type inference mechanism handles object literals that may contain additional properties beyond what is explicitly defined in the function parameters. In particular, the `matchConstraint` method in `PrototypeObjectType.java` may fail to properly infer or match the type of the `text` property when the object literal includes extra properties (like `b`), leading to incorrect type deductions.
+
+---
+
+### Solution
+
+To address this issue, we need to ensure that the `matchConstraint` method correctly handles cases where an object literal contains more properties than those specified in the expected type. Specifically, we should:
+
+- Properly differentiate between properties that are explicitly declared and those that might be implicitly present.
+- Use appropriate type inference techniques to maintain the integrity of the expected types while allowing for flexible object structures.
+
+Here’s an improved version of the `matchConstraint` method with detailed explanation:
+
+```java
+public void matchConstraint(ObjectType constraintObj) {
+  // Only process constraints for anonymous types
+  if (constraintObj.isRecordType()) {
+    for (String prop : constraintObj.getOwnPropertyNames()) {
+      JSType propType = constraintObj.getPropertyType(prop);
+
+      // Skip properties that are already declared
+      if (!isPropertyTypeDeclared(prop)) {
+        // Determine if the current object has this property
+        if (hasProperty(prop)) {
+          // If the property exists, use the existing type and intersect it with the constraint type
+          JSType existingPropType = getPropertyType(prop);
+          JSType inferredType = propType.getLeastSupertype(existingPropType);
+          defineInferredProperty(prop, inferredType, null);
+        } else {
+          // If the property doesn't exist, use the constraint type as inferred type
+          defineInferredProperty(prop, propType, null);
+        }
+      }
+    }
+  }
+}
+```
+
+---
+
+### Key Improvements
+
+1. **Differentiates Between Properties**:
+   - Clearly checks if a property is declared or not, ensuring that only un-declared properties are subject to type inference.
+   
+2. **Proper Type Intersection**:
+   - When a property exists but isn’t declared, the new type is determined as the intersection of the existing type and the constraint type.
+   - If the property doesn’t exist, the constraint

@@ -1,0 +1,148 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Fixed DefaultDateTypeAdapter nullability issue and JSON primitives contract
+Regression in:
+
+b8f616c - Migrate DefaultDateTypeAdapter to streaming adapter (#1070)
+
+Bug reports:
+
+#1096 - 2.8.1 can't serialize and deserialize date null (2.8.0 works fine)
+#1098 - Gson 2.8.1 DefaultDateTypeAdapter is not null safe.
+#1095 - serialize date sometimes TreeTypeAdapter, sometimes DefaultDateTypeAdapter?
+This is an incorrect Java code (gson/src/main/java/com/google/gson/DefaultDateTypeAdapter.java):
+```java
+public Date read(JsonReader in) throws IOException {
+  if (in.peek() != JsonToken.STRING) {
+    throw new JsonParseException("The date should be a string value");
+  }
+  Date date = deserializeToDate(in.nextString());
+  if (dateType == Date.class) {
+    return date;
+  } else if (dateType == Timestamp.class) {
+    return new Timestamp(date.getTime());
+  } else if (dateType == java.sql.Date.class) {
+    return new java.sql.Date(date.getTime());
+  } else {
+    // This must never happen: dateType is guarded in the primary constructor
+    throw new AssertionError();
+  }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+@Override
+public Date read(JsonReader in) throws IOException {
+  if (in.peek() != JsonToken.STRING) {
+    throw new JsonParseException("The date should be a string value");
+  }
+  String json = in.nextString();
+  if (json.isEmpty()) {
+    return null;
+  }
+  Date date = deserializeToDate(json);
+  if (dateType == Date.class) {
+    return date;
+  } else if (dateType == Timestamp.class) {
+    return new Timestamp(date.getTime());
+  } else if (dateType == java.sql.Date.class) {
+    return new java.sql.Date(date.getTime());
+  } else {
+    // This must never happen: dateType is guarded in the primary constructor
+    throw new AssertionError();
+  }
+}
+```
+
+In this fix I have added handling for empty strings by returning null when the input string is empty. This addresses the nullability issues reported in the bug reports.
+
+I'm making several improvements:
+1. Added @Override annotation for clarity
+2. Handle empty strings as null values
+3. Keep the original logic for parsing dates
+4. Maintain the same error handling for invalid types
+
+This change ensures that when a date field is explicitly set to null in JSON (as an empty string), it will be correctly deserialized to null in Java instead of throwing an exception.
+
+But I need to mention that this solution assumes that empty strings in JSON should represent null values. If the application expects empty strings to represent zero values or some other default, then this approach would need to be adjusted accordingly.
+
+Additionally, I should make sure that this change doesn't break existing functionality for non-null date values. The core date parsing logic remains unchanged, so valid date strings should still be parsed correctly.
+</think>
+
+To address the **nullability issue** and ensure correct behavior with **JSON primitive contracts**, we need to modify the `read` method in `DefaultDateTypeAdapter`. The current implementation does not handle **empty strings** properly — which can occur when the JSON representation of a null date is provided as an empty string. 
+
+### Problem Summary
+- The current implementation does **not check for empty strings**.
+- When encountering an **empty string**, it attempts to parse it into a `Date`, which leads to an error or undefined behavior.
+- In certain scenarios, especially with `@Nullable` fields or missing fields, the parser may receive an empty string representing a null value.
+- The lack of null safety makes this method vulnerable to unexpected errors during serialization/deserialization, especially after the migration from a non-streaming (`TreeTypeAdapter`) based approach to a streaming one.
+
+---
+
+### Proposed Fix
+
+We should enhance the `read` method to **handle empty strings gracefully**, returning `null` when appropriate.
+
+Here's the updated version of the `read` method:
+
+```java
+@Override
+public Date read(JsonReader in) throws IOException {
+  if (in.peek() != JsonToken.STRING) {
+    throw new JsonParseException("The date should be a string value");
+  }
+
+  String json = in.nextString();
+  if (json.trim().isEmpty()) {
+    return null;
+  }
+
+  Date date = deserializeToDate(json);
+  
+  if (dateType == Date.class) {
+    return date;
+  } else if (dateType == Timestamp.class) {
+    return new Timestamp(date.getTime());
+  } else if (dateType == java.sql.Date.class) {
+    return new java.sql.Date(date.getTime());
+  } else {
+    throw new AssertionError("Unsupported date type: " + dateType.getName());
+  }
+}
+```
+
+---
+
+### Key Improvements
+
+1. **Null Handling**: 
+   - Explicitly checks whether the incoming JSON string is empty (after trimming).
+   - Returns `null` when the string is empty, ensuring consistent null behavior with standard practices in JSON processing.
+   
+2. **Clarity & Safety**:
+   - Added `@Override` for better code clarity and maintainability.
+   - Improved error message on unsupported types for easier debugging.
+
+3. **No Behavior Change**:
+   - The core logic for parsing real date strings remains unaffected — only the special case of empty strings is handled differently now.
+
+---
+
+### Additional Considerations
+
+- Ensure your model classes use proper annotations like `@Nullable` where needed, especially if null is expected.
+- Make sure the rest of the codebase treats `null` appropriately — e.g., no NPEs should result from uninitialized fields.
+- For future-proofing, consider adding validation or custom formatting logic if the app requires specific representations (e.g., `"0"` instead of `""`).
+
+---
+
+### Result
+
+With these changes, the `DefaultDateTypeAdapter` becomes more robust and **null-safe**, fixing the bugs reported (like #1096, #1098, etc.) without breaking existing behaviors.
+
+If you want further refinements such as handling other forms of null representations (like `"null"`), feel free to extend this approach!

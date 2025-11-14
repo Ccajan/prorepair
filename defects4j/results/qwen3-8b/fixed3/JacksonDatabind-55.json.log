@@ -1,0 +1,191 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# EnumMap keys not using enum's `@JsonProperty` values unlike Enum values
+Based on these issues:
+https://github.com/FasterXML/jackson-databind/issues/677
+https://github.com/FasterXML/jackson-databind/issues/1148
+https://github.com/FasterXML/jackson-annotations/issues/96
+
+I implemented @JsonProperty for my enum constants and they show up nicely when they are property values. But I also have an EnumMap which uses the enum, and it's generated JSON uses the original enum names for the keys and not the JsonProperty values.
+
+Using 2.8.1 (in spring boot 4.3.2)
+
+Thanks!
+
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/ser/std/StdKeySerializers.java):
+```java
+@SuppressWarnings("unchecked")
+    public static JsonSerializer<Object> getFallbackKeySerializer(SerializationConfig config,
+            Class<?> rawKeyType)
+    {
+        if (rawKeyType != null) {
+            // 29-Sep-2015, tatu: Odd case here, of `Enum`, which we may get for `EnumMap`; not sure
+            //   if that is a bug or feature. Regardless, it seems to require dynamic handling
+            //   (compared to getting actual fully typed Enum).
+            //  Note that this might even work from the earlier point, but let's play it safe for now
+            // 11-Aug-2016, tatu: Turns out we get this if `EnumMap` is the root value because
+            //    then there is no static type
+            if (rawKeyType == Enum.class) {
+                return new Dynamic();
+            }
+            if (rawKeyType.isEnum()) {
+                return new Default(Default.TYPE_ENUM, rawKeyType);
+            }
+        }
+        return DEFAULT_KEY_SERIALIZER;
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+To address your issue with Jackson not using the custom `@JsonProperty` values defined in your enum as keys in `EnumMap`, we need to understand how Jackson serializes `EnumMap` keys.
+
+---
+
+### 📌 Problem Summary:
+
+Jackson **does not apply** `@JsonProperty` annotations to **keys** in `EnumMap`. It relies on **enum constant names** by default. This behavior is hardcoded in [this section](https://github.com/Fasterxml/jackson-databind/blob/v2.8.1/src/main/java/com/fasterxml/jackson/databind/ser/std/StdKeySerializers.java) of the Jackson source code.
+
+Specifically, the method:
+
+```java
+public static JsonSerializer<Object> getFallbackKeySerializer(...)
+```
+
+checks whether the key class is an `Enum`, and if so, returns a generic serializer (like `Dynamic`) instead of one that respects `@JsonProperty`.
+
+---
+
+## ✅ Solution: Custom Serializer for EnumMap Keys
+
+To make Jackson use the `@JsonProperty` values as key names in `EnumMap`, you need to:
+
+1. Define a **custom serializer** for your specific enum.
+2. Configure it to be used when serializing `EnumMap` keys.
+
+---
+
+### 🔧 Step-by-Step Implementation
+
+#### 1. Define Your Enum With `@JsonProperty`
+
+Make sure each enum constant has the desired name using `@JsonProperty`:
+
+```java
+public enum MyEnum {
+    @JsonProperty("one") ONE,
+    @JsonProperty("two") TWO,
+    @JsonProperty("three") THREE
+}
+```
+
+#### 2. Create a Custom Serializer for Enum Constants
+
+```java
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.databind.SerializerProvider;
+import com.fasterxml.jackson.databind.ser.std.StdSerializer;
+
+import java.io.IOException;
+
+public class EnumConstantSerializer extends StdSerializer<MyEnum> {
+
+    public EnumConstantSerializer() {
+        super(MyEnum.class);
+    }
+
+    @Override
+    public void serialize(MyEnum value, JsonGenerator gen, SerializerProvider provider) throws IOException {
+        gen.writeString(value.name());  // Use Jackson's internal name -> override later
+    }
+}
+```
+
+⚠️ **Important**: For `@JsonProperty` to take effect, use a `JsonFormat.Shape.OBJECT` style:
+
+```java
+@JsonFormat(shape = Shape.OBJECT)
+public enum MyEnum {
+    @JsonProperty("one") ONE,
+    @JsonProperty("two") TWO,
+    @JsonProperty("three") THREE
+}
+```
+
+Then update your serializer like this:
+
+```java
+@Override
+public void serialize(MyEnum value, JsonGenerator gen, SerializerProvider provider) throws IOException {
+    String jsonName = provider.getContext().findValueDeserializer(value.getClass()).getName(); 
+    gen.writeString(jsonName);
+}
+```
+
+#### 3. Register the Custom Serializer with ObjectMapper
+
+```java
+ObjectMapper mapper = new ObjectMapper();
+
+SimpleModule module = new SimpleModule();
+module.addSerializer(MyEnum.class, new EnumConstantSerializer());
+mapper.registerModule(module);
+
+// Now use this mapper to serialize EnumMaps
+```
+
+---
+
+### ⚠️ Workaround: Patching the Jackson Source (Not Recommended)
+
+If you’re trying to modify the behavior globally, you can patch the Jackson code where it checks for enums as keys.
+
+Modify:
+
+```java
+if (rawKeyType == Enum.class) {
+    return new Dynamic();
+}
+```
+
+Change to:
+
+```java
+if (rawKeyType == Enum.class || isEnumWithJsonNames(rawKeyType)) {
+    return new EnumKeySerializer(rawKeyType); // Use your custom key serializer
+}
+```
+
+And create:
+
+```java
+public class EnumKeySerializer extends JsonSerializer<Enum<?>> {
+    private final Class<? extends Enum<?>> enumClass;
+
+    public EnumKeySerializer(Class<? extends Enum<?>> enumClass) {
+        this.enumClass = enumClass;
+    }
+
+    @Override
+    public void serialize(Enum<?> value, JsonGenerator gen, SerializerProvider provider) throws IOException {
+        String jsonName = provider.getContext().findValueDeserializer(enumClass).getName();
+        gen.writeString(jsonName);
+    }
+}
+```
+
+But this is **not recommended** unless you're developing a framework or modifying dependencies directly — and only do it if you know what you're doing.
+
+---
+
+### ✅ Conclusion
+
+The correct approach is to define a **custom serializer** that understands the `@JsonProperty` mapping and explicitly use it for `EnumMap` keys. Avoid patching core Jackson sources unless necessary.
+
+Let me know if you’d like help with full integration into Spring Boot!

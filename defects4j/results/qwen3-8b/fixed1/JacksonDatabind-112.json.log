@@ -1,0 +1,190 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# StringCollectionDeserializer fails with custom collection
+Seeing this with Jackson 2.9.8.
+We have a custom collection implementation, which is wired to use its "immutable" version for deserialization. The rationale is that we don't want accidental modifications to the data structures that come from the wire, so they all are forced to be immutable.
+After upgrade from 2.6.3 to 2.9.8, the deserialization started breaking with the message:
+
+Cannot construct instance of XXX (although at least one Creator exists): no default no-arguments constructor found
+
+This happens ONLY when you deserialize a custom collection of strings as a property of the other object. Deserializing the custom collection of strings directly works fine, and so does the deserialization of custom collection of non-strings. I believe either the StringCollectionDeserializer should not be invoked for custom collections, or perhaps it does not handle the delegation as expected.
+Please see comments for repro and workaround.
+Thanks!
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/deser/std/StringCollectionDeserializer.java):
+```java
+public JsonDeserializer<?> createContextual(DeserializationContext ctxt,
+        BeanProperty property) throws JsonMappingException
+{
+    // May need to resolve types for delegate-based creators:
+    JsonDeserializer<Object> delegate = null;
+    if (_valueInstantiator != null) {
+        // [databind#2324]: check both array-delegating and delegating
+        AnnotatedWithParams delegateCreator = _valueInstantiator.getDelegateCreator();
+        if (delegateCreator != null) {
+            JavaType delegateType = _valueInstantiator.getDelegateType(ctxt.getConfig());
+            delegate = findDeserializer(ctxt, delegateType, property);
+        }
+    }
+    JsonDeserializer<?> valueDeser = _valueDeserializer;
+    final JavaType valueType = _containerType.getContentType();
+    if (valueDeser == null) {
+        // [databind#125]: May have a content converter
+        valueDeser = findConvertingContentDeserializer(ctxt, property, valueDeser);
+        if (valueDeser == null) {
+        // And we may also need to get deserializer for String
+            valueDeser = ctxt.findContextualValueDeserializer(valueType, property);
+        }
+    } else { // if directly assigned, probably not yet contextual, so:
+        valueDeser = ctxt.handleSecondaryContextualization(valueDeser, property, valueType);
+    }
+    // 11-Dec-2015, tatu: Should we pass basic `Collection.class`, or more refined? Mostly
+    //   comes down to "List vs Collection" I suppose... for now, pass Collection
+    Boolean unwrapSingle = findFormatFeature(ctxt, property, Collection.class,
+            JsonFormat.Feature.ACCEPT_SINGLE_VALUE_AS_ARRAY);
+    NullValueProvider nuller = findContentNullProvider(ctxt, property, valueDeser);
+    if (isDefaultDeserializer(valueDeser)) {
+        valueDeser = null;
+    }
+    return withResolved(delegate, valueDeser, nuller, unwrapSingle);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+The error you're encountering stems from how **`StringCollectionDeserializer`** in Jackson 2.9.8 handles the deserialization of custom collections. Specifically, the method `_findDeserializer()` uses logic that assumes the target type is a standard `String` collection, but your use case involves a **custom immutable collection of strings**, which likely doesn't match any built-in deserializer logic.
+
+### Problem Summary
+
+Jackson's `StringCollectionDeserializer` relies on certain assumptions about the structure of collections during deserialization, such as expecting a `String[]` or a `List<String>` to be deserialized using a known default strategy. However, when you define your own immutable collection type, Jackson may fall back to trying to instantiate it via a default constructor — which typically isn’t available for immutable objects like `ImmutableList`, etc.
+
+In particular, the issue arises because **`StringCollectionDeserializer`** attempts to create a deserializer based on `String`, but when you try to deserialize into a **custom string collection**, it tries to apply some kind of general-purpose `String` handling rather than recognizing the actual target class.
+
+---
+
+### Solution
+
+To fix this, you need to make sure that the correct deserializer is used for your custom collection type. This can be done by **explicitly defining a custom deserializer** for your specific type and then configuring the module to use it.
+
+Here’s how you can do it step-by-step:
+
+---
+
+## ✅ Step-by-Step Fix
+
+### 1. Define Your Custom Immutable Collection Class
+
+Assume your class looks something like this:
+
+```java
+public final class ImmutableStringList implements Collection<String>, Serializable {
+
+    private final List<String> list;
+
+    public static ImmutableStringList of(List<String> elements) {
+        return new ImmutableStringList(Collections.unmodifiableList(elements));
+    }
+
+    private ImmutableStringList(List<String> list) {
+        this.list = Collections.unmodifiableList(list);
+    }
+
+    // Implement all Collection methods here...
+}
+```
+
+Note: Your class should not expose any mutators or allow modification after construction.
+
+---
+
+### 2. Create a Custom Deserializer for Your Type
+
+Create a deserializer that understands how to convert JSON arrays of strings into instances of your immutable class:
+
+```java
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.databind.DeserializationContext;
+import com.fasterxml.jackson.databind.JsonDeserializer;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.module.SimpleModule;
+
+import java.io.IOException;
+import java.util.List;
+import java.util.stream.Collectors;
+
+public class ImmutableStringListDeserializer extends JsonDeserializer<ImmutableStringList> {
+
+    @Override
+    public ImmutableStringList deserialize(JsonParser p, DeserializationContext ctxt)
+            throws IOException {
+        List<String> values = p.readValueAs(new TypeReference<List<String>>() {});
+        return ImmutableStringList.of(values);
+    }
+}
+```
+
+---
+
+### 3. Register the Deserializer with ObjectMapper
+
+Register this deserializer with your `ObjectMapper` (or configure it globally):
+
+```java
+SimpleModule module = new SimpleModule();
+
+module.addDeserializer(ImmutableStringList.class, new ImmutableStringListDeserializer());
+
+ObjectMapper mapper = new ObjectMapper();
+mapper.registerModule(module);
+```
+
+---
+
+### 4. Make Sure Your POJO Uses the Correct Type
+
+Ensure that your POJO refers to your `ImmutableStringList` class instead of the generic `List<String>` where appropriate:
+
+```java
+public class MyData {
+
+    private ImmutableStringList strings;
+
+    // Getters & setters
+}
+```
+
+---
+
+## 🔍 Why It Works
+
+By explicitly registering a deserializer for your `ImmutableStringList`, you bypass the behavior of `StringCollectionDeserializer`. Instead of assuming what kind of `String` collection you’re dealing with, Jackson will now use your own deserializer, which is designed to handle your immutable, custom collection type correctly.
+
+---
+
+## 🧠 Optional: Extend or Customize `StringCollectionDeserializer` (Not Recommended)
+
+While technically possible, extending or modifying the `StringCollectionDeserializer` is **not recommended** unless you fully understand the internal flow of Jackson's deserialization pipeline and are confident you know how it affects all supported types. It introduces tight coupling and makes upgrades riskier.
+
+---
+
+## ✅ Summary
+
+| Action | Description |
+|--------|-------------|
+| Define your immutable collection class | Use it in your models. |
+| Write a custom deserializer | To transform JSON → immutable collection. |
+| Register the deserializer | With your `ObjectMapper`. |
+| Ensure model classes reference it | Avoid using raw `List<String>`. |
+
+---
+
+### 📌 Final Note
+
+If you're seeing issues only when a custom string collection appears as a field within another object, make sure that your `ObjectMapper` configuration is consistent across all parts of your application — especially between API responses, database models, and internal data structures.
+
+Let me know if you’d like help creating a full working example with dummy data!

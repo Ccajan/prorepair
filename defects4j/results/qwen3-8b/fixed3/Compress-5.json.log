@@ -1,0 +1,205 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# ZipArchiveInputStream doesn't report the end of a truncated archive
+If a Zip archive is truncated, (e.g. because it is the first volume in a multi-volume archive) the ZipArchiveInputStream.read() method will not detect that fact. All calls to read() will return 0 bytes read. They will not return -1 (end of stream), nor will they throw any exception (which would seem like a good idea to me because the archive is truncated).
+I have tracked this problem to ZipArchiveInputStream.java, line 239. It contains a check
+if (read == 0 && inf.finished()) {
+    return -1;
+}
+For truncated archives the read is always zero but the inf is never finished(). I suggest adding two lines below:
+if (read == 0 && inf.finished()) {
+    return -1;
+} else if (read == 0 && lengthOfLastRead == -1) {
+	throw new IOException("Truncated ZIP file");
+}
+This solves the problem in my tests.
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/zip/ZipArchiveInputStream.java):
+```java
+public int read(byte[] buffer, int start, int length) throws IOException {
+    if (closed) {
+        throw new IOException("The stream is closed");
+    }
+    if (inf.finished() || current == null) {
+        return -1;
+    }
+
+    // avoid int overflow, check null buffer
+    if (start <= buffer.length && length >= 0 && start >= 0
+        && buffer.length - start >= length) {
+        if (current.getMethod() == ZipArchiveOutputStream.STORED) {
+            int csize = (int) current.getSize();
+            if (readBytesOfEntry >= csize) {
+                return -1;
+            }
+            if (offsetInBuffer >= lengthOfLastRead) {
+                offsetInBuffer = 0;
+                if ((lengthOfLastRead = in.read(buf)) == -1) {
+                    return -1;
+                }
+                count(lengthOfLastRead);
+                bytesReadFromStream += lengthOfLastRead;
+            }
+            int toRead = length > lengthOfLastRead
+                ? lengthOfLastRead - offsetInBuffer
+                : length;
+            if ((csize - readBytesOfEntry) < toRead) {
+                toRead = csize - readBytesOfEntry;
+            }
+            System.arraycopy(buf, offsetInBuffer, buffer, start, toRead);
+            offsetInBuffer += toRead;
+            readBytesOfEntry += toRead;
+            crc.update(buffer, start, toRead);
+            return toRead;
+        }
+        if (inf.needsInput()) {
+            fill();
+            if (lengthOfLastRead > 0) {
+                bytesReadFromStream += lengthOfLastRead;
+            }
+        }
+        int read = 0;
+        try {
+            read = inf.inflate(buffer, start, length);
+        } catch (DataFormatException e) {
+            throw new ZipException(e.getMessage());
+        }
+        if (read == 0 && inf.finished()) {
+            return -1;
+        }
+        crc.update(buffer, start, read);
+        return read;
+    }
+    throw new ArrayIndexOutOfBoundsException();
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+Certainly! The issue you've identified is important for robust zip file handling, especially when dealing with incomplete or truncated archives.
+
+### Problem Summary:
+
+- When reading from a **truncated** ZIP archive (like a multi-volume archive where only the first part is available), the `ZipArchiveInputStream` doesn't properly detect the end of data.
+- This results in all subsequent reads returning 0 instead of signaling the end of stream (`-1`) or throwing an appropriate exception.
+- This behavior can cause subtle bugs or infinite loops in applications expecting normal end-of-stream signals.
+
+---
+
+### Proposed Fix:
+
+We need to enhance the logic that checks whether we're at the end of the stream. Specifically, after checking `read == 0 && inf.finished()` to signal the end of the entry, we should also check whether the read size has become 0 and there's no more input available — which is typically the case with a **truncated** ZIP file.
+
+Here’s the corrected version of your code:
+
+---
+
+### ✅ Fixed Code
+
+```java
+public int read(byte[] buffer, int start, int length) throws IOException {
+    if (closed) {
+        throw new IOException("The stream is closed");
+    }
+    if (inf.finished() || current == null) {
+        return -1;
+    }
+
+    // Avoid int overflow, check null buffer
+    if (start <= buffer.length && length >= 0 && start >= 0
+        && buffer.length - start >= length) {
+
+        if (current.getMethod() == ZipArchiveOutputStream.STORED) {
+            int csize = (int) current.getSize();
+            if (readBytesOfEntry >= csize) {
+                return -1;
+            }
+
+            if (offsetInBuffer >= lengthOfLastRead) {
+                offsetInBuffer = 0;
+                if ((lengthOfLastRead = in.read(buf)) == -1) {
+                    return -1;
+                }
+                count(lengthOfLastRead);
+                bytesReadFromStream += lengthOfLastRead;
+            }
+
+            int toRead = length > lengthOfLastRead
+                ? lengthOfLastRead - offsetInBuffer
+                : length;
+
+            if ((csize - readBytesOfEntry) < toRead) {
+                toRead = csize - readBytesOfEntry;
+            }
+
+            System.arraycopy(buf, offsetInBuffer, buffer, start, toRead);
+            offsetInBuffer += toRead;
+            readBytesOfEntry += toRead;
+            crc.update(buffer, start, toRead);
+            return toRead;
+        }
+
+        if (inf.needsInput()) {
+            fill();
+            if (lengthOfLastRead > 0) {
+                bytesReadFromStream += lengthOfLastRead;
+            }
+        }
+
+        int read = 0;
+        try {
+            read = inf.inflate(buffer, start, length);
+        } catch (DataFormatException e) {
+            throw new ZipException(e.getMessage());
+        }
+
+        if (read == 0 && inf.finished()) {
+            return -1;
+        }
+
+        // Check for truncation: read == 0, and lengthOfLastRead is -1 (no more input)
+        if (read == 0 && lengthOfLastRead == -1) {
+            throw new IOException("Truncated ZIP file");
+        }
+
+        crc.update(buffer, start, read);
+        return read;
+    }
+
+    throw new ArrayIndexOutOfBoundsException();
+}
+```
+
+---
+
+### Explanation of Fixes
+
+- **New Check**:  
+  After determining that `read == 0`, we now explicitly check whether `lengthOfLastRead == -1`. If so, it means that the stream is **truncated** — i.e., the end of the input stream was reached before the ZIP entry could be fully read.
+
+- **Why It Works**:
+  - In a **normal** situation, `lengthOfLastRead` would be positive as long as there is still content being read.
+  - But in a **truncated** ZIP, the underlying stream (e.g., file input stream) returns `-1` (`EOF`), which makes `lengthOfLastRead == -1`.
+
+- **Behavior**:
+  - A call to `read()` returns `0` for a full entry.
+  - But if `read == 0` and `lengthOfLastRead == -1`, we consider it a sign that the ZIP is **truncated**, and throw an explicit exception to help debugging and prevent silent failures.
+
+---
+
+### Suggested Enhancement for Future Use
+
+To make such issues easier to handle, consider enhancing the library (or use a different one like Apache Commons Compress) with proper support for **multi-volume ZIP files** or provide utility methods to detect truncation during streaming.
+
+---
+
+### Final Thoughts
+
+Your patch improves robustness and usability by detecting **truncated ZIP files**, which can otherwise lead to hard-to-diagnose errors in applications. Great job identifying and addressing this!
+
+Let me know if you'd like a version of this fix applied to a specific version of Apache Commons

@@ -1,0 +1,139 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Cannot Read Winzip Archives With Unicode Extra Fields
+I have a zip file created with WinZip containing Unicode extra fields. Upon attempting to extract it with org.apache.commons.compress.archivers.zip.ZipFile, ZipFile.getInputStream() returns null for ZipArchiveEntries previously retrieved with ZipFile.getEntry() or even ZipFile.getEntries(). See UTF8ZipFilesTest.patch in the attachments for a test case exposing the bug. The original test case stopped short of trying to read the entries, that's why this wasn't flagged up before. 
+The problem lies in the fact that inside ZipFile.java entries are stored in a HashMap. However, at one point after populating the HashMap, the unicode extra fields are read, which leads to a change of the ZipArchiveEntry name, and therefore a change of its hash code. Because of this, subsequent gets on the HashMap fail to retrieve the original values.
+ZipFile.patch contains an (admittedly simple-minded) fix for this problem by reconstructing the entries HashMap after the Unicode extra fields have been parsed. The purpose of this patch is mainly to show that the problem is indeed what I think, rather than providing a well-designed solution.
+The patches have been tested against revision 1210416.
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/zip/ZipFile.java):
+```java
+private void resolveLocalFileHeaderData(Map<ZipArchiveEntry, NameAndComment>
+                                        entriesWithoutUTF8Flag)
+    throws IOException {
+    // changing the name of a ZipArchiveEntry is going to change
+    // the hashcode - see COMPRESS-164
+    // Map needs to be reconstructed in order to keep central
+    // directory order
+    for (ZipArchiveEntry ze : entries.keySet()) {
+        OffsetEntry offsetEntry = entries.get(ze);
+        long offset = offsetEntry.headerOffset;
+        archive.seek(offset + LFH_OFFSET_FOR_FILENAME_LENGTH);
+        byte[] b = new byte[SHORT];
+        archive.readFully(b);
+        int fileNameLen = ZipShort.getValue(b);
+        archive.readFully(b);
+        int extraFieldLen = ZipShort.getValue(b);
+        int lenToSkip = fileNameLen;
+        while (lenToSkip > 0) {
+            int skipped = archive.skipBytes(lenToSkip);
+            if (skipped <= 0) {
+                throw new RuntimeException("failed to skip file name in"
+                                           + " local file header");
+            }
+            lenToSkip -= skipped;
+        }
+        byte[] localExtraData = new byte[extraFieldLen];
+        archive.readFully(localExtraData);
+        ze.setExtra(localExtraData);
+        offsetEntry.dataOffset = offset + LFH_OFFSET_FOR_FILENAME_LENGTH
+            + SHORT + SHORT + fileNameLen + extraFieldLen;
+
+        if (entriesWithoutUTF8Flag.containsKey(ze)) {
+            String orig = ze.getName();
+            NameAndComment nc = entriesWithoutUTF8Flag.get(ze);
+            ZipUtil.setNameAndCommentFromExtraFields(ze, nc.name,
+                                                     nc.comment);
+            if (!orig.equals(ze.getName())) {
+                nameMap.remove(orig);
+                nameMap.put(ze.getName(), ze);
+            }
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
+import org.apache.commons.compress.archivers.zip.ZipArchiveEntry;
+import org.apache.commons.compress.archivers.zip.ZipFile;
+import org.apache.commons.compress.utils.ZipConstants;
+
+public class FixZipFile {
+
+    public static void main(String[] args) throws Exception {
+        // Test case
+        ZipFile zipFile = new ZipFile("test.zip");
+        
+        // Check if the issue exists
+        checkIssue(zipFile);
+    }
+
+    private static void checkIssue(ZipFile zipFile) throws IOException {
+        Map<String, ZipArchiveEntry> nameMap = new HashMap<>();
+        
+        // First pass: get all entries
+        for (ZipArchiveEntry entry : zipFile.getEntries()) {
+            nameMap.put(entry.getName(), entry);
+        }
+        
+        // Second pass: verify names
+        for (ZipArchiveEntry entry : zipFile.getEntries()) {
+            System.out.println("Expected name: " + entry.getName());
+            System.out.println("Actual name: " + nameMap.get(entry.getName()));
+            
+            if (!entry.getName().equals(nameMap.get(entry.getName()))) {
+                System.out.println("Mismatch found!");
+            }
+        }
+    }
+}
+
+```
+
+Okay, let me try to figure out how to fix this issue with the ZipFile handling Unicode extra fields.
+
+First, understanding the problem: When a ZIP file has Unicode extra fields, the ZipFile class reads these fields and updates the ZipArchiveEntry's name. Since the entries are stored in a HashMap using the original name as the key, modifying the name after insertion causes the hash code to change, leading to incorrect retrieval from the map.
+
+Looking at the provided code snippet, the problem happens in the `resolveLocalFileHeaderData` method. After reading the local file headers, it processes the extra fields, which can modify the entry names. This modification changes the hash codes of the existing entries in the HashMap, causing subsequent lookups to fail.
+
+The current approach uses a HashMap for entries, which relies on the object's hash code for fast access. When the name is changed, the hash code changes, so the same key isn't found anymore.
+
+So, the core issue is that the HashMap is being modified after the keys are inserted, leading to inconsistencies. One possible fix is to ensure that the entries are stored in the map with their final names, preventing any changes after they're added.
+
+But how can we do that? Let's think about the process:
+
+1. The initial parsing of the central directory reads the entries into the HashMap, using their names as keys.
+2. Then, processing the local file headers might update some entries' names based on Unicode extra data.
+3. These updates cause the keys in the map to change, leading to mismatches.
+
+A potential solution would be to rebuild the map after all processing is done, ensuring that each entry's name is correctly set before adding it to the map. But how?
+
+Wait, the original patch suggests reconstructing the entries HashMap after parsing the Unicode extra fields. That makes sense because once the names are finalized, we can safely use them as keys without worrying about future modifications.
+
+Another approach could be to avoid storing the entries in a HashMap with the original names. Instead, store them in a list, and then when retrieving by name, search through the list. But that's less efficient for large archives.
+
+Alternatively, perhaps during the initial processing, when we read the central directory entries, we should first parse the extra fields to determine the correct names, then add them to the map with those names. That way, there's no need to modify the names later.
+
+But how does the current code handle this? It seems that the extra field processing comes after the initial reading of the entries, which is why the names are being updated post-insertion.
+
+Let me think of a step-by-step plan:
+
+1. When reading the central directory entries, instead of immediately adding them to the HashMap, temporarily store them in a list.
+2. Process all the local file headers to collect the extra data, including Unicode information.
+3. After all processing is complete, create the HashMap using the finalized names from the processed entries.
+4. This way, the names are fixed before being used as keys, avoiding hash collisions.
+
+But this requires reworking the entire parsing flow, which might be complex. Alternatively, during the initial processing, we can make sure that the names are set correctly before adding them to the map.
+
+In the given code, the `resolveLocalFileHeaderData` method processes the local file headers and may modify the entry names. To prevent the hash code from changing after insertion, maybe we should defer the addition of entries to the map until after the name is finalized.
+
+Wait, looking at the code again:
+
+The `resolveLocalFileHeaderData` method iterates over `entries.keySet()` and processes each entry. During this processing, the name might be changed, which affects the HashMap's behavior. So the problem arises because the entries are already in the map, and their names are being altered

@@ -1,0 +1,137 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Generic type returned from type id resolver seems to be ignored
+https://github.com/benson-basis/jackson-custom-mess-tc
+Here's the situation, with Jackson 2.7.4.
+I have a TypeIdResolver that returns a JavaType for a generic type. However, something seems to be forgetting/erasing the generic, as it is failing to use the generic type param to understand the type of a field in the class.
+All the information is in the test case, so I'm not putting any code to read here in the issue.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/jsontype/impl/TypeDeserializerBase.java):
+```java
+protected final JsonDeserializer<Object> _findDeserializer(DeserializationContext ctxt,
+        String typeId) throws IOException
+{
+    JsonDeserializer<Object> deser = _deserializers.get(typeId);
+    if (deser == null) {
+        /* As per [Databind#305], need to provide contextual info. But for
+         * backwards compatibility, let's start by only supporting this
+         * for base class, not via interface. Later on we can add this
+         * to the interface, assuming deprecation at base class helps.
+         */
+        JavaType type = _idResolver.typeFromId(ctxt, typeId);
+        if (type == null) {
+            // As per [JACKSON-614], use the default impl if no type id available:
+            deser = _findDefaultImplDeserializer(ctxt);
+            if (deser == null) {
+                // 10-May-2016, tatu: We may get some help...
+                JavaType actual = _handleUnknownTypeId(ctxt, typeId, _idResolver, _baseType);
+                if (actual == null) { // what should this be taken to mean?
+                    // TODO: try to figure out something better
+                    return null;
+                }
+                // ... would this actually work?
+                deser = ctxt.findContextualValueDeserializer(actual, _property);
+            }
+        } else {
+            /* 16-Dec-2010, tatu: Since nominal type we get here has no (generic) type parameters,
+             *   we actually now need to explicitly narrow from base type (which may have parameterization)
+             *   using raw type.
+             *
+             *   One complication, though; can not change 'type class' (simple type to container); otherwise
+             *   we may try to narrow a SimpleType (Object.class) into MapType (Map.class), losing actual
+             *   type in process (getting SimpleType of Map.class which will not work as expected)
+             */
+            if ((_baseType != null)
+                    && _baseType.getClass() == type.getClass()) {
+                /* 09-Aug-2015, tatu: Not sure if the second part of the check makes sense;
+                 *   but it appears to check that JavaType impl class is the same which is
+                 *   important for some reason?
+                 *   Disabling the check will break 2 Enum-related tests.
+                 */
+                // 19-Jun-2016, tatu: As per [databind#1270] we may actually get full
+                //   generic type with custom type resolvers. If so, should try to retain them.
+                //  Whether this is sufficient to avoid problems remains to be seen, but for
+                //  now it should improve things.
+                    type = ctxt.getTypeFactory().constructSpecializedType(_baseType, type.getRawClass());
+            }
+            deser = ctxt.findContextualValueDeserializer(type, _property);
+        }
+        _deserializers.put(typeId, deser);
+    }
+    return deser;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+The problem described is related to how **Jackson** handles generic types when using custom `TypeIdResolver` and tries to instantiate deserializers based on type IDs. The key issue is that even though the `TypeIdResolver` returns a `JavaType`, the logic doesn't fully take advantage of the generic type information, leading to potential type erasure issues.
+
+### Root Cause:
+
+In the provided code snippet (`TypeDeserializerBase._findDeserializer()`):
+
+```java
+if ((_baseType != null)
+        && _baseType.getClass() == type.getClass()) {
+    ...
+    type = ctxt.getTypeFactory().constructSpecializedType(_baseType, type.getRawClass());
+}
+```
+
+This part attempts to construct a specialized version of `_baseType` using `type.getRawClass()`. This approach loses the generic type arguments, because `getRawClass()` gives just the raw class name (e.g., `MyGenericClass` rather than `MyGenericClass<T>`). Therefore, **the generic type information isn’t preserved**, causing type resolution to fail.
+
+---
+
+## ✅ Solution: Preserve and Use Full Generic Information
+
+To fix this, you must ensure that the full `JavaType` (with its generic type parameters) is passed through the whole chain instead of relying on `getRawClass()` or similar methods that lose genericity.
+
+Here’s a revised version of the problematic section:
+
+```java
+// From the original line:
+type = ctxt.getTypeFactory().constructSpecializedType(_baseType, type.getRawClass());
+
+// Replace with:
+if (_baseType != null) {
+    // Construct a new type that incorporates both the base and the resolved type
+    // including its generics.
+    type = ctxt.getTypeFactory().constructSpecializedType(
+        _baseType, 
+        type
+    );
+}
+```
+
+This avoids using `getRawClass()` and directly uses the complete `JavaType` object, preserving all generic information.
+
+---
+
+## 🔍 Explanation of Why That Works
+
+When `TypeIdResolver` provides a `JavaType`, it includes all type parameters and nested generics. By passing this unmodified `JavaType` directly to `constructSpecializedType(...)`, we preserve those details, allowing Jackson to correctly resolve deserializers and match fields with their correct types.
+
+If `_baseType` already includes the generic information, `constructSpecializedType(...)` ensures that the new `JavaType` reflects the full type hierarchy, including all generics.
+
+---
+
+## 📌 Additional Notes
+
+- Make sure your `TypeIdResolver` always returns a `JavaType` with all generic info — do not fall back to raw classes.
+- Avoid calling `.getRawClass()` unless you're certain about what you’re doing — this often causes type mismatches due to generic type erasure.
+- Always pass `JavaType` objects where possible instead of `Class<?>`.
+
+---
+
+## ✅ Final Suggestion
+
+Instead of modifying the existing method, consider extending `TypeDeserializerBase` and overriding the relevant parts to enforce proper handling of generic types.
+
+Alternatively, you could use a more modern version of Jackson (like 2.16.x or newer) since generic type support has improved significantly over time.
+
+Let me know if you want a full example or a modified version of the `TypeIdResolver` or deserializer.

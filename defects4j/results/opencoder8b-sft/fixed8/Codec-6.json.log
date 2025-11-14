@@ -1,0 +1,128 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Base64InputStream#read(byte[]) incorrectly returns 0 at end of any stream which is multiple of 3 bytes long
+Using new InputStreamReader(new Base64InputStream(in, true)) sometimes fails with "java.io.IOException: Underlying input stream returned zero bytes".
+This is been tracked down that Base64InputStream#read(byte[]) incorrectly returns 0 at end of any stream which is multiple of 3 bytes long.
+This is an incorrect Java code (src/java/org/apache/commons/codec/binary/Base64InputStream.java):
+```java
+public int read(byte b[], int offset, int len) throws IOException {
+    if (b == null) {
+        throw new NullPointerException();
+    } else if (offset < 0 || len < 0) {
+        throw new IndexOutOfBoundsException();
+    } else if (offset > b.length || offset + len > b.length) {
+        throw new IndexOutOfBoundsException();
+    } else if (len == 0) {
+        return 0;
+    } else {
+        /*
+         Rationale for while-loop on (readLen == 0):
+         -----
+         Base64.readResults() usually returns > 0 or EOF (-1).  In the
+         rare case where it returns 0, we just keep trying.
+
+         This is essentially an undocumented contract for InputStream
+         implementors that want their code to work properly with
+         java.io.InputStreamReader, since the latter hates it when
+         InputStream.read(byte[]) returns a zero.  Unfortunately our
+         readResults() call must return 0 if a large amount of the data
+         being decoded was non-base64, so this while-loop enables proper
+         interop with InputStreamReader for that scenario.
+         -----
+         This is a fix for CODEC-101
+        */
+            if (!base64.hasData()) {
+                byte[] buf = new byte[doEncode ? 4096 : 8192];
+                int c = in.read(buf);
+                // A little optimization to avoid System.arraycopy()
+                // when possible.
+                if (c > 0 && b.length == len) {
+                    base64.setInitialBuffer(b, offset, len);
+                }
+                if (doEncode) {
+                    base64.encode(buf, 0, c);
+                } else {
+                    base64.decode(buf, 0, c);
+                }
+            }
+        return base64.readResults(b, offset, len);
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+package com.github.alexthe666.iceandfire.compat.common.base;
+
+import javax.crypto.CipherInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.FilterInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+
+/**
+ * An {@link InputStream} filter that decodes bytes from a base64 encoded form.
+ *
+ * @since 1.7
+ * @version $Id$
+ */
+public class Base64InputStream extends FilterInputStream {
+
+    private final Base64 base64;
+    private final boolean doEncode;
+    private final CipherInputStream cipherInStream;
+    private final ByteArrayOutputStream cipherOutStream;
+
+    /**
+     * Constructs a Base64InputStream which reads from the given
+     * underlying input stream.
+     *
+     * @param in      the underlying input stream
+     * @param encode true for decoding base64 data; false for encoding data
+     */
+    public Base64InputStream(InputStream in, boolean encode) {
+        super(in);
+        this.doEncode = !encode;
+        this.base64 = new Base64(this.doEncode);
+        try {
+            cipherOutStream = new ByteArrayOutputStream();
+            cipherInStream = new CipherInputStream(in, base64.getCipher());
+        } catch (Exception e) {
+            throw new IllegalArgumentException("Failed to create cipher");
+        }
+    }
+
+    /**
+     * Returns 0 unless some other thread closes the stream or
+     * an I/O error occurs. This method always blocks until input is
+     * available, the end of the stream is reached, or an exception is thrown.
+     *
+     * @throws IOException If an I/O error occurs.
+     * @return the number of characters read, -1 if the end of the
+     * stream has been reached.
+     */
+    public synchronized int read(byte[] b, int offset, int len)
+            throws IOException {
+        int numBytesRead = 0;
+        if (cipherInStream != null && len > 0) {
+            while (numBytesRead < len) {
+                int nextByte = cipherInStream.read();
+                if (nextByte == -1) {
+                    break;
+                }
+                b[offset++] = (byte) nextByte;
+                numBytesRead++;
+            }
+        }
+        return numBytesRead == 0 ? -1 : numBytesRead;
+    }
+
+    public synchronized int read(byte[] b) throws IOException {
+        return read(b, 0, b.length);
+    }
+}
+```

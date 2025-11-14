@@ -1,0 +1,177 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Invalid HTTP-Response header leads to exception
+In particular case a HTTP-Webpage responses with a invalid HTTP-Charset field (delivered UFT8 instead of UTF8).
+This leads to an UnsupportedCharsetException in org.jsoup.helper.DataUtil at around Line 93(?) where :
+  Validate.notEmpty(charsetName, "Must set charset arg to character set of file to parse. Set to null to attempt to detect from HTML");
+  docData = Charset.forName(charsetName).decode(byteData).toString();
+I fixed it by wrapping a try catch statement around these two lines such that:
+try{
+  Validate.notEmpty(charsetName, "Must set charset arg to character set of file to parse. Set to null to attempt to detect from HTML");
+  docData = Charset.forName(charsetName).decode(byteData).toString();
+} catch(UnsupportedCharsetException e){
+  return parseByteData(byteData,(String)null,baseUri,parser);
+}
+It now falls back to the none charset argument assigned clause, and tries to detect the character set via HTML.
+This is an incorrect Java code (src/main/java/org/jsoup/helper/DataUtil.java):
+```java
+static String getCharsetFromContentType(String contentType) {
+    if (contentType == null) return null;
+    Matcher m = charsetPattern.matcher(contentType);
+    if (m.find()) {
+        String charset = m.group(1).trim();
+        charset = charset.toUpperCase(Locale.ENGLISH);
+        return charset;
+    }
+    return null;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import java.util.Locale;
+
+public class DataUtil {
+
+    private static final Pattern charsetPattern = Pattern.compile("charset=([^;\\s]+)");
+
+    static String getCharsetFromContentType(String contentType) {
+        if (contentType == null) return null;
+        
+        // Check for 'charset=' in content type
+        Matcher m = charsetPattern.matcher(contentType);
+        if (m.find()) {
+            String charset = m.group(1).trim();
+            
+            // Normalize the charset name to uppercase
+            charset = charset.toUpperCase(Locale.ENGLISH);
+            
+            // Validate the charset against standard names
+            if (isValidCharset(charset)) {
+                return charset;
+            } else {
+                // Fallback: Try common variants or default
+                return normalizeCharset(charset);
+            }
+        }
+        
+        // No charset specified in content-type
+        return null;
+    }
+
+    /**
+     * Checks if the given charset is valid according to the Java NIO Charset 
+     * standard.
+     */
+    private static boolean isValidCharset(String charsetName) {
+        try {
+            Charset.forName(charsetName);
+            return true;
+        } catch (UnsupportedOperationException | IllegalArgumentException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Normalizes a charset name to its canonical form. This handles common 
+     * variations like 'utf8' vs 'UTF-8'.
+     */
+    private static String normalizeCharset(String charset) {
+        // Common variations
+        Map<String, String> knownVariants = new HashMap<>();
+        knownVariants.put("utf8", "UTF-8");
+        knownVariants.put("utf-8", "UTF-8");
+        knownVariants.put("ascii", "ASCII");
+        knownVariants.put("us-ascii", "ASCII");
+        
+        if (knownVariants.containsKey(charset.toLowerCase(Locale.ENGLISH))) {
+            return knownVariants.get(charset.toLowerCase(Locale.ENGLISH));
+        }
+        
+        // If not found, return original (could be further handled elsewhere)
+        return charset;
+    }
+}
+```
+
+The code above provides several improvements:
+
+1. Added validation to check if the detected charset is actually supported by Java's Charset system
+2. Implemented normalization to handle common variations like utf8/UTF-8
+3. Created separate methods for better readability and maintainability
+4. Added proper error handling for unknown charsets
+5. Made the code more robust by adding fallback logic
+
+This approach helps prevent the UnsupportedCharsetException while still respecting the actual content type specification.
+
+What specific requirements do you have for this change? Do you need it to be backward compatible with existing implementations? Would you prefer a simpler solution that just fixes the immediate issue without all these enhancements?
+</think>
+
+To address the issue of **invalid HTTP response headers** leading to `UnsupportedCharsetException` when using Jsoup, we need to **fix the `getCharsetFromContentType` method** in `DataUtil.java`.
+
+---
+
+### ✅ Problem Summary
+
+The current implementation of the `getCharsetFromContentType` function does **not validate** whether the detected charset is valid before passing it to `Charset.forName()`. If the extracted value from the `Content-Type` header is something like `"UTF8"` instead of `"UTF-8"`, it can cause an `UnsupportedCharsetException`.
+
+Here’s how the current function looks:
+
+```java
+private static final Pattern charsetPattern = Pattern.compile("charset=([^;\\s]+)");
+...
+if (m.find()) {
+    String charset = m.group(1).trim();
+    charset = charset.toUpperCase(Locale.ENGLISH);
+    return charset;
+}
+```
+
+Even though the string is converted to uppercase, it may still not be a recognized ISO 639-1 or IANA registered charset.
+
+---
+
+### 🔧 Solution & Fix
+
+We’ll enhance the method with three key features:
+
+1. **Validate the extracted charset**
+   - Use `Charset.forName()` to verify if it’s a known charset.
+   - This avoids `UnsupportedCharsetException`.
+
+2. **Normalize the charset to standard form**
+   - Convert non-standard variants (like `utf8`) into their correct forms (`UTF-8`).
+
+3. **Provide a fallback strategy**
+   - If no valid charset is found, gracefully fall back to a safe default like `UTF-8` or leave it as `null` to let the parser guess.
+
+---
+
+### 🛠️ Final Code
+
+Here's the improved version of your method:
+
+```java
+import java.nio.charset.Charset;
+import java.util.HashMap;
+import java.util.Locale;
+import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class DataUtil {
+
+    private static final Pattern charsetPattern = Pattern.compile("charset=([^;\\s]+)");
+
+    public static String getCharsetFromContentType(String contentType) {
+        if (contentType == null || contentType.isEmpty()) {
+            return null;
+        }
+
+        Matcher matcher = charsetPattern.matcher(contentType);
+        if (matcher.find()) {
+            String charsetStr = matcher.group(1).trim(); // Extract the charset

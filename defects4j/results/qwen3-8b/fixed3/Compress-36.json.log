@@ -1,0 +1,108 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Calling SevenZFile.read() on empty SevenZArchiveEntry throws IllegalStateException
+I'm pretty sure COMPRESS-340 breaks reading empty archive entries. When calling getNextEntry() and that entry has no content, the code jumps into the first block at line 830 (SevenZFile.class), clearing the deferredBlockStreams. When calling entry.read(...) afterwards an IllegalStateException ("No current 7z entry (call getNextEntry() first).") is thrown. IMHO, there should be another check for entry.getSize() == 0.
+This worked correctly up until 1.10.
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/sevenz/SevenZFile.java):
+```java
+private InputStream getCurrentStream() throws IOException {
+    if (deferredBlockStreams.isEmpty()) {
+        throw new IllegalStateException("No current 7z entry (call getNextEntry() first).");
+    }
+    
+    while (deferredBlockStreams.size() > 1) {
+        // In solid compression mode we need to decompress all leading folder'
+        // streams to get access to an entry. We defer this until really needed
+        // so that entire blocks can be skipped without wasting time for decompression.
+        final InputStream stream = deferredBlockStreams.remove(0);
+        IOUtils.skip(stream, Long.MAX_VALUE);
+        stream.close();
+    }
+
+    return deferredBlockStreams.get(0);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+You're absolutely correct in your analysis of the issue — the problem stems from how the `SevenZFile` class handles **empty** or **zero-sized** archive entries. The current logic assumes that every `SevenZArchiveEntry` has some data to read and doesn't properly handle entries with size zero.
+
+The key issue occurs when you have an entry with:
+
+```java
+entry.getSize() == 0
+```
+
+In such cases, it's acceptable not to create an actual `InputStream`, because there is nothing to read. However, the current logic will still attempt to retrieve an input stream using `getCurrentStream()` and eventually throw an exception when trying to call `.read()` on it.
+
+---
+
+## ✅ Proposed Fix: Add Check for Entry Size Before Creating Stream
+
+To fix this, we should add a condition in the method `getCurrentStream()` to **skip creating a stream if the entry size is zero**. That way, even though `getNextEntry()` returns an entry with zero length, we won't try to read from it and won’t trigger the `IllegalStateException`.
+
+Here’s the modified version of the `getCurrentStream()` method:
+
+```java
+private InputStream getCurrentStream() throws IOException {
+    if (deferredBlockStreams.isEmpty()) {
+        throw new IllegalStateException("No current 7z entry (call getNextEntry() first).");
+    }
+
+    // If the current entry is empty (size is zero), don't open a stream.
+    if (currentEntry != null && currentEntry.getSize() == 0) {
+        return null;
+    }
+
+    while (deferredBlockStreams.size() > 1) {
+        // In solid compression mode we need to decompress all leading folder'
+        // streams to get access to an entry. We defer this until really needed
+        // so that entire blocks can be skipped without wasting time for decompression.
+        final InputStream stream = deferredBlockStreams.remove(0);
+        IOUtils.skip(stream, Long.MAX_VALUE);
+        stream.close();
+    }
+
+    return deferredBlockStreams.get(0);
+}
+```
+
+> ⚠️ Note: This assumes that you've tracked the current entry via a field like:
+>
+> ```java
+> private SevenZArchiveEntry currentEntry;
+> ```
+
+And in the `getNextEntry()` method, set that field:
+
+```java
+public SevenZArchiveEntry getNextEntry() throws IOException {
+    ...
+    this.currentEntry = entry;
+    ...
+}
+```
+
+---
+
+## 📌 Summary of Fixes
+
+| Problem | Solution |
+|--------|----------|
+| Empty entry with zero size triggers illegal state | Skip creation of `InputStream` for zero-length entries |
+| Lack of proper handling of zero-size archives | Add a condition to bypass stream creation |
+| Incorrect logic that doesn't account for empty entries | Enhance code to support non-data entries |
+
+---
+
+## ✅ Final Recommendation
+
+If this issue affects a lot of users (as it seems), consider submitting a **pull request** to the Apache Commons Compress project with this change. It would improve robustness for common use cases involving empty entries in 7z archives.
+
+Would you like me to also provide an example of how to use the fixed class or implement a workaround for older versions?

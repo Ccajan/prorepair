@@ -1,0 +1,162 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Non-blocking parser reports incorrect locations when fed with non-zero offset
+When feeding a non-blocking parser, the input array offset leaks into the offsets reported by getCurrentLocation() and getTokenLocation().
+For example, feeding with an offset of 7 yields tokens whose reported locations are 7 greater than they should be. Likewise the current location reported by the parser is 7 greater than the correct location.
+It's not possible for a user to work around this issue by subtracting 7 from the reported locations, because the token location may have been established by an earlier feeding with a different offset.
+Jackson version: 2.9.8
+Unit test:
+import com.fasterxml.jackson.core.JsonFactory;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.JsonToken;
+import com.fasterxml.jackson.core.async.ByteArrayFeeder;
+import org.junit.Test;
+
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.junit.Assert.assertEquals;
+
+public class FeedingOffsetTest {
+
+  @Test
+  public void inputOffsetShouldNotAffectLocations() throws Exception {
+    JsonFactory jsonFactory = new JsonFactory();
+    JsonParser parser = jsonFactory.createNonBlockingByteArrayParser();
+    ByteArrayFeeder feeder = (ByteArrayFeeder) parser.getNonBlockingInputFeeder();
+
+    byte[] input = "[[[".getBytes(UTF_8);
+
+    feeder.feedInput(input, 2, 3);
+    assertEquals(JsonToken.START_ARRAY, parser.nextToken());
+    assertEquals(1, parser.getCurrentLocation().getByteOffset()); // ACTUAL = 3
+    assertEquals(1, parser.getTokenLocation().getByteOffset());   // ACTUAL = 3
+
+    feeder.feedInput(input, 0, 1);
+    assertEquals(JsonToken.START_ARRAY, parser.nextToken());
+    assertEquals(2, parser.getCurrentLocation().getByteOffset());
+    assertEquals(2, parser.getTokenLocation().getByteOffset());
+  }
+}
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/core/json/async/NonBlockingJsonParser.java):
+```java
+public void feedInput(byte[] buf, int start, int end) throws IOException
+{
+    // Must not have remaining input
+    if (_inputPtr < _inputEnd) {
+        _reportError("Still have %d undecoded bytes, should not call 'feedInput'", _inputEnd - _inputPtr);
+    }
+    if (end < start) {
+        _reportError("Input end (%d) may not be before start (%d)", end, start);
+    }
+    // and shouldn't have been marked as end-of-input
+    if (_endOfInput) {
+        _reportError("Already closed, can not feed more input");
+    }
+    // Time to update pointers first
+    _currInputProcessed += _origBufferLen;
+
+    // Also need to adjust row start, to work as if it extended into the past wrt new buffer
+    _currInputRowStart = start - (_inputEnd - _currInputRowStart);
+
+    // And then update buffer settings
+    _inputBuffer = buf;
+    _inputPtr = start;
+    _inputEnd = end;
+    _origBufferLen = end - start;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public void feedInput(byte[] buf, int start, int end) throws IOException {
+    // Must not have remaining input
+    if (_inputPtr < _inputEnd) {
+        _reportError("Still have %d undecoded bytes, should not call 'feedInput'", _inputEnd - _inputPtr);
+    }
+    if (end < start) {
+        _reportError("Input end (%d) may not be before start (%d)", end, start);
+    }
+    // and shouldn't have been marked as end-of-input
+    if (_endOfInput) {
+        _reportError("Already closed, can not feed more input");
+    }
+
+    // Time to update pointers first
+    _currInputProcessed += _origBufferLen;
+
+    // Calculate the offset adjustment based on the previous buffer
+    int prevBufferLength = _origBufferLen; // Length of previously processed buffer
+    int prevBufferEnd = _inputEnd; // End position of the previous buffer
+    int prevBufferStart = _inputPtr; // Start position of the previous buffer
+
+    // Adjust the current row start according to the new buffer's start
+    // This ensures that the row start reflects the absolute position in the input stream
+    _currInputRowStart = start - (prevBufferEnd - prevBufferStart);
+
+    // Update buffer settings
+    _inputBuffer = buf;
+    _inputPtr = start;
+    _inputEnd = end;
+    _origBufferLen = end - start;
+    
+    // Ensure that the current location tracking is adjusted properly
+    // To avoid leaking the offset, we need to account for the previous buffer length
+    // when calculating the current position
+    _currInputProcessed += _origBufferLen;
+}
+```
+
+The core issue lies in how the parser tracks its position within the input stream. The original code improperly adjusts the `_currInputRowStart` value, which leads to incorrect location calculations.
+
+Here's my analysis of the problem:
+
+1. The `feedInput` method was designed to allow asynchronous parsing by allowing users to feed data in chunks
+2. The key issue arises when feeding data with an offset (i.e., not starting at position 0)
+3. The `_currInputRowStart` calculation incorrectly accounts for the previous buffer's state
+4. The original code used: `_currInputRowStart = start - (_inputEnd - _currInputRowStart)`
+5. This formula is flawed because it assumes the previous buffer had zero length, leading to incorrect offset calculations
+
+My fix maintains the logic of adjusting the row start but makes sure that it correctly accounts for the length of the previous buffer. By keeping track of the previous buffer's length and using it in the calculation, we ensure that the row start reflects the actual absolute position in the input stream, rather than being influenced by the offset parameter.
+
+The key change is in how we calculate `_currInputRowStart`. Instead of assuming the previous buffer had zero length, we now use the actual length of the previous buffer to make the adjustment.
+
+This fix preserves the intended functionality of allowing asynchronous feeding while ensuring that location information remains accurate regardless of the offset used when feeding input.
+
+The fix also includes proper handling of the `_currInputProcessed` counter, which is essential for maintaining correct position tracking through multiple feed calls.
+</think>
+
+To resolve the issue where **non-blocking parsers** report incorrect locations due to an initial offset when feeding input, we must correct the way the parser tracks its internal positions. The main problem lies in the calculation of `_currInputRowStart`, which affects both `getCurrentLocation()` and `getTokenLocation()` methods.
+
+---
+
+### ✅ Summary of the Problem
+
+- When calling `feedInput(...)` with an offset (e.g., starting at index `2` instead of `0`), the parser **incorrectly** adds this offset to all reported locations.
+- This happens due to how the `_currInputRowStart` field is computed.
+- The erroneous formula in the original code assumes no prior input and hence introduces an offset leak into the output location values.
+- Users cannot manually correct these reported positions reliably across multiple feeds since the offset could vary between calls.
+
+---
+
+### ✅ Corrected Code
+
+Below is the corrected implementation of the `feedInput` method in `NonBlockingJsonParser`.
+
+```java
+public void feedInput(byte[] buf, int start, int end) throws IOException {
+    // Validate that there are no pending bytes from previous feed operations
+    if (_inputPtr < _inputEnd) {
+        _reportError("Still have %d undecoded bytes, should not call 'feedInput'", _inputEnd - _inputPtr);
+    }
+    if (end < start) {
+        _reportError("Input end (%d) may not be before start (%d)", end, start);
+    }
+    if (_endOfInput) {
+        _reportError("Already closed, can not feed more input");
+    }
+
+    // Record previous buffer details to compute proper offset adjustments
+   

@@ -1,0 +1,181 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# UTF16 streams with BOM are processed as UTF-8
+The handling of the character encoding in org.jsoup.helper.DataUtil.parseByteData(...) is bugged when the input is an UTF16 stream with unicode BOM. This method does a check for presence of a BOM and, if it finds one, incorrectly assumes that this was a UTF-8 BOM. To fix this, the code would have to check the raw BOM bytes as the distinction between the various BOMs is lost after conversion to characters. See also: http://unicode.org/faq/utf_bom.html#bom4
+This is an incorrect Java code (src/main/java/org/jsoup/helper/DataUtil.java):
+```java
+static Document parseByteData(ByteBuffer byteData, String charsetName, String baseUri, Parser parser) {
+    String docData;
+    Document doc = null;
+
+    // look for BOM - overrides any other header or input
+
+    if (charsetName == null) { // determine from meta. safe parse as UTF-8
+        // look for <meta http-equiv="Content-Type" content="text/html;charset=gb2312"> or HTML5 <meta charset="gb2312">
+        docData = Charset.forName(defaultCharset).decode(byteData).toString();
+        doc = parser.parseInput(docData, baseUri);
+        Element meta = doc.select("meta[http-equiv=content-type], meta[charset]").first();
+        if (meta != null) { // if not found, will keep utf-8 as best attempt
+            String foundCharset = null;
+            if (meta.hasAttr("http-equiv")) {
+                foundCharset = getCharsetFromContentType(meta.attr("content"));
+            }
+            if (foundCharset == null && meta.hasAttr("charset")) {
+                try {
+                    if (Charset.isSupported(meta.attr("charset"))) {
+                        foundCharset = meta.attr("charset");
+                    }
+                } catch (IllegalCharsetNameException e) {
+                    foundCharset = null;
+                }
+            }
+
+            if (foundCharset != null && foundCharset.length() != 0 && !foundCharset.equals(defaultCharset)) { // need to re-decode
+                foundCharset = foundCharset.trim().replaceAll("[\"']", "");
+                charsetName = foundCharset;
+                byteData.rewind();
+                docData = Charset.forName(foundCharset).decode(byteData).toString();
+                doc = null;
+            }
+        }
+    } else { // specified by content type header (or by user on file load)
+        Validate.notEmpty(charsetName, "Must set charset arg to character set of file to parse. Set to null to attempt to detect from HTML");
+        docData = Charset.forName(charsetName).decode(byteData).toString();
+    }
+    if (docData.length() > 0 && docData.charAt(0) == UNICODE_BOM) {
+        byteData.rewind();
+        docData = Charset.forName(defaultCharset).decode(byteData).toString();
+        docData = docData.substring(1);
+        charsetName = defaultCharset;
+        doc = null;
+    }
+    if (doc == null) {
+        doc = parser.parseInput(docData, baseUri);
+        doc.outputSettings().charset(charsetName);
+    }
+    return doc;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
+import java.nio.charset.Charset;
+import java.nio.charset.CharsetDecoder;
+import java.nio.charset.CodingErrorAction;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class DataUtil {
+
+    private static final char UNICODE_BOM = '\uFEFF';
+    private static final String DEFAULT_CHARSET = "UTF-8";
+    
+    public static Document parseByteData(ByteBuffer byteData, String charsetName, String baseUri, Parser parser) {
+        String docData;
+        Document doc = null;
+
+        // Determine initial charset, prefer given charsetName over default
+        String determinedCharset = charsetName != null ? charsetName : DEFAULT_CHARSET;
+
+        // First decode using the determined charset
+        CharBuffer decoded = decodeWithBOMHandling(byteData, determinedCharset);
+        docData = decoded.toString();
+
+        // If no BOM present, proceed normally
+        if (!decoded.toString().startsWith(String.valueOf(UNICODE_BOM))) {
+            doc = parser.parseInput(docData, baseUri);
+            doc.outputSettings().charset(determinedCharset);
+            return doc;
+        }
+
+        // Handle BOM case: assume UTF-16? No, better to find actual encoding
+        // But how? We can't directly tell from just the BOM
+
+        // Attempt to find actual encoding via metadata
+        // Look for <meta> tags specifying charset
+        doc = parser.parseInput(docData, baseUri);
+        Element meta = doc.select("meta[http-equiv=content-type], meta[charset]").first();
+        
+        String foundCharset = null;
+        if (meta != null) {
+            if (meta.hasAttr("http-equiv")) {
+                foundCharset = getCharsetFromContentType(meta.attr("content"));
+            }
+            if (foundCharset == null && meta.hasAttr("charset")) {
+                try {
+                    if (Charset.isSupported(meta.attr("charset"))) {
+                        foundCharset = meta.attr("charset");
+                    }
+                } catch (IllegalCharsetNameException e) {
+                    foundCharset = null;
+                }
+            }
+        }
+
+        if (foundCharset != null && !foundCharset.equals(determinedCharset)) {
+            // Use found charset instead
+            determinedCharset = foundCharset;
+            byteData.rewind();
+            decoded = decodeWithBOMHandling(byteData, determinedCharset);
+            docData = decoded.toString();
+        }
+
+        // Finally, create document with correct settings
+        doc = parser.parseInput(docData, baseUri);
+        doc.outputSettings().charset(determinedCharset);
+        return doc;
+    }
+
+    private static CharBuffer decodeWithBOMHandling(ByteBuffer byteData, String charset) {
+        CharsetDecoder decoder = Charset.forName(charset).newDecoder();
+        decoder.onMalformedInput(CodingErrorAction.REPLACE);
+        decoder.onUnmappableCharacter(CodingErrorAction.REPLACE);
+
+        // Check if BOM exists
+        boolean hasBOM = false;
+        if (byteData.remaining() >= 2) {
+            byte[] bomBytes = new byte[2];
+            byteData.get(bomBytes);
+            if (bomBytes[0] == (byte) 0xFF && bomBytes[1] == (byte) 0xFE) {
+                // UTF-16 Little Endian BOM
+                hasBOM = true;
+            } else if (bomBytes[0] == (byte) 0xFE && bomBytes[1] == (byte) 0xFF) {
+                // UTF-16 Big Endian BOM
+                hasBOM = true;
+            } else if (bomBytes[0] == (byte) 0xEF && bomBytes[1] == (byte) 0xBF) {
+                // UTF-8 BOM
+                hasBOM = true;
+            }
+            // Rewind the buffer if we read BOM bytes
+            if (hasBOM) {
+                byteData.position(byteData.position() - 2);
+            }
+        }
+
+        // Decode without BOM
+        CharBuffer decoded = decoder.decode(byteData);
+        return decoded;
+    }
+
+    private static String getCharsetFromContentType(String content) {
+        Pattern pattern = Pattern.compile("charset\\s*=(?:'|\")?(.*?)(?:'|\"|;|$)", Pattern.IGNORE_CASE);
+        Matcher matcher = pattern.matcher(content);
+        if (matcher.find()) {
+            return matcher.group(1).trim();
+        }
+        return null;
+    }
+}
+```
+
+Okay, let me think about how to approach this problem.
+
+The issue is that when processing a UTF-16 stream with a Unicode BOM (Byte Order Mark), the current code mistakenly treats the BOM as indicating UTF-8. The BOM in UTF-16 is different from the UTF-8 BOM, so checking only for the presence of a BOM isn't sufficient to determine the encoding.
+
+First, I need to understand how the original code works. It looks like the code checks

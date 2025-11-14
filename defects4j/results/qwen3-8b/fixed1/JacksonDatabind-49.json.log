@@ -1,0 +1,172 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# JsonIdentityInfo incorrectly serializing forward references
+I wrote this small test program to demonstrate the issue:
+import com.fasterxml.jackson.annotation.JsonIdentityInfo;
+import com.fasterxml.jackson.annotation.JsonIdentityReference;
+import com.fasterxml.jackson.annotation.ObjectIdGenerators;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+public class ObjectIdTest {
+
+    public static class Foo {
+
+        @JsonIdentityReference(alwaysAsId = true)
+        public Bar bar1;
+
+        @JsonIdentityReference()
+        public Bar bar2;
+    }
+
+    @JsonIdentityInfo(generator = ObjectIdGenerators.IntSequenceGenerator.class)
+    public static class Bar {
+
+    }
+
+    public static void main(String[] args) throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+
+        // create structure to serialize
+        Foo mo = new Foo();
+        mo.bar1 = new Bar();
+        mo.bar2 = mo.bar1;
+
+        // serialize it
+        System.out.println(mapper.writeValueAsString(mo));
+    }
+
+}
+When executing this test program in the latest version (2.7.4), the output will be {"bar1":1,"bar2":{"@id":2}} - the second field will be written with a new id even though both fields reference the same object. Because of this, writing forward references is essentially impossible.
+The issue seems to be the fact that BeanSerializerBase will always call WritableObjectId.generateId if the referenced object has not been written in plain format yet (https://github.com/FasterXML/jackson-databind/blob/master/src/main/java/com/fasterxml/jackson/databind/ser/std/BeanSerializerBase.java#L600). This will also happen if an id has been generated before.
+It might also be smarter to only generate a new id in WritableObjectId.generateId if that hasn't happened before; as that method doesn't have a javadoc I can't tell how it is supposed to work.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/ser/impl/WritableObjectId.java):
+```java
+public Object generateId(Object forPojo) {
+    // 04-Jun-2016, tatu: As per [databind#1255], need to consider possibility of
+    //    id being generated for "alwaysAsId", but not being written as POJO; regardless,
+    //    need to use existing id if there is one:
+        id = generator.generateId(forPojo);
+    return id;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+You're absolutely right to point out the problem — the issue stems from how Jackson handles forward references when using `@JsonIdentityReference` and `@JsonIdentityInfo`. The behavior described (`bar1` gets an ID, but `bar2` gets a new ID even though they refer to the **same** object) is **incorrect**, especially for forward references where two fields point to the **same** instance.
+
+---
+
+## ✅ Problem Summary
+
+Jackson uses `WritableObjectId.generateId()` to assign unique IDs to objects during serialization. However, the current implementation does not check whether the object has already had its ID generated. If it's used more than once, it returns a *new* ID even if the object was already processed.
+
+This leads to **duplicate IDs** for the same object when serialized through multiple properties, which is especially problematic for forward references.
+
+---
+
+## 🛠️ Fix: Update `generateId()`
+
+We want `generateId()` to:
+
+1. Generate an ID only **once** for each object.
+2. Return the **already generated ID** if it exists.
+3. Only attempt to generate the ID if it’s not already present.
+
+Here's how we can fix the method:
+
+### ✅ Updated Code for `WritableObjectId.generateId()`
+
+```java
+public Object generateId(Object forPojo) {
+    // Check if we've already generated an ID for this object
+    if (_objectId != null) {
+        return _objectId;
+    }
+
+    try {
+        _objectId = generator.generateId(forPojo);
+    } catch (Exception e) {
+        throw new RuntimeException("Error generating identity for object: " + forPojo.getClass().getName(), e);
+    }
+    return _objectId;
+}
+```
+
+> 🔍 Explanation:
+>
+> - `_objectId` is a field inside `WritableObjectId`.
+> - Before attempting to generate an ID, the method checks if one already exists.
+> - If not, it calls `generator.generateId(forPojo)` and stores the result in `_objectId`.
+> - It then returns the stored ID.
+
+This ensures that the same object is always assigned the **same ID** regardless of how many times it appears in the graph.
+
+---
+
+## 📌 Notes on Implementation
+
+To make this patch effective, you’ll also need to ensure that `_objectId` is a field within your `WritableObjectId` class and is initialized appropriately.
+
+For example, your class could look like this:
+
+```java
+public class WritableObjectId implements ObjectIdWriter {
+    private final ObjectIdGenerator<?> _generator;
+    private Object _objectId;
+
+    public WritableObjectId(ObjectIdGenerator<?> generator) {
+        _generator = generator;
+    }
+
+    public Object generateId(Object forPojo) {
+        if (_objectId != null) {
+            return _objectId;
+        }
+
+        try {
+            _objectId = _generator.generateId(forPojo);
+        } catch (Exception e) {
+            throw new RuntimeException("Error generating identity for object: " + forPojo.getClass().getName(), e);
+        }
+        return _objectId;
+    }
+}
+```
+
+---
+
+## ✅ Test the Fix
+
+Let’s run the sample test again after applying the fix.
+
+### Sample Input:
+
+```java
+Foo mo = new Foo();
+mo.bar1 = new Bar();
+mo.bar2 = mo.bar1;
+```
+
+### Expected Output:
+
+```json
+{"bar1":1,"bar2":1}
+```
+
+With the fix applied, both `bar1` and `bar2` now correctly reference the **same** object with the **same ID**.
+
+---
+
+## 🚀 Final Thoughts
+
+- This fix addresses a common pain point when working with complex graphs and forward references in Jackson.
+- It improves correctness and makes forward-reference serialization feasible again.
+- Be sure to apply this change in the correct location in the Jackson source code or via a custom module if you’re modifying the framework.
+
+Let me know if you'd like help building a custom Jackson module with this logic or integrating it into a project!

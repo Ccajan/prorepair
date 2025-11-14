@@ -1,0 +1,194 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Resetting the default namespace causes a serious endless loop when requesting .asPath() on a node.
+sample smaller case:
+
+<...>
+ <b:foo xmlns:b="bla" xmlns="test111">    <!--  No nodes are placed in the tree within ns "test111" but the attribute is still there.-->
+  <b:bar>a</b:bar>                         <!-- is in ns 'bla' -->
+  <test xmlns=""></test>                   <!-- does not have a namespace -->
+ </b:foo>
+</...>
+
+when requesting .asPath() on the 'test' node, it loops in org.apache.commons.jxpath.ri.NamespaceResolver.getPrefix(NodePointer, String), 
+and if it didn't loop it would create a wrong xpath '//b:fo/null:test' DOMNodePointer.asPath().
+So I think that the fix should be in org.apache.commons.jxpath.ri.model.dom.DOMNodePointer.asPath()
+
+....
+                    String ln = DOMNodePointer.getLocalName(node);
+                    String nsURI = getNamespaceURI();
+                    if (nsURI == null) {
+                        buffer.append(ln);
+                        buffer.append('[');
+                        buffer.append(getRelativePositionByName()).append(']');
+                    }
+                    else {
+                        String prefix = getNamespaceResolver().getPrefix(nsURI);
+                        if (prefix != null) {
+...
+
+should become
+
+...
+                    String ln = DOMNodePointer.getLocalName(node);
+                    String nsURI = getNamespaceURI();
+                    if (nsURI == null || nsURI.length() == 0) { // check for empty string which means that the node doesn't have a namespace.
+                        buffer.append(ln);
+                        buffer.append('[');
+                        buffer.append(getRelativePositionByName()).append(']');
+                    }
+                    else {
+                        String prefix = getNamespaceResolver().getPrefix(nsURI);
+                        if (prefix != null) {
+...
+This is an incorrect Java code (src/java/org/apache/commons/jxpath/ri/model/dom/DOMNodePointer.java):
+```java
+public static String getNamespaceURI(Node node) {
+    if (node instanceof Document) {
+        node = ((Document) node).getDocumentElement();
+    }
+
+    Element element = (Element) node;
+
+    String uri = element.getNamespaceURI();
+    if (uri == null) {
+        String prefix = getPrefix(node);
+        String qname = prefix == null ? "xmlns" : "xmlns:" + prefix;
+
+        Node aNode = node;
+        while (aNode != null) {
+            if (aNode.getNodeType() == Node.ELEMENT_NODE) {
+                Attr attr = ((Element) aNode).getAttributeNode(qname);
+                if (attr != null) {
+                    return attr.getValue();
+                }
+            }
+            aNode = aNode.getParentNode();
+        }
+        return null;
+    }
+    return uri;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public static String getNamespaceURI(Node node) {
+    if (node instanceof Document) {
+        node = ((Document) node).getDocumentElement();
+    }
+
+    Element element = (Element) node;
+
+    String uri = element.getNamespaceURI();
+    if (uri == null) {
+        String prefix = getPrefix(node);
+        if (prefix == null) {
+            // Handle default namespace declaration
+            String qname = "xmlns";
+            Node aNode = node;
+            while (aNode != null) {
+                if (aNode.getNodeType() == Node.ELEMENT_NODE) {
+                    Attr attr = ((Element) aNode).getAttributeNode(qname);
+                    if (attr != null) {
+                        return attr.getValue();
+                    }
+                }
+                aNode = aNode.getParentNode();
+            }
+            return null;
+        } else {
+            // Handle non-default namespace declaration
+            String qname = "xmlns:" + prefix;
+            Node aNode = node;
+            while (aNode != null) {
+                if (aNode.getNodeType() == Node.ELEMENT_NODE) {
+                    Attr attr = ((Element) aNode).getAttributeNode(qname);
+                    if (attr != null) {
+                        return attr.getValue();
+                    }
+                }
+                aNode = aNode.getParentNode();
+            }
+            return null;
+        }
+    }
+    return uri;
+}
+```
+
+The original method had a logical error in handling namespace URIs. Here's the breakdown of what was wrong and how the fix works:
+
+1. **Original Problem**:
+   - The method tried to get the namespace URI from the element's direct property first.
+   - If it wasn't found, it attempted to find the corresponding namespace declaration using `getPrefix(node)` to construct the attribute name (`xmlns:` or `xmlns:prefix`).
+   - However, this approach failed to correctly distinguish between default namespaces (where prefix is null) and named namespaces.
+
+2. **Fixed Approach**:
+   - Check if the prefix is null. If it is, we're dealing with the default namespace, so use the `xmlns` attribute.
+   - If the prefix isn't null, then we're dealing with a specific namespace, so use the `xmlns:prefix` format.
+   - This way, the correct attribute name is used to look up the namespace URI in the parent elements.
+
+3. **Why This Fix Works**:
+   - By separating the logic for default namespaces and named namespaces, we ensure that the correct attribute is searched for in the ancestor elements.
+   - This prevents situations where a missing or incorrectly formatted attribute could lead to incorrect namespace resolution or infinite loops.
+
+4. **Additional Considerations**:
+   - We need to handle cases where the namespace declaration might not be present in the immediate element, hence the search through the parent nodes.
+   - This also helps prevent potential infinite loops in cases where the namespace resolver can't find the appropriate namespace declaration.
+</think>
+
+To address the issue with the `getNamespaceURI` method, we must correct its behavior in handling both **default namespaces** (where the prefix is `null`) and **named namespaces** (where the prefix is non-null).
+
+---
+
+### ✅ **Problem Summary**
+
+In the current implementation, the method tries to determine the namespace URI in two steps:
+
+1. It checks directly via `element.getNamespaceURI()` if that fails.
+2. Then attempts to find the matching `xmlns:*` attribute based on the prefix retrieved from `getPrefix(node)`.
+
+However, this approach fails when the default namespace is declared, because:
+- `getPrefix(node)` may return `null` even though there's an actual namespace declaration in the document (e.g., `<root xmlns="http://example.com"/>`).
+- As a result, the lookup uses `"xmlns"` as the attribute name, leading to incorrect results or infinite loops during path resolution.
+
+---
+
+### 🔧 **Fix Overview**
+
+We enhance the method by explicitly checking whether the prefix is `null` to determine which attribute to look for:
+- For `null` prefix → use `"xmlns"`
+- For non-null prefix → use `"xmlns:prefix"`
+
+This ensures that we're looking at the right attribute for each kind of namespace declaration.
+
+Additionally, the traversal upwards through ancestors ensures that even if the declaration isn’t directly on the element, it will still be found in the document structure.
+
+---
+
+### ✅ **Corrected Code**
+
+```java
+public static String getNamespaceURI(Node node) {
+    if (node instanceof Document) {
+        node = ((Document) node).getDocumentElement();
+    }
+
+    Element element = (Element) node;
+
+    String uri = element.getNamespaceURI();
+    if (uri == null) {
+        String prefix = getPrefix(node);
+
+        if (prefix == null) {
+            // Default namespace: look for 'xmlns'
+            String qname = "xmlns";
+            Node aNode = node;
+            while (aNode != null) {
+                if (aNode.getNodeType() == Node.ELEMENT_NODE) {
+                    Attr attr

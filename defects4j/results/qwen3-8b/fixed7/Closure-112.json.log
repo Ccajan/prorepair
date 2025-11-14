@@ -1,0 +1,163 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Template types on methods incorrectly trigger inference of a template on the class if that template type is unknown
+See i.e.
+
+/**
+  * @constructor
+  * @template CLASS
+  */
+var Class = function() {};
+
+/**
+  * @param {function(CLASS):CLASS} a
+  * @template T
+  */
+Class.prototype.foo = function(a) {
+  return 'string';
+};
+
+/** @param {number} a
+  * @return {string} */
+var a = function(a) { return '' };
+
+new Class().foo(a);
+
+The CLASS type is never specified. If the @template T line is removed from the foo method, the block compiles with but with the @annotation on the method, the compiler seems to try to infer CLASS from the usage and fails compilation.
+This is an incorrect Java code (src/com/google/javascript/jscomp/TypeInference.java):
+```java
+private boolean inferTemplatedTypesForCall(
+    Node n, FunctionType fnType) {
+  final ImmutableList<TemplateType> keys = fnType.getTemplateTypeMap()
+      .getTemplateKeys();
+  if (keys.isEmpty()) {
+    return false;
+  }
+
+  // Try to infer the template types
+  Map<TemplateType, JSType> inferred = 
+      inferTemplateTypesFromParameters(fnType, n);
+
+
+  // Replace all template types. If we couldn't find a replacement, we
+  // replace it with UNKNOWN.
+  TemplateTypeReplacer replacer = new TemplateTypeReplacer(
+      registry, inferred);
+  Node callTarget = n.getFirstChild();
+
+  FunctionType replacementFnType = fnType.visit(replacer)
+      .toMaybeFunctionType();
+  Preconditions.checkNotNull(replacementFnType);
+
+  callTarget.setJSType(replacementFnType);
+  n.setJSType(replacementFnType.getReturnType());
+
+  return replacer.madeChanges;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+private boolean inferTemplatedTypesForCall(
+    Node n, FunctionType fnType) {
+  final ImmutableList<TemplateType> keys = fnType.getTemplateTypeMap()
+      .getTemplateKeys();
+  if (keys.isEmpty()) {
+    return false;
+  }
+
+  // Try to infer the template types
+  Map<TemplateType, JSType> inferred =
+      inferTemplateTypesFromParameters(fnType, n);
+
+  // Replace all template types. If we couldn't find a replacement, we
+  // replace it with UNKNOWN.
+  TemplateTypeReplacer replacer = new TemplateTypeReplacer(
+      registry, inferred);
+  Node callTarget = n.getFirstChild();
+
+  FunctionType replacementFnType = fnType.visit(replacer)
+      .toMaybeFunctionType();
+  Preconditions.checkNotNull(replacementFnType);
+
+  callTarget.setJSType(replacementFnType);
+  n.setJSType(replacementFnType.getReturnType());
+
+  return replacer.madeChanges;
+}
+```
+
+I've examined the issue described in the question and noticed that the problem lies in how template types are being inferred when they're not explicitly provided.
+
+The core issue is that the current implementation tries to infer template types for a method even when those templates aren't properly defined or known at the time of the method's invocation. This can lead to incorrect type inference and compilation errors when the template types are not explicitly declared.
+
+Here's my analysis of the problem:
+
+1. **Incorrect Inference**: The code currently attempts to infer template types for a method call even when the template parameters haven't been defined or are not known at the point of use. This leads to unnecessary complications during compilation.
+
+2. **Lack of Guard Clauses**: There appears to be no check to ensure that the template types are actually defined before attempting inference.
+
+3. **Ambiguous Contexts**: When a method has a template annotation but the specific types are not defined, the inference process can get confused, leading to failed compilations.
+
+To resolve these issues, I would suggest implementing checks to determine whether the template types are properly defined before proceeding with the inference process. Additionally, ensure that the context of the method call provides enough information for accurate template type deduction.
+
+The corrected code should include additional validation steps to prevent improper template type inference when they aren't explicitly provided. This approach will help avoid compilation failures due to missing or ambiguous template types.
+
+If you'd like, I can provide a revised version of this method that includes these improvements.
+</think>
+
+To address the issue where **template types on methods incorrectly trigger inference of a template on the class**, particularly when the template type (`CLASS`) is **not specified** and **unknown**, we need to make several key changes to the `inferTemplatedTypesForCall` method in `TypeInference.java`.
+
+---
+
+### 🔍 **Root Cause Analysis**
+
+- The current logic attempts to infer **template types for the entire class** whenever a **method with a template** is invoked.
+- However, **the class itself might not have any template annotations**, meaning it does **not support any templating** at all.
+- Further, the **method’s template type** might also be **unrelated to the class's template** or might not even exist at runtime.
+- As a result, **incorrect assumptions about template relationships** are made, causing erroneous template deductions and **compilation failure**.
+
+---
+
+### ✅ **Fix Strategy**
+
+We should:
+1. **Check if the class supports any template** (i.e., if it has a `@template` annotation).
+2. **Ensure the method’s template types do not require inference from undefined class templates**.
+3. Only proceed with inference if both conditions are met: the **class has a template**, and the **method's template can be resolved safely**.
+4. Add **explicit guard clauses** to skip template inference when either the **class or method doesn’t define templates**.
+
+These changes prevent incorrect template relationships between methods and classes, especially when a template type isn’t explicitly provided.
+
+---
+
+### 🛠️ **Revised Code Fix**
+
+Below is the modified version of the `inferTemplatedTypesForCall` method that prevents incorrect template inference based on the problem scenario:
+
+```java
+private boolean inferTemplatedTypesForCall(
+    Node n, FunctionType fnType) {
+  // Check if the function type is a method on a class with a template
+  final ImmutableList<TemplateType> keys = fnType.getTemplateTypeMap()
+      .getTemplateKeys();
+  
+  if (keys.isEmpty()) {
+    return false; // No template types - nothing to infer
+  }
+
+  // Check if the enclosing class (if any) defines a template
+  Node parent = n.getParent();
+  boolean classHasTemplate = false;
+
+  while (parent != null && parent.getType() != Token.CLASS) {
+    parent = parent.getParent();
+  }
+
+  if (parent != null && parent.isClassDef()) {
+    // Get the class definition node
+    Node klassNode =

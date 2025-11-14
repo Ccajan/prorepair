@@ -1,0 +1,139 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Possibly wrong TokenBuffer delegate deserialization using @JsonCreator
+class Value {
+@JsonCreator
+public static Value from(TokenBuffer buffer) {
+...
+}
+Given JSON string is  { "a":1, "b":null }, it is expected that while deserializing using delegate buffer,
+current token will be start object {, and rest of the tokens will be available in buffer:
+[START_OBJECT, FIELD_NAME, VALUE_NUMBER_INT, FIELD_NAME, VALUE_NULL, END_OBJECT]
+
+But, buffers ends up being started with field name and then contains single attribute value
+[FIELD_NAME, VALUE_NUMBER_INT]
+
+It's due to how TokenBuffer#copyCurrentStructure works when we have current token as a FIELD_NAME, rather than START_OBJECT, because it's forced to move to next token BeanDeserializer.java:120
+Hope this helps to nail it down. Is it an intended behavior, or it's regression/bug?
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/util/TokenBuffer.java):
+```java
+public TokenBuffer deserialize(JsonParser jp, DeserializationContext ctxt) throws IOException
+{
+        copyCurrentStructure(jp);
+    /* 28-Oct-2014, tatu: As per #592, need to support a special case of starting from
+     *    FIELD_NAME, which is taken to mean that we are missing START_OBJECT, but need
+     *    to assume one did exist.
+     */
+    return this;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.com.fasterxml.jackson.databind.DeserializationContext;
+import com.fasterxml.jackson.databind.util.TokenBuffer;
+
+public class CustomTokenBuffer extends TokenBuffer {
+
+    public CustomTokenBuffer() {
+        super();
+    }
+
+    /**
+     * Override the deserialize method to correctly handle the scenario where the current token is a FIELD_NAME
+     * instead of a START_OBJECT. This ensures that the TokenBuffer is populated with all tokens starting from the
+     * beginning of the JSON object, including the START_OBJECT token.
+     *
+     * @param jp The JsonParser instance used for reading JSON data.
+     * @param ctxt The DeserializationContext instance providing context during deserialization.
+     * @return The current TokenBuffer instance with all relevant tokens copied.
+     * @throws IOException If an I/O error occurs during deserialization.
+     */
+    @Override
+    public TokenBuffer deserialize(JsonParser jp, DeserializationContext ctxt) throws IOException {
+        // First, copy the current structure, which includes the current token (e.g., FIELD_NAME)
+        copyCurrentStructure(jp);
+
+        // Now, check if the current token is a FIELD_NAME. If so, we need to rewind to the beginning
+        // of the JSON object to ensure we capture all tokens, including the START_OBJECT.
+        if (jp.getCurrentToken().isFieldName()) {
+            // Rewind to the beginning of the JSON object
+            jp.reset(); // This resets the parser back to the start of the input
+        }
+
+        // Copy the entire structure again, starting from the beginning of the JSON object
+        copyCurrentStructure(jp);
+
+        return this;
+    }
+}
+```
+
+The provided code has an issue where it does not properly handle the scenario where the current token is a FIELD_NAME instead of a START_OBJECT. To fix this, we can create a custom `CustomTokenBuffer` class that overrides the `deserialize` method. In the overridden method, we first copy the current structure. Then, if the current token is a FIELD_NAME, we reset the parser to the beginning of the input and copy the entire structure again. This ensures that all tokens, including the START_OBJECT token, are included in the TokenBuffer.
+
+To use the custom implementation:
+
+1. Replace the existing `TokenBuffer` implementation with the `CustomTokenBuffer` class.
+2. Ensure that any references to `TokenBuffer` are now pointing to `CustomTokenBuffer`.
+3. Test the deserialization process to confirm that the correct tokens are being captured, including the START_OBJECT token.
+
+By making these changes, we address the issue and ensure that the TokenBuffer is correctly populated with all necessary tokens, even when the current token is a FIELD_NAME.
+</think>
+
+The described issue stems from the `TokenBuffer.deserialize()` method in Jackson's `TokenBuffer` class failing to account for the need to include the `START_OBJECT` token when the initial token is a `FIELD_NAME`. This leads to incomplete buffering of JSON tokens, particularly when using delegation through `@JsonCreator`.
+
+---
+
+### ✅ Root Cause Summary:
+
+- **Current Behavior:** When a `FIELD_NAME` token is encountered first (e.g., due to direct deserialization into a property), `TokenBuffer.deserialize()` fails to rewind and read the entire structure from the start of the object.
+- **Expected Behavior:** The `TokenBuffer` should contain **all tokens** (`START_OBJECT`, `FIELD_NAME`, `VALUE_NUMBER_INT`, etc.) from the JSON stream.
+
+---
+
+### 🛠️ Proposed Solution
+
+We’ll implement a **custom version of `TokenBuffer`**, ensuring that it handles cases where the current token is `FIELD_NAME` correctly, by resetting the parser and copying the full object structure.
+
+#### 🔧 Fix Implementation
+
+```java
+package com.fasterxml.jackson.databind.util;
+
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.databind.DeserializationContext;
+import com.fasterxml.jackson.databind.util.TokenBuffer;
+
+/**
+ * A customized version of TokenBuffer that properly captures the complete JSON object
+ * even when starting with a FIELD_NAME.
+ */
+public class CustomTokenBuffer extends TokenBuffer {
+
+    public CustomTokenBuffer() {
+        super();
+    }
+
+    /**
+     * Overridden to ensure that we correctly collect all tokens from the start of the object
+     * even if we are starting at a FIELD_NAME (as might happen when using a delegating constructor).
+     *
+     * @param jp           Current JSON parser.
+     * @param ctxt         Context for deserialization.
+     * @return             Updated TokenBuffer containing all relevant tokens.
+     * @throws IOException Any I/O exception during parsing.
+     */
+    @Override
+    public TokenBuffer deserialize(JsonParser jp, DeserializationContext ctxt) throws IOException {
+        // Step 1: Initial copy of the current state
+        copyCurrentStructure(jp);
+
+        // Step 2: Check if the current token is a FIELD_NAME
+        if (jp.getCurrentToken().isFieldName()) {
+            // Reset the parser to re-read from the start of the object
+            jp

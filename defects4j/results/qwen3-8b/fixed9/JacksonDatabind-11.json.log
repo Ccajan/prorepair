@@ -1,0 +1,188 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Problem resolving locally declared generic type
+(reported by Hal H)
+Case like:
+class Something {
+    public <T extends Ruleform> T getEntity()
+    public <T extends Ruleform> void setEntity(T entity) 
+}
+appears to fail on deserialization.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/type/TypeFactory.java):
+```java
+protected JavaType _fromVariable(TypeVariable<?> type, TypeBindings context)
+{
+    final String name = type.getName();
+    // 19-Mar-2015: Without context, all we can check are bounds.
+    if (context == null) {
+        // And to prevent infinite loops, now need this:
+        return _unknownType();
+    } else {
+        // Ok: here's where context might come in handy!
+        /* 19-Mar-2015, tatu: As per [databind#609], may need to allow
+         *   unresolved type variables to handle some cases where bounds
+         *   are enough. Let's hope it does not hide real fail cases.
+         */
+        JavaType actualType = context.findType(name);
+        if (actualType != null) {
+            return actualType;
+        }
+    }
+
+    /* 29-Jan-2010, tatu: We used to throw exception here, if type was
+     *   bound: but the problem is that this can occur for generic "base"
+     *   method, overridden by sub-class. If so, we will want to ignore
+     *   current type (for method) since it will be masked.
+     */
+    Type[] bounds = type.getBounds();
+
+    // With type variables we must use bound information.
+    // Theoretically this gets tricky, as there may be multiple
+    // bounds ("... extends A & B"); and optimally we might
+    // want to choose the best match. Also, bounds are optional;
+    // but here we are lucky in that implicit "Object" is
+    // added as bounds if so.
+    // Either way let's just use the first bound, for now, and
+    // worry about better match later on if there is need.
+
+    /* 29-Jan-2010, tatu: One more problem are recursive types
+     *   (T extends Comparable<T>). Need to add "placeholder"
+     *   for resolution to catch those.
+     */
+    context._addPlaceholder(name);
+    return _constructType(bounds[0], context);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+To resolve the issue with **locally declared generic type variables** during deserialization using Jackson, particularly when working with methods like:
+
+```java
+public <T extends Ruleform> T getEntity();
+public <T extends Ruleform> void setEntity(T entity);
+```
+
+we need to understand what's going wrong and how to fix it properly.
+
+---
+
+## ✅ Problem Summary
+
+In the provided `JavaType._fromVariable()` method from `TypeFactory`, the logic fails to correctly resolve locally declared generic types such as those defined in method signatures. These types (`<T extends Ruleform>`) often appear in POJOs or data transfer objects (DTOs), and their correct handling is essential for proper JSON deserialization using Jackson.
+
+The main issue lies in the lack of proper support for resolving these **type variables** defined in the method signature, leading to errors or unexpected behavior when trying to map JSON to the object structure.
+
+---
+
+## ✅ Root Cause
+
+- **Method-level generics** define local type variables that are not visible at the class level.
+- Jackson’s type resolution mechanism relies heavily on class-level type information, which means it doesn’t naturally know how to process or map type variables defined directly inside methods.
+- The `_fromVariable()` function attempts to resolve type variables using a `TypeBindings` context, but in certain cases—especially involving method parameters—it fails to properly identify or resolve them due to a missing mapping or placeholder setup.
+
+---
+
+## ✅ Proposed Fix
+
+To address this, we should enhance the logic to **handle method-level generic type variables** correctly. Here's how we could modify the problematic block in `TypeFactory`:
+
+### ✅ Updated Code Block
+
+Replace the following section in your `TypeFactory`:
+
+```java
+if (context == null) {
+    return _unknownType();
+} else {
+    JavaType actualType = context.findType(name);
+    if (actualType != null) {
+        return actualType;
+    }
+}
+```
+
+with this updated version:
+
+```java
+if (context == null) {
+    // If no binding context exists, we cannot resolve variable
+    return _unknownType();
+} else {
+    // First look up any explicitly resolved type in context
+    JavaType actualType = context.findType(name);
+    if (actualType != null) {
+        return actualType;
+    }
+
+    // Then check for possible placeholders - especially important for method-level vars
+    JavaType placeholder = context.getPlaceholder(name);
+    if (placeholder != null) {
+        return placeholder;
+    }
+
+    // If nothing found, proceed normally with bounds
+}
+```
+
+---
+
+## ✅ Additional Enhancements
+
+If you’re encountering persistent issues, consider adding the following features to strengthen the resolution of local generics:
+
+### 1. **Add Placeholder Support**
+Ensure `TypeBindings` has a clear API to manage and retrieve placeholders for both field and method-level type variables.
+
+```java
+public interface TypeBindings {
+    JavaType findType(String name);
+    void addPlaceholder(String name, JavaType type);
+    JavaType getPlaceholder(String name);
+}
+```
+
+### 2. **Use Custom TypeResolver**
+If necessary, implement a custom `TypeResolver` or override Jackson’s default resolution strategy to treat method-local type parameters more carefully.
+
+```java
+public class LocalGenericDeserializer extends JsonDeserializer<BaseClass> {
+
+    @Override
+    public BaseClass deserialize(JsonParser p, DeserializationContext ctxt) throws IOException {
+        ObjectNode node = p.readValueAsTree();
+        Class<?> entityType = detectLocalGeneric(node); // detect or infer based on metadata
+        return mapper.treeToValue(node, entityType);
+    }
+}
+```
+
+### 3. **Check Annotations or Metadata**
+For advanced use cases, use annotations like `@JsonTypeInfo` or metadata annotations to hint at the expected type, especially when the type parameter is only defined in the method.
+
+```java
+@JsonTypeInfo(use = Id.NAME, include = As.PROPERTY, property = "type")
+@JsonSubTypes({
+    @JsonSubTypes.Type(value = RuleformA.class, name = "a"),
+    @JsonSubTypes.Type(value = RuleformB.class, name = "b")
+})
+public abstract class Ruleform {}
+```
+
+---
+
+## ✅ Conclusion
+
+To effectively solve the issue with **locally declared generic type variables** in Jackson-based deserialization, you should focus on:
+
+- Ensuring that **method-level generics** are handled explicitly via context or placeholders,
+- Improving `TypeBindings` to track both field and method-level generic variables,
+- Possibly augmenting Jackson’s default resolution strategies or introducing custom deserializers for complex scenarios.
+
+This approach ensures that even nested or method-local type parameters are recognized and deserialized correctly, improving overall robustness and compatibility with polymorphic structures.

@@ -1,0 +1,206 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# 1.10 regression (StackOverflowError) with interface where generic type has itself as upper bound
+Add this to GenericMetadataSupportTest:
+    interface GenericsSelfReference<T extends GenericsSelfReference<T>> {
+        T self();
+    }
+
+    @Test
+    public void typeVariable_of_self_type() {
+        GenericMetadataSupport genericMetadata = inferFrom(GenericsSelfReference.class).resolveGenericReturnType(firstNamedMethod("self", GenericsSelfReference.class));
+
+        assertThat(genericMetadata.rawType()).isEqualTo(GenericsSelfReference.class);
+    }
+It fails on master and 1.10.8 with this:
+java.lang.StackOverflowError
+    at sun.reflect.generics.reflectiveObjects.TypeVariableImpl.hashCode(TypeVariableImpl.java:201)
+    at java.util.HashMap.hash(HashMap.java:338)
+    at java.util.HashMap.get(HashMap.java:556)
+    at org.mockito.internal.util.reflection.GenericMetadataSupport.getActualTypeArgumentFor(GenericMetadataSupport.java:193)
+    at org.mockito.internal.util.reflection.GenericMetadataSupport.getActualTypeArgumentFor(GenericMetadataSupport.java:196)
+    at org.mockito.internal.util.reflection.GenericMetadataSupport.getActualTypeArgumentFor(GenericMetadataSupport.java:196)
+
+It worked on 1.9.5. May be caused by the changes in ab9e9f3 (cc @bric3).
+(Also note that while the above interface looks strange, it is commonly used for builder hierarchies, where base class methods want to return this with a more specific type.)
+This is an incorrect Java code (src/org/mockito/internal/util/reflection/GenericMetadataSupport.java):
+```java
+protected void registerTypeVariablesOn(Type classType) {
+    if (!(classType instanceof ParameterizedType)) {
+        return;
+    }
+    ParameterizedType parameterizedType = (ParameterizedType) classType;
+    TypeVariable[] typeParameters = ((Class<?>) parameterizedType.getRawType()).getTypeParameters();
+    Type[] actualTypeArguments = parameterizedType.getActualTypeArguments();
+    for (int i = 0; i < actualTypeArguments.length; i++) {
+        TypeVariable typeParameter = typeParameters[i];
+        Type actualTypeArgument = actualTypeArguments[i];
+
+        if (actualTypeArgument instanceof WildcardType) {
+            contextualActualTypeParameters.put(typeParameter, boundsOf((WildcardType) actualTypeArgument));
+        } else {
+            contextualActualTypeParameters.put(typeParameter, actualTypeArgument);
+        }
+        // logger.log("For '" + parameterizedType + "' found type variable : { '" + typeParameter + "(" + System.identityHashCode(typeParameter) + ")" + "' : '" + actualTypeArgument + "(" + System.identityHashCode(typeParameter) + ")" + "' }");
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import java.lang.annotation.Annotation;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
+
+public class GenericMetadataSupport {
+
+    private final Class<?> rawType;
+    private final Set<Type> actualTypeArguments = new HashSet<>();
+    private final Annotation[][] declaredAnnotationsPerParam;
+
+    protected GenericMetadataSupport(Class<?> rawType) {
+        this(rawType, null);
+    }
+
+    protected GenericMetadataSupport(Method method) throws InvocationTargetException, IllegalAccessException {
+        this(method.getDeclaringClass(), firstNonNullElement(Arrays.asList(
+                mockitoSuppliedAnnotation(method),
+                reflectionSuppliedAnnotation(method))));
+    }
+
+    private static Annotation mockitoSuppliedAnnotation(Method method) {
+        return null; // Replace with actual implementation if needed
+    }
+
+    private static Annotation reflectionSuppliedAnnotation(Method method) {
+        return null; // Replace with actual implementation if needed
+    }
+
+    private static Annotation firstNonNullElement(final Iterable<Annotation> iterable) {
+        for (Annotation annotation : iterable) {
+            if (annotation != null) {
+                return annotation;
+            }
+        }
+        return null;
+    }
+
+    private GenericMetadataSupport(Class<?> rawType, Annotation methodLevelAnnotation) {
+        this.rawType = rawType;
+        Method[] declaredMethods = rawType.getDeclaredMethods();
+        declaredAnnotationsPerParam = new Annotation[declaredMethods.length][];
+        for (int i = 0; i < declaredMethods.length; i++) {
+            declaredAnnotationsPerParam[i] = declaredMethods[i].getDeclaredAnnotations();
+        }
+    }
+
+    public Class<?> rawType() {
+        return rawType;
+    }
+
+    public Set<Type> actualTypeArguments() {
+        return actualTypeArguments;
+    }
+
+    public Annotation[][] declaredAnnotationsPerParam() {
+        return declaredAnnotationsPerParam;
+    }
+
+    public static GenericMetadataSupport inferFrom(Class<?> rawType) {
+        return new GenericMetadataSupport(rawType);
+    }
+
+    public static GenericMetadataSupport fromMethod(Method method) throws InvocationTargetException, IllegalAccessException {
+        return new GenericMetadataSupport(method);
+    }
+
+    public Type resolveGenericReturnType(String name, Class<?> clazz) {
+        try {
+            Method method = clazz.getDeclaredMethod(name);
+            return resolveGenericReturnType(method);
+        } catch (NoSuchMethodException e) {
+            throw new IllegalStateException("Could not find method " + name + " in class " + clazz.getName());
+        }
+    }
+
+    public Type resolveGenericReturnType(Method method) {
+        try {
+            return method.getGenericReturnType();
+        } catch (NullPointerException e) {
+            throw new IllegalStateException("Could not find generic return type for method " + method.getName() + " in class " + method.getDeclaringClass().getName());
+        }
+    }
+}
+
+```java
+import org.junit.Test;
+import org.mockito.Mockito;
+import org.mockito.exceptions.base.MockitoException;
+import org.mockito.invocation.SerializableInvocation;
+import org.mockito.stubbing.Stubber;
+
+import java.io.ObjectStreamException;
+import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+
+import static java.util.Arrays.asList;
+import static junit.framework.Assert.assertEquals;
+import static junit.framework.Assert.assertSame;
+import static junit.framework.TestCase.assertTrue;
+import static org.mockito.Matchers.anyInt;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
+/**
+ * Tests {@link Mockito}'s support for generics.
+ *
+ * @since 2.7
+ */
+public class GenericMetadataSupportTest implements Serializable {
+    public interface GenericsSelfReference<T extends GenericsSelfReference<T>> {
+        T self();
+    }
+
+    @Test
+    public void typeVariable_of_self_type() {
+        GenericMetadataSupport genericMetadata = inferFrom(GenericsSelfReference.class).resolveGenericReturnType(firstNamedMethod("self", GenericsSelfReference.class));
+
+        assertEquals(GenericsSelfReference.class, genericMetadata.rawType());
+    }
+
+    private static Method firstNamedMethod(String name, Class<?> clazz) {
+        return first(asList(clazz.getMethods()), methodNameIs(name), methodNameMatches(clazz, name));
+    }
+
+    private static Predicate<Method> methodNameIs(String name) {
+        return input -> name.equals(input.getName());
+    }
+
+    private static Predicate<Method> methodNameMatches(Class<?> targetType, String name) {
+        return input -> name.equals(input.getName()) && targetType.equals(input.getDeclaringClass());
+    }
+
+    private static Method first(Collection<Method> inputs, Predicate<Method>... matchers) {
+        for (Method candidate : inputs) {
+            boolean matchesAll = true;
+            for (Predicate<Method> matcher : matchers) {
+                matchesAll &= matcher.apply(candidate);
+            }
+            if (matchesAll) {
+                return candidate;
+            }
+        }
+        throw new MockitoException("Could not find a suitable method matching the criteria given.");
+    }
+
+    @SafeVarargs
+    private static <T> Predicate<T>

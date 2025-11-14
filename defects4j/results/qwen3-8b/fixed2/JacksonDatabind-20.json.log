@@ -1,0 +1,117 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Presence of PropertyNamingStrategy Makes Deserialization Fail
+I originally came across this issue using Dropwizard - https://github.com/dropwizard/dropwizard/issues/1095.  But it looks like this is a Jackson issue.  Here's the rerproducer:
+
+``` java
+public class TestPropertyNamingStrategyIssue {
+  public static class ClassWithObjectNodeField {
+    public String id;
+    public ObjectNode json;
+  }
+
+  @Test
+  public void reproducer() throws Exception {
+    ObjectMapper mapper = new ObjectMapper();
+    mapper.setPropertyNamingStrategy(PropertyNamingStrategy.LOWER_CASE);
+    ClassWithObjectNodeField deserialized =
+        mapper.readValue(
+            "{ \"id\": \"1\", \"json\": { \"foo\": \"bar\", \"baz\": \"bing\" } }",
+            ClassWithObjectNodeField.class);
+  }
+}
+```
+
+Looks like the presence of any PropertyNamingStrategy make deserialization to ObjectNode fail.  This works fine if I remove the property naming strategy.
+
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/node/ObjectNode.java):
+```java
+public JsonNode setAll(Map<String,? extends JsonNode> properties)
+    {
+        for (Map.Entry<String,? extends JsonNode> en : properties.entrySet()) {
+            JsonNode n = en.getValue();
+            if (n == null) {
+                n = nullNode();
+            }
+            _children.put(en.getKey(), n);
+        }
+        return this;
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public JsonNode setAll(Map<String, ? extends JsonNode> properties) {
+    if (properties == null) {
+        return this;
+    }
+    for (Map.Entry<String, ? extends JsonNode> entry : properties.entrySet()) {
+        String key = entry.getKey();
+        JsonNode value = entry.getValue();
+        // Apply the property naming strategy to the key before setting it
+        String mappedKey = getPropertyNamingStrategy().mapPropertyName(key);
+        _children.put(mappedKey, value);
+    }
+    return this;
+}
+```
+</think>
+
+The problem described involves a failure in deserializing JSON into a class that contains an `ObjectNode` field when a `PropertyNamingStrategy` is applied. The issue arises because the `setAll` method in `ObjectNode` does not account for the naming strategy used during deserialization, leading to mismatched field names when expecting camel case or other strategies.
+
+---
+
+### ✅ Problem Summary:
+- **Without** a `PropertyNamingStrategy`, deserialization from JSON into `ClassWithObjectNodeField` with a field named `json` works as expected.
+- With the use of `PropertyNamingStrategy.LOWER_CASE`, the deserializer tries to map JSON keys based on this strategy but fails to apply it correctly within the `ObjectNode` itself.
+- Specifically, the `setAll` method inside `ObjectNode` doesn't use the naming strategy when populating `_children`, causing misalignment between JSON and object field names.
+
+---
+
+### 🔧 Solution Explanation:
+To fix the issue, we need to ensure that the `setAll` method respects the active `PropertyNamingStrategy`. That means applying the naming strategy to the key (e.g., transforming "FooBar" → "foobar") before inserting it into `_children`.
+
+Here’s how we can modify the method:
+
+```java
+public JsonNode setAll(Map<String, ? extends JsonNode> properties) {
+    if (properties == null) {
+        return this;
+    }
+
+    for (Map.Entry<String, ? extends JsonNode> entry : properties.entrySet()) {
+        String originalKey = entry.getKey();
+        JsonNode value = entry.getValue();
+
+        // Get the current naming strategy
+        PropertyNamingStrategy namingStrategy = getPropertyNamingStrategy();
+
+        // Map the key according to the current naming strategy
+        String mappedKey = namingStrategy.mapPropertyName(originalKey);
+
+        // Set the mapped key-value pair in _children
+        _children.put(mappedKey, value);
+    }
+
+    return this;
+}
+```
+
+---
+
+### 📌 Key Notes:
+- `getPropertyNamingStrategy()` should be available via some mechanism — typically, the parent `ObjectMapper` holds the naming strategy.
+- Ensure access to the naming strategy is thread-safe if the `ObjectNode` may be shared between threads.
+- This change will only affect the behavior of `setAll`, which is called when populating node content during deserialization — thus resolving the inconsistency caused by ignoring the naming strategy.
+
+---
+
+### ✅ Expected Outcome:
+- After implementing this fix, deserialization using a `PropertyNamingStrategy` such as `LOWER_CASE` will work properly for objects containing `ObjectNode` fields.
+- This aligns `ObjectNode` behavior with the rest of the Jackson framework and ensures consistency during JSON parsing.
+
+Let me know if you'd also like help integrating this change into your build system or testing it further!

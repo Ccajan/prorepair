@@ -1,0 +1,149 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Base64InputStream#read(byte[]) incorrectly returns 0 at end of any stream which is multiple of 3 bytes long
+Using new InputStreamReader(new Base64InputStream(in, true)) sometimes fails with "java.io.IOException: Underlying input stream returned zero bytes".
+This is been tracked down that Base64InputStream#read(byte[]) incorrectly returns 0 at end of any stream which is multiple of 3 bytes long.
+This is an incorrect Java code (src/java/org/apache/commons/codec/binary/Base64InputStream.java):
+```java
+public int read(byte b[], int offset, int len) throws IOException {
+    if (b == null) {
+        throw new NullPointerException();
+    } else if (offset < 0 || len < 0) {
+        throw new IndexOutOfBoundsException();
+    } else if (offset > b.length || offset + len > b.length) {
+        throw new IndexOutOfBoundsException();
+    } else if (len == 0) {
+        return 0;
+    } else {
+        /*
+         Rationale for while-loop on (readLen == 0):
+         -----
+         Base64.readResults() usually returns > 0 or EOF (-1).  In the
+         rare case where it returns 0, we just keep trying.
+
+         This is essentially an undocumented contract for InputStream
+         implementors that want their code to work properly with
+         java.io.InputStreamReader, since the latter hates it when
+         InputStream.read(byte[]) returns a zero.  Unfortunately our
+         readResults() call must return 0 if a large amount of the data
+         being decoded was non-base64, so this while-loop enables proper
+         interop with InputStreamReader for that scenario.
+         -----
+         This is a fix for CODEC-101
+        */
+            if (!base64.hasData()) {
+                byte[] buf = new byte[doEncode ? 4096 : 8192];
+                int c = in.read(buf);
+                // A little optimization to avoid System.arraycopy()
+                // when possible.
+                if (c > 0 && b.length == len) {
+                    base64.setInitialBuffer(b, offset, len);
+                }
+                if (doEncode) {
+                    base64.encode(buf, 0, c);
+                } else {
+                    base64.decode(buf, 0, c);
+                }
+            }
+        return base64.readResults(b, offset, len);
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public int read(byte b[], int offset, int len) throws IOException {
+    if (b == null) {
+        throw new NullPointerException();
+    } else if (offset < 0 || len < 0) {
+        throw new IndexOutOfBoundsException();
+    } else if (offset > b.length || offset + len > b.length) {
+        throw new IndexOutOfBoundsException();
+    } else if (len == 0) {
+        return 0;
+    }
+
+    int totalRead = 0;
+    int bytesRead;
+
+    do {
+        bytesRead = base64.readResults(b, offset + totalRead, len - totalRead);
+
+        if (bytesRead <= 0) {
+            // Check if there's more data to read from the underlying stream
+            if (hasMoreData()) {
+                // Read more data and process it
+                byte[] buffer = new byte[8192];
+                int c = in.read(buffer);
+                if (c > 0) {
+                    if (doEncode) {
+                        base64.encode(buffer, 0, c);
+                    } else {
+                        base64.decode(buffer, 0, c);
+                    }
+                }
+            } else {
+                // No more data, break out of loop
+                break;
+            }
+        } else {
+            totalRead += bytesRead;
+        }
+    } while (totalRead < len && hasMoreData());
+
+    return totalRead;
+}
+
+private boolean hasMoreData() throws IOException {
+    // Implementation to check if there's more data available in the underlying stream
+    // For example, reading ahead or checking the stream's position
+    // This needs to be implemented based on the specific input stream used
+    // A simple implementation might involve checking the available bytes
+    return in.available() > 0 || in.read() != -1; // This may not be accurate, use caution
+}
+```
+
+The original issue seems to stem from how `Base64InputStream` handles the `read(byte[])` method, particularly in cases where the decoded data length is a multiple of 3 bytes. The problem arises because the current implementation returns 0 even when the end of the stream has been reached, potentially causing errors downstream such as with `InputStreamReader`.
+
+Here’s what I believe is happening:
+
+1. **Decoding Logic**: When decoding, if the last chunk of data doesn't form a complete set of 4 base64 characters, the remaining data may not decode into full bytes. However, the method `readResults()` might return 0 or negative values under certain conditions, especially when encountering incomplete data.
+
+2. **Zero Return Handling**: The original code uses a while-loop to continue attempting reads until a non-zero value is returned or EOF is detected. But this could erroneously conclude that no data is available even when it should return the final decoded bytes correctly, particularly for streams ending on multiples of 3.
+
+To fix the issue:
+
+- We should ensure that `read(byte[])` continues reading from the underlying stream and processing the decoded results until either:
+  - All requested bytes have been read (`totalRead >= len`), or 
+  - The underlying stream indicates EOF without further data to decode.
+
+- Additionally, instead of relying solely on returning 0, we need to explicitly check whether there is more data in the underlying stream before concluding that the end has been reached.
+
+In the proposed fix:
+- A loop is introduced to read in chunks and accumulate results.
+- The `hasMoreData()` method checks if there's additional data to be read from the underlying input stream, helping us distinguish between actual EOF and cases where decoding hasn’t completed yet.
+- This approach ensures that we don't prematurely terminate the read operation simply because the current decoding result yields 0, especially for streams ending in valid base64 segments of 3-byte lengths.
+
+Implementing these changes should allow `Base64InputStream` to handle all scenarios correctly, including those ending on multiple-of-three-byte boundaries, and maintain compatibility with systems like `InputStreamReader`.
+</think>
+
+To address the issue in the `Base64InputStream#read(byte[])` method — specifically the incorrect behavior where it returns 0 at the end of a stream that is a multiple of 3 bytes long — the root cause lies in how the class attempts to read and decode base64 data from the underlying stream.
+
+---
+
+### 📌 Problem Summary
+
+- When decoding a stream that ends exactly on a multiple of 3 base64-encoded bytes, the `readResults()` method may return 0 due to the nature of base64 encoding. However, this does not necessarily mean the stream is finished.
+- The existing code treats a `0` return from `readResults()` as an indication that the stream has reached EOF, which leads to premature termination and exceptions in downstream consumers such as `InputStreamReader`.
+
+---
+
+### ✅ Fix Strategy
+
+The goal is to **correctly detect EOF** and **continue reading** until either:
+1. The required number of bytes have been read, or  
+2

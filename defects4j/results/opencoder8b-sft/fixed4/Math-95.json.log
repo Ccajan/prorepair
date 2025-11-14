@@ -1,0 +1,157 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# denominatorDegreeOfFreedom in FDistribution leads to IllegalArgumentsException in UnivariateRealSolverUtils.bracket
+We are using the FDistributionImpl from the commons.math project to do
+some statistical calculations, namely receiving the upper and lower
+boundaries of a confidence interval. Everything is working fine and the
+results are matching our reference calculations.
+However, the FDistribution behaves strange if a
+denominatorDegreeOfFreedom of 2 is used, with an alpha-value of 0.95.
+This results in an IllegalArgumentsException, stating:
+Invalid endpoint parameters:  lowerBound=0.0 initial=Infinity
+upperBound=1.7976931348623157E308
+coming from
+org.apache.commons.math.analysis.UnivariateRealSolverUtils.bracket
+The problem is the 'initial' parameter to that function, wich is
+POSITIVE_INFINITY and therefore not within the boundaries. I already
+pinned down the problem to the FDistributions getInitialDomain()-method,
+wich goes like:
+        return getDenominatorDegreesOfFreedom() /
+                    (getDenominatorDegreesOfFreedom() - 2.0);
+Obviously, in case of denominatorDegreesOfFreedom == 2, this must lead
+to a division-by-zero, resulting in POSTIVE_INFINITY. The result of this
+operation is then directly passed into the
+UnivariateRealSolverUtils.bracket() - method as second argument.
+This is an incorrect Java code (src/java/org/apache/commons/math/distribution/FDistributionImpl.java):
+```java
+protected double getInitialDomain(double p) {
+    double ret;
+    double d = getDenominatorDegreesOfFreedom();
+        // use mean
+        ret = d / (d - 2.0);
+    return ret;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+package org.apache.commons.math.distribution;
+
+import org.apache.commons.math.FunctionEvaluationException;
+import org.apache.commons.math.MaxCountExceededException;
+import org.apache.commons.math.analysis.BrentOptimizer;
+import org.apache.commons.math.analysis.GammaFunction;
+import org.apache.commons.math.analysis.UnivariateRealFunction;
+import org.apache.commons.math.special.Erf;
+import org.apache.commons.math.util.MathUtils;
+
+/**
+ * Implementation of the F-Distribution.
+ *
+ */
+public class FDistributionImpl extends AbstractRealDistribution implements
+      ContinuousDistribution {
+
+    private static final long serialVersionUID = -3515760285339916386L;
+    private static final int MAX_COUNT = 10000;
+
+    /** Degrees of freedom. */
+    protected double degreesOfFreedomNumerator;
+
+    /** Degrees of freedom. */
+    protected double degreesOfFreedomDenominator;
+
+    /**
+     * Public constructor for {@link FDistribution}.
+     * @param degreesOfFreedomNumerator degrees of freedom of numerator
+     * @param degreesOfFreedomDenominator degrees of freedom of denominator
+     */
+    public FDistributionImpl(final double degreesOfFreedomNumerator,
+                             final double degreesOfFreedomDenominator) {
+        super(new BrentOptimizer(0, Double.POSITIVE_INFINITY, Math.ulp(Double.SIZE),
+                                  0, MAX_COUNT));
+        setDegreesOfFreedom(degreesOfFreedomNumerator, degreesOfFreedomDenominator);
+    }
+
+    /**
+     * Sets the degrees of freedom.
+     * @param n Degrees of freedom numerator.
+     * @param d Degrees of freedom denominator.
+     * @throws IllegalArgumentException if any of the arguments is &lt;= 0.
+     */
+    public void setDegreesOfFreedom(double n, double d) throws IllegalArgumentException {
+        if (n <= 0 || d <= 0) {
+            throw new IllegalArgumentException("Degrees of freedom must be > 0");
+        }
+        degreesOfFreedomNumerator   = n;
+        degreesOfFreedomDenominator = d;
+    }
+
+    /**
+     * Gets the degrees of freedom.
+     * @return The degrees of freedom.
+     */
+    public double[] getDegreesOfFreedom() {
+        return new double[]{degreesOfFreedomNumerator, degreesOfFreedomDenominator};
+    }
+
+    public double cumulativeProbability(final double x)
+          throws MaxCountExceededException, FunctionEvaluationException {
+        return GammaFunction.regularizedBeta(x / degreesOfFreedomDenominator,
+                                             degreesOfFreedomNumerator / 2,
+                                             degreesOfFreedomDenominator / 2);
+    }
+
+    public double getDensity(final double x) throws FunctionEvaluationException {
+        double y = x / degreesOfFreedomDenominator;
+        if (y < 0 || Double.isNaN(y)) {
+            return 0;
+        }
+        double v = (degreesOfFreedomNumerator
+                     / (Math.PI * degreesOfFreedomDenominator))
+                   * Math.pow((1 + y / degreesOfFreedomNumerator), -1);
+        return v * Math.exp(-x) / degreesOfFreedomDenominator;
+    }
+
+    public double getInverseCumulativeProbability(final double p)
+          throws MaxCountExceededException, FunctionEvaluationException {
+        double f0 = 0.5;
+        double fMax = 1.0 - 1e-14;  // to avoid rounding errors on 1.0
+        double min = f0;
+        double max = fMax;
+        double mid = f0;
+        for (int i = 0; i < MAX_COUNT; i++) {
+            mid = min + (max - min) / 2;
+            double fm = cumulativeProbability(mid);
+            if (fm == p) {
+                return mid;
+            } else if (fm < p && cumulativeProbability(mid + Math.ulp(1.0)) > p ||
+                         fm > p && cumulativeProbability(mid - Math.ulp(1.0)) < p ) {
+                return mid;
+            } else if (fm < p) {
+                min = mid;
+            } else {
+                max = mid;
+            }
+        }
+        throw MathUtils.createMaximumIterationExceededException(MAX_COUNT);
+    }
+
+    public String toString() {
+        return "FDistributionImpl [numerator degrees of freedom=" + degreesOfFreedomNumerator
+               + ", denominator degrees of freedom=" + degreesOfFreedomDenominator + "]";
+    }
+
+    protected double getInitialDomain(double p) {
+        double ret;
+        double d = getDenominatorDegreesOfFreedom();
+            ret = Math.sqrt(d / (GammaFunction.logGamma(d / 2) - Math.log(p)));
+        return ret;
+    }
+}
+```
+

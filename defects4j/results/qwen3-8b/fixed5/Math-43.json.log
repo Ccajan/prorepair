@@ -1,0 +1,143 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Statistics.setVarianceImpl makes getStandardDeviation produce NaN
+Invoking SummaryStatistics.setVarianceImpl(new Variance(true/false) makes getStandardDeviation produce NaN. The code to reproduce it:
+
+int[] scores = {1, 2, 3, 4};
+SummaryStatistics stats = new SummaryStatistics();
+stats.setVarianceImpl(new Variance(false)); //use "population variance"
+for(int i : scores) {
+  stats.addValue(i);
+}
+double sd = stats.getStandardDeviation();
+System.out.println(sd);
+
+A workaround suggested by Mikkel is:
+
+  double sd = FastMath.sqrt(stats.getSecondMoment() / stats.getN());
+This is an incorrect Java code (src/main/java/org/apache/commons/math/stat/descriptive/SummaryStatistics.java):
+```java
+public void addValue(double value) {
+    sumImpl.increment(value);
+    sumsqImpl.increment(value);
+    minImpl.increment(value);
+    maxImpl.increment(value);
+    sumLogImpl.increment(value);
+    secondMoment.increment(value);
+    // If mean, variance or geomean have been overridden,
+    // need to increment these
+    if (!(meanImpl instanceof Mean)) {
+        meanImpl.increment(value);
+    }
+    if (!(varianceImpl instanceof Variance)) {
+        varianceImpl.increment(value);
+    }
+    if (!(geoMeanImpl instanceof GeometricMean)) {
+        geoMeanImpl.increment(value);
+    }
+    n++;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public void addValue(double value) {
+    sumImpl.increment(value);
+    sumsqImpl.increment(value);
+    minImpl.increment(value);
+    maxImpl.increment(value);
+    sumLogImpl.increment(value);
+    secondMoment.increment(value);
+    // If mean, variance or geomean have been overridden,
+    // need to increment these
+    if (!(meanImpl instanceof Mean)) {
+        meanImpl.increment(value);
+    }
+    if (!(varianceImpl instanceof Variance)) {
+        varianceImpl.increment(value);
+    }
+    if (!(geoMeanImpl instanceof GeometricMean)) {
+        geoMeanImpl.increment(value);
+    }
+    n++;
+}
+
+```
+
+I don't see any obvious issues with this code. However, I can see how this could lead to problems when using setVarianceImpl(). Let me think about how this might be causing the issue.
+
+The key seems to be that when we call setVarianceImpl(), we're replacing the default variance implementation with a custom one. But then, when we add values, the default variance implementation is not being updated properly.
+
+Let me walk through what's happening step by step:
+
+1. We create a SummaryStatistics object.
+2. We call setVarianceImpl(new Variance(false)), which replaces the default variance implementation with a population variance implementation.
+3. Then, we add some values using addValue().
+4. Finally, we call getStandardDeviation(), which tries to calculate the standard deviation using the variance implementation.
+
+But here's the problem: When we added the values, the default variance implementation wasn't being used. Instead, our custom Variance instance was being updated. This means that when we called getStandardDeviation(), it was trying to calculate the standard deviation based on a variance that was never actually computed correctly.
+
+So the solution would be to ensure that when we replace the variance implementation with a custom one, the default variance implementation is still being updated properly. This way, when we call getStandardDeviation(), it will use the correct variance calculation.
+
+One possible fix is to make sure that when we call setVarianceImpl(), we also reset the default variance implementation so that it starts tracking from scratch. This would allow us to maintain both implementations and avoid conflicts.
+
+Another possibility is to modify the addValue() method to ensure that even if we've replaced the variance implementation, the default one is still being updated. This would help prevent conflicts between different implementations.
+
+In conclusion, the issue seems to stem from replacing the variance implementation without resetting the default one. To fix this, we need to ensure that when we replace the variance implementation, the default one is either reset or properly updated to avoid conflicts. This would help prevent the standard deviation from returning NaN when using a custom variance implementation.
+</think>
+
+To address the issue where `getStandardDeviation()` returns `NaN` after calling `setVarianceImpl(...)`, let’s analyze the root cause and provide a fix.
+
+---
+
+### 🔍 Root Cause Analysis
+
+The problem lies in **how the `Variance` implementation is integrated** into `SummaryStatistics`. Here's what happens:
+
+1. `SummaryStatistics` uses multiple internal statistics:
+   - `sumImpl`, `sumsqImpl`, `secondMoment`, etc.
+   - `varianceImpl` is one of them.
+   
+2. When `setVarianceImpl(new Variance(...))` is called, **this changes the `varianceImpl`**, but it doesn’t automatically update the underlying statistical data required for the variance computation.
+
+3. In `addValue(...)`, all other statistics are updated, including `sumsqImpl` and `secondMoment`. But **the custom `Variance` implementation does not get updated with these values** — only its own `increment(value)` is called.
+
+4. As a result, the variance stored in `varianceImpl` is incomplete or malformed. Since `getStandardDeviation()` calls `.getVariance()` internally, this leads to invalid results (`NaN`) during the square root operation.
+
+---
+
+### ✅ Correct Fix
+
+We must **ensure that the `Variance` implementation gets proper access to the necessary statistics** (like `sumsq` and `n`) to compute variance accurately. The current setup fails because it overwrites the entire implementation rather than updating it.
+
+#### 🔧 Updated Code Fix
+
+Here’s how to fix the integration of the `Variance` class within `SummaryStatistics`:
+
+```java
+public class SummaryStatistics {
+
+    private final Variance varianceImpl;
+
+    public SummaryStatistics() {
+        this.varianceImpl = new Variance(true); // Default sample variance
+    }
+
+    public void setVarianceImpl(Variance variance) {
+        this.varianceImpl = variance;
+    }
+
+    public void addValue(double value) {
+        sumImpl.increment(value);
+        sumsqImpl.increment(value);
+        minImpl.increment(value);
+        maxImpl.increment(value);
+        sumLogImpl.increment(value);
+        secondMoment.increment(value);
+
+        // Ensure the Variance is updated with necessary state
+        varianceImpl.updateFrom(sumImpl, sumsqImpl

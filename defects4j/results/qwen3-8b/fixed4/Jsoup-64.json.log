@@ -1,0 +1,151 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Incorrect handling of self-closing tags noframes, style and title cause remainder of document to be html-escaped
+Given the input:
+<html>
+<head>
+	<style />   <!-- < - - this is the culprit -->
+</head>
+<body>
+	<p>Whatever</p>
+</body>
+</html>
+JSoup 1.8.2 and also http://try.jsoup.org/~lJwWpjXYUSTBeBZhdEnS3Mt56g4 will produce:
+    <html>
+     <head> 
+      <style></style>
+     </head>
+     <body>
+       &lt;/head&gt; &lt;body&gt; &lt;p&gt;Whatever&lt;/p&gt; &lt;/body&gt; &lt;/html&gt;
+     </body>
+    </html>
+With <title/> instead of <style/>, the result is different but still wrong (http://try.jsoup.org/~BZ3uoMki-r904fZxUOWJgLJO7r8 ):
+<html>
+ <head> 
+  <title></title>
+ </head>
+ <body>
+   &lt;/head&gt;  
+  <p>Whatever</p>  
+ </body>
+</html>
+That weirdness was fixed for <script> with Issue #305: http://try.jsoup.org/~3Ms6TQCrrdaA_uPgxgURYYvwFAg
+<html>
+ <head> 
+  <script></script> 
+ </head> 
+ <body> 
+  <p>Whatever</p>  
+ </body>
+</html>
+Looking at the source, it seems only the HtmlTreeBuilderState handling for <noframes>, <style> and <title> in the methods handleRawText and handleRcData doesn't get along with the self-closing tags.
+Any other tagname I've checked (and I tried to cover all branches of that case StartTag switch) results in a good parse similar to the <script> case, which is what I'd expect.
+Thanks for looking into this!
+This is an incorrect Java code (src/main/java/org/jsoup/parser/HtmlTreeBuilderState.java):
+```java
+private static void handleRawtext(Token.StartTag startTag, HtmlTreeBuilder tb) {
+    tb.insert(startTag);
+    tb.tokeniser.transition(TokeniserState.Rawtext);
+    tb.markInsertionMode();
+    tb.transition(Text);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+// Original problematic code:
+private static void handleRawtext(Token.StartTag startTag, HtmlTreeBuilder tb) {
+    tb.insert(startTag);
+    tb.tokeniser.transition(TokeniserState.Rawtext);
+    tb.markInsertionMode();
+    tb.transition(Text);
+}
+
+// Repaired version:
+private static void handleRawtext(Token.StartTag startTag, HtmlTreeBuilder tb) {
+    // For self-closing tags like <style />, we need to insert the element node,
+    // then immediately close it if it's one of the special cases (like <style>, <title>, etc.)
+    // This mimics the behavior of how browsers handle these tags.
+
+    tb.insert(startTag);
+
+    // Check if the tag is one of the special cases where self-closing should behave as non-self-closing
+    String tagName = startTag.tagName().toLowerCase(Locale.ENGLISH);
+    if ("style".equals(tagName) || "title".equals(tagName) || "noframes".equals(tagName)) {
+        // If the tag is self-closing, close it immediately (like in HTML)
+        // But ensure it's handled correctly in terms of content insertion
+        tb.closeCurrentElement();  // Close any open element if needed (though typically none here)
+        tb.tokeniser.transition(TokeniserState.Rawtext);  // Transition to raw text state
+        tb.markInsertionMode();
+        tb.transition(Text);
+    } else {
+        // Otherwise, proceed normally with the current tag
+        tb.tokeniser.transition(TokeniserState.Rawtext);
+        tb.markInsertionMode();
+        tb.transition(Text);
+    }
+}
+```
+
+### Explanation:
+
+The issue arises because Jsoup incorrectly handles self-closing tags like `<style />` or `<title />`. In HTML, such self-closing tags don’t mean they’re empty—they're just tags without a body. However, when Jsoup parses them, it sometimes treats them as though they were closed and does not allow further parsing inside, leading to everything after being escaped.
+
+#### Key Fixes:
+1. **Check Special Tags:** Identify whether the tag is one of those special cases (`<style>`, `<title>`, `<noframes>`).
+2. **Handle Self-Closure Properly:** Even though the tag is self-closing, Jsoup must insert the tag node and then properly transition to the correct state (like `rawtext`) so that subsequent elements can be parsed normally.
+
+By ensuring the correct parsing of these special self-closing tags, Jsoup can more accurately represent the original document structure, preventing the unnecessary escaping of subsequent content.
+
+Let me know if you want this to apply only to specific versions of Jsoup or have additional checks.
+</think>
+
+To address the bug in Jsoup’s handling of self-closing tags like `<style />`, `<title />`, and `<noframes />`, we need to make sure these special tags are treated appropriately—**not as empty nodes**, but as **elements that may contain content** even if they appear self-closed. The key problem is that Jsoup prematurely transitions the parser out of the expected context, causing following content to be incorrectly escaped or misinterpreted.
+
+---
+
+## ✅ Corrected Code
+
+Here’s the corrected implementation of the method responsible for parsing self-closing tags within the `Rawtext` mode in Jsoup:
+
+```java
+private static void handleRawtext(Token.StartTag startTag, HtmlTreeBuilder tb) {
+    // Always insert the start tag as a real element node
+    tb.insert(startTag);
+
+    // Determine if the tag is one of the special cases
+    String tagName = startTag.tagName().toLowerCase(Locale.ENGLISH);
+    boolean isSpecial = "style".equals(tagName) ||
+                       "title".equals(tagName) ||
+                       "noframes".equals(tagName);
+
+    // For special tags, explicitly transition into Rawtext mode
+    tb.tokeniser.transition(TokeniserState.Rawtext);
+    tb.markInsertionMode();
+
+    // Only transition to Text mode if it's NOT a special tag
+    if (!isSpecial) {
+        tb.transition(Text);
+    }
+}
+```
+
+---
+
+## 🔍 Problem Summary
+
+In the original code, the method `handleRawtext` would always move to the `Text` state right away after inserting a `<style />` or similar tag. That leads to the browser engine treating the next content as **plain text** rather than markup, hence the unexpected escaping of the rest of the document.
+
+Instead, the correct behavior for `<style>`, `<title>`, and `<noframes>` should be to remain in the **"Rawtext"** state (allowing embedded content), and only transition to `Text` when the tag isn’t one of the special ones.
+
+---
+
+## 🧠 How It Works
+
+1. Insert the tag node as a regular HTML element.
+2. If the tag is one of the special types (`<style>`, `<title>`, `<noframes>`), keep the parser in **Rawtext** mode.
+3. Only transition to **Text**

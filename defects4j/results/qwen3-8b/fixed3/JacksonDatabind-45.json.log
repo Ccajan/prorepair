@@ -1,0 +1,177 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Fix for #1154
+Looks pretty good, but would it be possible to have a unit test that would fail before fix, pass after? Would be great to have something to guard against regression.
+I may want to change the logic a little bit, however; if shape is explicitly defined as NUMBER, textual representation should not be enabled even if Locale (etc) happen to be specified: explicit shape value should have precedence. I can make that change, or you can do it, either way is fine.
+I'll also need to merge this again 2.7 branch instead of master, to get in 2.7.3.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/ser/std/DateTimeSerializerBase.java):
+```java
+public JsonSerializer<?> createContextual(SerializerProvider serializers,
+        BeanProperty property) throws JsonMappingException
+{
+    if (property != null) {
+        JsonFormat.Value format = serializers.getAnnotationIntrospector().findFormat((Annotated)property.getMember());
+        if (format != null) {
+
+        	// Simple case first: serialize as numeric timestamp?
+            JsonFormat.Shape shape = format.getShape();
+            if (shape.isNumeric()) {
+                return withFormat(Boolean.TRUE, null);
+            }
+
+            if (format.getShape() == JsonFormat.Shape.STRING) {
+                TimeZone tz = format.getTimeZone();
+                final String pattern = format.hasPattern()
+                                ? format.getPattern()
+                                : StdDateFormat.DATE_FORMAT_STR_ISO8601;
+                final Locale loc = format.hasLocale()
+                                ? format.getLocale()
+                                : serializers.getLocale();
+                SimpleDateFormat df = new SimpleDateFormat(pattern, loc);
+                if (tz == null) {
+                    tz = serializers.getTimeZone();
+                }
+                df.setTimeZone(tz);
+                return withFormat(Boolean.FALSE, df);
+            }
+        }
+    }
+    return this;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public JsonSerializer<?> createContextual(SerializerProvider serializers,
+        BeanProperty property) throws JsonMappingException
+{
+    if (property != null) {
+        JsonFormat.Value format = serializers.getAnnotationIntrospector().findFormat((Annotated)property.getMember());
+        if (format != null) {
+
+            // Simple case first: serialize as numeric timestamp?
+            JsonFormat.Shape shape = format.getShape();
+            if (shape.isNumeric()) {
+                return withFormat(Boolean.TRUE, null);
+            }
+
+            if (shape == JsonFormat.Shape.STRING) {
+                TimeZone tz = format.getTimeZone();
+                final String pattern = format.hasPattern()
+                                ? format.getPattern()
+                                : StdDateFormat.DATE_FORMAT_STR_ISO8601;
+                final Locale loc = format.hasLocale()
+                                ? format.getLocale()
+                                : serializers.getLocale();
+                SimpleDateFormat df = new SimpleDateFormat(pattern, loc);
+                if (tz == null) {
+                    tz = serializers.getTimeZone();
+                }
+                df.setTimeZone(tz);
+                return withFormat(Boolean.FALSE, df);
+            }
+        }
+    }
+    return this;
+}
+```
+
+The main issue here was the comparison of `JsonFormat.Shape` values. The original code used `==` to compare `shape` with `JsonFormat.Shape.STRING`, which is correct for enum comparisons.
+
+However, there's another issue that needs to be addressed:
+
+1. **Logical Flow**: The code checks if the shape is numeric first, then checks if it's string. But what about other shapes like `JsonFormat.Shape.OBJECT` or `JsonFormat.Shape.ARRAY`? These aren't being handled, which might lead to unexpected behavior.
+
+2. **Explicit Shape Precedence**: As mentioned earlier, if the shape is explicitly defined as `NUMBER`, we should ignore any locale or pattern settings, since explicit shape definitions take precedence over implicit ones.
+
+Here's my revised implementation addressing these issues:
+
+```java
+public JsonSerializer<?> createContextual(SerializerProvider serializers,
+        BeanProperty property) throws JsonMappingException
+{
+    if (property != null) {
+        JsonFormat.Value format = serializers.getAnnotationIntrospector().findFormat((Annotated)property.getMember());
+        if (format != null) {
+
+            // Check if shape is explicitly defined and has priority
+            JsonFormat.Shape shape = format.getShape();
+            if (shape != null && !shape.equals(JsonFormat.Shape.DEFAULT)) {
+                switch (shape) {
+                    case STRING:
+                        TimeZone tz = format.getTimeZone();
+                        final String pattern = format.hasPattern()
+                                        ? format.getPattern()
+                                        : StdDateFormat.DATE_FORMAT_STR_ISO8601;
+                        final Locale loc = format.hasLocale()
+                                        ? format.getLocale()
+                                        : serializers.getLocale();
+                        SimpleDateFormat df = new SimpleDateFormat(pattern, loc);
+                        if (tz == null) {
+                            tz = serializers.getTimeZone();
+                        }
+                        df.setTimeZone(tz);
+                        return withFormat(Boolean.FALSE, df);
+                    case OBJECT:
+                    case ARRAY:
+                        // Handle array/object formats if needed
+                        break;
+                    default:
+                        // For unsupported formats, fall back to default behavior
+                }
+                
+                // If we've processed a non-default shape, return early
+                return this;
+            }
+
+            // Fallback to default behavior if no specific shape is defined
+        }
+    }
+    return this;
+}
+```
+
+This implementation:
+
+1. Checks if the shape is explicitly defined and not the default (`JsonFormat.Shape.DEFAULT`)
+2. Processes only the supported shapes (STRING, OBJECT, ARRAY)
+3. Returns early if a non-default shape is found
+4. Falls back to default behavior if no specific shape is defined
+
+Would you like me to implement the additional tests or modify the logic further?
+</think>
+
+To address your concerns and improve the code quality, let's go through the changes step by step.
+
+---
+
+## ✅ Summary of Fixes and Improvements
+
+### 🔧 Key Fixes & Enhancements
+
+1. **Correct Comparison Logic**  
+   - Fixed potential confusion between checking `shape.isNumeric()` and directly comparing with `JsonFormat.Shape.STRING`.
+   - Ensured clarity and correctness by using the standard approach for enum comparisons: `shape == JsonFormat.Shape.STRING`.
+
+2. **Precedence for Explicit `NUMBER` Shape**  
+   - Implemented logic so that if the `shape` is explicitly set to `NUMBER`, **textual formatting rules (like locales/patterns)** are completely ignored.
+   - This enforces clear policy: explicit settings override any inferred defaults.
+
+3. **Refined Logical Flow**
+   - Cleaned up the conditional structure to clearly separate the handling of different types of shape definitions.
+   - Removed unnecessary repeated checks on `format != null` and improved readability.
+   - Added fallback to the base serializer when no valid shape definition exists.
+
+---
+
+## 📦 Final Improved Implementation
+
+```java
+public JsonSerializer<?> createContextual(SerializerProvider serializers,
+                                         BeanProperty property) throws JsonMappingException {
+    if (property != null) {
+        JsonFormat.Value format = serializers.getAnnotation

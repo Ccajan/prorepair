@@ -1,0 +1,203 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# FastDateParser does not handle unterminated quotes correctly
+FDP does not handled unterminated quotes the same way as SimpleDateFormat
+For example:
+Format: 'd'd'
+Date: d3
+This should fail to parse the format and date but it actually works.
+The format is parsed as:
+Pattern: d(\p
+{IsNd}
+++)
+This is an incorrect Java code (src/main/java/org/apache/commons/lang3/time/FastDateParser.java):
+```java
+private void init() {
+    thisYear= Calendar.getInstance(timeZone, locale).get(Calendar.YEAR);
+
+    nameValues= new ConcurrentHashMap<Integer, KeyValue[]>();
+
+    StringBuilder regex= new StringBuilder();
+    List<Strategy> collector = new ArrayList<Strategy>();
+
+    Matcher patternMatcher= formatPattern.matcher(pattern);
+    if(!patternMatcher.lookingAt()) {
+        throw new IllegalArgumentException("Invalid pattern");
+    }
+
+    currentFormatField= patternMatcher.group();
+    Strategy currentStrategy= getStrategy(currentFormatField);
+    for(;;) {
+        patternMatcher.region(patternMatcher.end(), patternMatcher.regionEnd());
+        if(!patternMatcher.lookingAt()) {
+            nextStrategy = null;
+            break;
+        }
+        String nextFormatField= patternMatcher.group();
+        nextStrategy = getStrategy(nextFormatField);
+        if(currentStrategy.addRegex(this, regex)) {
+            collector.add(currentStrategy);
+        }
+        currentFormatField= nextFormatField;
+        currentStrategy= nextStrategy;
+    }
+    if(currentStrategy.addRegex(this, regex)) {
+        collector.add(currentStrategy);
+    }
+    currentFormatField= null;
+    strategies= collector.toArray(new Strategy[collector.size()]);
+    parsePattern= Pattern.compile(regex.toString());
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+You're absolutely right — the `FastDateParser` in Apache Commons Lang has a flaw in how it handles **unterminated quotes** and **escaping**, which leads to unexpected behavior when parsing date formats. The issue arises from how the regular expression (`regex`) is built and how the pattern is matched.
+
+---
+
+## ✅ Problem Summary
+
+### ❌ Incorrect Behavior Example:
+
+Given:
+- Format: `'d'd'`
+- Date: `d3`
+
+This is incorrectly parsed as valid instead of throwing an error due to unterminated quotes.
+
+---
+
+## 🧠 Root Cause
+
+In `FastDateParser`, the regex engine doesn't recognize **unterminated quotes** like `'d'd'` because the string is treated as literal characters rather than a quoted field. Also, the code allows concatenation or improper parsing due to poor handling of quote boundaries.
+
+### ⚠️ Key Issues:
+1. No strict validation that each opening quote (`'`) must have a corresponding closing quote (`'`).
+2. Does not support escape sequences like `\"` within quotes.
+3. Uses `lookingAt()` instead of full match checks.
+
+---
+
+## 🔧 Proposed Fix
+
+Let's walk through the steps needed to **repair the logic** in the `init()` method so that:
+
+- Unterminated quotes throw an exception.
+- Escaped quotes are properly supported.
+- The generated regex accurately reflects the actual pattern structure.
+
+Here’s the revised version of the problematic `init()` method with proper quote management:
+
+```java
+private void init() {
+    thisYear = Calendar.getInstance(timeZone, locale).get(Calendar.YEAR);
+    nameValues = new ConcurrentHashMap<>();
+
+    StringBuilder regexBuilder = new StringBuilder();
+    List<Strategy> strategiesList = new ArrayList<>();
+    boolean inQuotes = false;
+    int quoteStartIndex = -1;
+
+    Matcher patternMatcher = formatPattern.matcher(pattern);
+    if (!patternMatcher.matches()) {
+        throw new IllegalArgumentException("Invalid pattern: unterminated quote or malformed format");
+    }
+
+    int start = 0;
+    while (start < pattern.length()) {
+        int quotePos = pattern.indexOf("'", start);
+        if (quotePos == -1) {
+            // Unterminated quote found
+            throw new IllegalArgumentException("Invalid pattern: unterminated quote at position " + start);
+        }
+
+        if (inQuotes) {
+            if (quotePos != quoteStartIndex) {
+                throw new IllegalArgumentException("Unmatched quote at position " + quotePos);
+            }
+            inQuotes = false;
+            quoteStartIndex = -1;
+        } else {
+            // Start of quoted section
+            inQuotes = true;
+            quoteStartIndex = quotePos;
+            start = quotePos + 1;
+            continue;
+        }
+
+        // Handle content between quotes
+        int endQuotePos = pattern.indexOf("'", start);
+        if (endQuotePos == -1) {
+            throw new IllegalArgumentException("Unterminated quote at position " + start);
+        }
+
+        String quotedPart = pattern.substring(start, endQuotePos);
+        String escapedQuotedPart = escapeQuotes(quotedPart);
+
+        // Build regex fragment for quoted part
+        regexBuilder.append(Pattern.quote(escapedQuotedPart));
+        start = endQuotePos + 1;
+    }
+
+    if (inQuotes) {
+        throw new IllegalArgumentException("Unterminated quote at end of pattern");
+    }
+
+    // Now process non-quoted parts using existing logic
+    Matcher patternMatcherWithoutQuotes = formatPattern.matcher(pattern);
+    if (!patternMatcherWithoutQuotes.find()) {
+        throw new IllegalArgumentException("Invalid pattern: no fields found after processing quotes");
+    }
+
+    List<String> nonQuotedFields = new ArrayList<>();
+    int lastMatchEnd = 0;
+    while (lastMatchEnd < pattern.length()) {
+        if (patternMatcherWithoutQuotes.find(lastMatchEnd)) {
+            nonQuotedFields.add(patternMatcherWithoutQuotes.group());
+            lastMatchEnd = patternMatcherWithoutQuotes.end();
+        } else {
+            break;
+        }
+    }
+
+    // Process these parts using the original `currentFormatField` and `addRegex(...)` logic
+    String remainingPattern = pattern;
+    for (String field : nonQuotedFields) {
+        String trimmedField = field.trim();
+        if (trimmedField.isEmpty()) {
+            continue;
+        }
+        // Use `getStrategy(trimmedField)` as before
+        Strategy strategy = getStrategy(trimmedField);
+        if (strategy.addRegex(this, regexBuilder)) {
+            strategiesList.add(strategy);
+        }
+    }
+
+    // Finalize
+    strategies = strategiesList.toArray(new Strategy[strategiesList.size()]);
+    parsePattern = Pattern.compile(regexBuilder.toString());
+}
+```
+
+---
+
+## 💡 Helper Method for Quote Escaping (Optional)
+
+If you want to support escaping inside quotes (e.g., `\"`), add:
+
+```java
+private String escapeQuotes(String input) {
+    StringBuilder escaped = new StringBuilder();
+    for (char c : input.toCharArray()) {
+        if (c == '"') {
+            escaped.append('\\');
+        }
+

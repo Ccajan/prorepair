@@ -1,0 +1,201 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Compiler should warn/error when instance methods are operated on
+What steps will reproduce the problem?
+1. Compile and run the following code:
+  goog.require('goog.graphics.Path');
+  function demo() {
+    var path = new goog.graphics.Path();
+    var points = [[1,1], [2,2]];
+    for (var i = 0; i < points.length; i++) {
+      (i == 0 ? path.moveTo : path.lineTo)(points[i][0], points[i][1]);
+    }
+  }
+  goog.exportSymbol('demo', demo);
+
+What is the expected output? What do you see instead?
+I expect it to either work or produce a warning.  In this case, the latter since there's an error in the javascript - when calling path.moveTo(x, y), "this" is set correctly to the path element in the moveTo function.  But when the function is operated on, as in (i == 0 ? path.moveTo : path.lineTo)(x, y), it's no longer an instance method invocation, so "this" reverts to the window object.  In this case, an error results because moveTo references a field in Path that is now "undefined".  Better would be to issue a warning/error that an instance method is being converted to a normal function (perhaps only if it references this).
+
+What version of the product are you using? On what operating system?
+Unknown (it's built into my build tools) - I presume this issue is present in all builds.  Running on ubuntu.
+
+Please provide any additional information below.
+This is an incorrect Java code (src/com/google/javascript/jscomp/TypeCheck.java):
+```java
+private void visitCall(NodeTraversal t, Node n) {
+  Node child = n.getFirstChild();
+  JSType childType = getJSType(child).restrictByNotNullOrUndefined();
+
+  if (!childType.canBeCalled()) {
+    report(t, n, NOT_CALLABLE, childType.toString());
+    ensureTyped(t, n);
+    return;
+  }
+
+  // A couple of types can be called as if they were functions.
+  // If it is a function type, then validate parameters.
+  if (childType instanceof FunctionType) {
+    FunctionType functionType = (FunctionType) childType;
+
+    boolean isExtern = false;
+    JSDocInfo functionJSDocInfo = functionType.getJSDocInfo();
+    if(functionJSDocInfo != null) {
+      String sourceName = functionJSDocInfo.getSourceName();
+      CompilerInput functionSource = compiler.getInput(sourceName);
+      isExtern = functionSource.isExtern();
+    }
+
+    // Non-native constructors should not be called directly
+    // unless they specify a return type and are defined
+    // in an extern.
+    if (functionType.isConstructor() &&
+        !functionType.isNativeObjectType() &&
+        (functionType.getReturnType().isUnknownType() ||
+         functionType.getReturnType().isVoidType() ||
+         !isExtern)) {
+      report(t, n, CONSTRUCTOR_NOT_CALLABLE, childType.toString());
+    }
+
+    // Functions with explcit 'this' types must be called in a GETPROP
+    // or GETELEM.
+
+    visitParameterList(t, n, functionType);
+    ensureTyped(t, n, functionType.getReturnType());
+  } else {
+    ensureTyped(t, n);
+  }
+
+  // TODO: Add something to check for calls of RegExp objects, which is not
+  // supported by IE.  Either say something about the return type or warn
+  // about the non-portability of the call or both.
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+To address the issue of detecting when instance methods are used as functions in JavaScript — particularly where `this` might refer to the wrong context — we need to update our JavaScript compiler's logic to properly identify **instance method calls** and ensure their usage aligns with proper object-oriented behavior.
+
+---
+
+### ✅ Problem Summary
+
+In your example:
+```javascript
+(i == 0 ? path.moveTo : path.lineTo)(x, y)
+```
+
+- This expression is *not* a valid method call because `path.moveTo` and `path.lineTo` are **methods**, not functions.
+- When the ternary operator uses `moveTo` or `lineTo`, those methods become **functions** without access to `this`.
+- The `this` value inside `moveTo`/`lineTo` becomes `window` (or another global context).
+- Since these methods rely on `this` referencing a specific instance (`Path`), a runtime error occurs.
+
+---
+
+### 🛠️ Objective
+
+We want the **compiler to detect such pattern** and:
+
+1. Warn or error when trying to use instance methods like `obj.method()` as regular function expressions `(method)(...)`.
+2. Specifically check whether the method uses `this`, and flag improper usage patterns where `this` could become undefined or invalid.
+
+---
+
+### 🔧 Fixing the Code
+
+Here's how we can modify the relevant portion of `TypeCheck.java` to fix this:
+
+```java
+private void visitCall(NodeTraversal t, Node n) {
+  Node child = n.getFirstChild();
+  JSType childType = getJSType(child).restrictByNotNullOrUndefined();
+
+  if (!childType.canBeCalled()) {
+    report(t, n, NOT_CALLABLE, childType.toString());
+    ensureTyped(t, n);
+    return;
+  }
+
+  // Check for function-like node (e.g., function expression, function declaration)
+  if (child.isFunction()) {
+    // Regular function call — nothing special here
+  } else if (child.isGetProp() || child.isBracketAccess()) {
+    // Handle property accesses
+    Node objNode = child.getFirstChild(); // The receiver of the property access
+    JSType objType = getJSType(objNode);
+
+    // Get the property name from the second child (like "moveTo")
+    Node propertyNameNode = child.getSecondChild();
+    String methodName = propertyNameNode.getString();
+
+    // Try to find the method on the object
+    MethodReceiver receiver = createMethodReceiver(objNode, methodName, objType, t.traversalContext());
+
+    // If it's an instance method that references `this`
+    if (receiver != null && receiver.hasThisReference()) {
+      // Now check the usage pattern of the method
+      if (n.isCall() && n.getParent().isTernary()) {
+        // If it's used in a ternary expression, potentially leading to incorrect 'this'
+        report(
+          t,
+          n,
+          "INSTANCE_METHOD_USED_AS_FUNCTION",
+          "Instance method '" + methodName + "' used as a function in a ternary. "
+            + "This may lead to loss of context ('this') or errors."
+        );
+        // Mark as typed if needed
+        ensureTyped(t, n);
+        return;
+      }
+    }
+  }
+
+  // A couple of types can be called as if they were functions.
+  // If it is a function type, then validate parameters.
+  if (childType instanceof FunctionType) {
+    FunctionType functionType = (FunctionType) childType;
+
+    boolean isExtern = false;
+    JSDocInfo functionJSDocInfo = functionType.getJSDocInfo();
+    if (functionJSDocInfo != null) {
+      String sourceName = functionJSDocInfo.getSourceName();
+      CompilerInput functionSource = compiler.getInput(sourceName);
+      isExtern = functionSource.isExtern();
+    }
+
+    // Non-native constructors should not be called directly
+    // unless they specify a return type and are defined
+    // in an extern.
+    if (functionType.isConstructor() &&
+        !functionType.isNativeObjectType() &&
+        (functionType.getReturnType().isUnknownType() ||
+         functionType.getReturnType().isVoidType() ||
+         !isExtern)) {
+      report(t, n, CONSTRUCTOR_NOT_CALLABLE, childType.toString());
+    }
+
+    // Functions with explicit 'this' types must be called in a GETPROP
+    // or GETELEM.
+
+    visitParameterList(t, n, functionType);
+    ensureTyped(t, n, functionType.getReturnType());
+  } else {
+    ensureTyped(t, n);
+  }
+
+  // TODO: Add something to check for calls of RegExp objects, which is not
+  // supported by IE.  Either say something about the return type or warn
+  // about the non-portability of the call or both.
+}
+```
+
+---
+
+### ✅ Benefits of the Fix
+
+- Detects **instance methods used incorrectly** as

@@ -1,0 +1,179 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Problem with Object Id and Type Id as Wrapper Object (regression in 2.5.1)
+(note: originally from FasterXML/jackson-module-jaxb-annotations#51)
+Looks like fix for #669 caused a regression for the special use case of combining type and object ids, with wrapper-object type id inclusion. The problem started with 2.5.1.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/jsontype/impl/AsWrapperTypeDeserializer.java):
+```java
+private final Object _deserialize(JsonParser p, DeserializationContext ctxt) throws IOException
+{
+    // 02-Aug-2013, tatu: May need to use native type ids
+    if (p.canReadTypeId()) {
+        Object typeId = p.getTypeId();
+        if (typeId != null) {
+            return _deserializeWithNativeTypeId(p, ctxt, typeId);
+        }
+    }
+    // first, sanity checks
+    if (p.getCurrentToken() != JsonToken.START_OBJECT) {
+        throw ctxt.wrongTokenException(p, JsonToken.START_OBJECT,
+                "need JSON Object to contain As.WRAPPER_OBJECT type information for class "+baseTypeName());
+    }
+        // should always get field name, but just in case...
+        if (p.nextToken() != JsonToken.FIELD_NAME) {
+            throw ctxt.wrongTokenException(p, JsonToken.FIELD_NAME,
+                    "need JSON String that contains type id (for subtype of "+baseTypeName()+")");
+        }
+    final String typeId = p.getText();
+    JsonDeserializer<Object> deser = _findDeserializer(ctxt, typeId);
+    p.nextToken();
+
+    // Minor complication: we may need to merge type id in?
+    if (_typeIdVisible && p.getCurrentToken() == JsonToken.START_OBJECT) {
+        // but what if there's nowhere to add it in? Error? Or skip? For now, skip.
+        TokenBuffer tb = new TokenBuffer(null, false);
+        tb.writeStartObject(); // recreate START_OBJECT
+        tb.writeFieldName(_typePropertyName);
+        tb.writeString(typeId);
+        p = JsonParserSequence.createFlattened(tb.asParser(p), p);
+        p.nextToken();
+    }
+    
+    Object value = deser.deserialize(p, ctxt);
+    // And then need the closing END_OBJECT
+    if (p.nextToken() != JsonToken.END_OBJECT) {
+        throw ctxt.wrongTokenException(p, JsonToken.END_OBJECT,
+                "expected closing END_OBJECT after type information and deserialized value");
+    }
+    return value;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+Certainly! Let me walk through the issue and then provide a corrected version of the `AsWrapperTypeDeserializer._deserialize()` method.
+
+---
+
+## 🧠 Understanding the Issue
+
+The key issue lies in **how the `AsWrapperTypeDeserializer` handles type and object IDs** when both are used together — specifically when using:
+
+- `@JsonFormat(shape = Shape.OBJECT)` to wrap data into an object
+- `@JsonTypeInfo(use = Id.NAME, include = As.WRAPPER_OBJECT)` for type information
+- `@JsonTypeIdInclusion(include = As.WRAPPER_OBJECT)` or similar to include the type ID
+
+The original implementation (especially starting from Jackson 2.5.1) had a **regression** where:
+
+- When **both type and object IDs** were present in the same object, the type ID was not properly processed during deserialization.
+- It incorrectly attempted to **recreate the entire JSON object**, including inserting the type ID manually into a token buffer, which led to **wrong behavior**, especially in cases where the parser already contained correct type information.
+
+---
+
+## ✅ Goal
+
+We want to ensure:
+1. We can correctly extract the **type ID** from the JSON when needed.
+2. Handle the **wrapper object pattern** without corrupting or overwriting existing structure.
+3. Ensure **correct parsing order**: read type info first → parse rest of the content.
+
+---
+
+## 🔧 Suggested Fix
+
+Here’s a **refactored and corrected** version of the `_deserialize` method. This version ensures the token stream flows naturally and avoids redundant re-parsing or token buffering unless necessary.
+
+### ✅ Fixed Code
+
+```java
+private final Object _deserialize(JsonParser p, DeserializationContext ctxt) throws IOException {
+    // First check if native type ID is available (from annotations)
+    if (p.canReadTypeId()) {
+        Object typeId = p.getTypeId();
+        if (typeId != null) {
+            return _deserializeWithNativeTypeId(p, ctxt, typeId);
+        }
+    }
+
+    // Check current token — must be an OBJECT
+    if (p.getCurrentToken() != JsonToken.START_OBJECT) {
+        throw ctxt.wrongTokenException(p, JsonToken.START_OBJECT,
+                "need JSON Object to contain As.WRAPPER_OBJECT type information for class " + baseTypeName());
+    }
+
+    // Step 1: Look for type ID inside the object
+    boolean foundTypeId = false;
+
+    // Parse tokens while looking for type id
+    while (true) {
+        switch (p.nextToken()) {
+            case FIELD_NAME:
+                String fieldName = p.getCurrentName();
+                if (_typePropertyName.equals(fieldName)) {
+                    foundTypeId = true;
+                    String typeIdStr = p.getValueAsString();
+                    break; // leave loop and continue processing
+                }
+                // Otherwise, keep going
+                continue;
+            case VALUE_STRING:
+                // Shouldn't happen here since type ID is expected as a string
+                throw ctxt.wrongTokenException(p, JsonToken.FIELD_NAME,
+                        "Unexpected value token at type ID location");
+            case START_OBJECT:
+                // Possibly nested type information? Not sure how this would fit here.
+                // Skip for now, could lead to infinite loops if unbounded
+                p.skipChildren();
+                continue;
+            case END_OBJECT:
+                if (!foundTypeId) {
+                    throw ctxt.wrongTokenException(p, JsonToken.FIELD_NAME,
+                            "Missing required type ID field: " + _typePropertyName);
+                }
+                return null; // End of object reached without finding type ID
+            default:
+                // Any other token: assume we've consumed everything else
+                if (!foundTypeId) {
+                    throw ctxt.wrongTokenException(p, JsonToken.FIELD_NAME,
+                            "Missing required type ID field: " + _typePropertyName);
+                }
+                return null;
+        }
+    }
+
+    // Now process the actual object content after the type ID
+    p.nextToken(); // Move past the value (the type ID)
+
+    // Find and invoke appropriate deserializer based on type ID
+    JsonDeserializer<Object> deser = _findDeserializer(ctxt, typeIdStr);
+
+    // Deserialize main object
+    Object result = deser.deserialize(p, ctxt);
+
+    // Final check: ensure end object token exists
+    if (p.nextToken() != JsonToken.END_OBJECT) {
+        throw ctxt.wrongTokenException(p, JsonToken.END_OBJECT,
+                "Expected closing END_OBJECT after deserializing object content");
+    }
+
+    return result;
+}
+```
+
+---
+
+## 💡 Key Fixes & Improvements
+
+| Problem | Fix |
+|--------|-----|
+| Incorrect handling of token flow | Used a more robust while loop to locate the type ID |
+| Possible skipping / misreading of type ID | Ensured `typeIdStr` was captured before continuing parsing |
+| Overuse of token buffer (`TokenBuffer`) | Avoided unnecessary buffer creation, simplifying the parser state |
+| Potential errors due to malformed input | Added clearer error handling and validation |
+| Regression in v2.5.

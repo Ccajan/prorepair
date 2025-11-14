@@ -1,0 +1,224 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Too relaxed tar detection in ArchiveStreamFactory
+The relaxed tar detection logic added in COMPRESS-117 unfortunately matches also some non-tar files like a test AIFF file that Apache Tika uses. It would be good to improve the detection heuristics to still match files like the one in COMPRESS-117 but avoid false positives like the AIFF file in Tika.
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/ArchiveStreamFactory.java):
+```java
+public ArchiveInputStream createArchiveInputStream(final InputStream in)
+        throws ArchiveException {
+    if (in == null) {
+        throw new IllegalArgumentException("Stream must not be null.");
+    }
+
+    if (!in.markSupported()) {
+        throw new IllegalArgumentException("Mark is not supported.");
+    }
+
+    final byte[] signature = new byte[12];
+    in.mark(signature.length);
+    try {
+        int signatureLength = in.read(signature);
+        in.reset();
+        if (ZipArchiveInputStream.matches(signature, signatureLength)) {
+            return new ZipArchiveInputStream(in);
+        } else if (JarArchiveInputStream.matches(signature, signatureLength)) {
+            return new JarArchiveInputStream(in);
+        } else if (ArArchiveInputStream.matches(signature, signatureLength)) {
+            return new ArArchiveInputStream(in);
+        } else if (CpioArchiveInputStream.matches(signature, signatureLength)) {
+            return new CpioArchiveInputStream(in);
+        }
+
+        // Dump needs a bigger buffer to check the signature;
+        final byte[] dumpsig = new byte[32];
+        in.mark(dumpsig.length);
+        signatureLength = in.read(dumpsig);
+        in.reset();
+        if (DumpArchiveInputStream.matches(dumpsig, signatureLength)) {
+            return new DumpArchiveInputStream(in);
+        }
+
+        // Tar needs an even bigger buffer to check the signature; read the first block
+        final byte[] tarheader = new byte[512];
+        in.mark(tarheader.length);
+        signatureLength = in.read(tarheader);
+        in.reset();
+        if (TarArchiveInputStream.matches(tarheader, signatureLength)) {
+            return new TarArchiveInputStream(in);
+        }
+        // COMPRESS-117 - improve auto-recognition
+        if (signatureLength >= 512) {
+            try {
+                TarArchiveInputStream tais = new TarArchiveInputStream(new ByteArrayInputStream(tarheader));
+                // COMPRESS-191 - verify the header checksum
+                tais.getNextEntry();
+                    return new TarArchiveInputStream(in);
+            } catch (Exception e) { // NOPMD
+                // can generate IllegalArgumentException as well
+                // as IOException
+                // autodetection, simply not a TAR
+                // ignored
+            }
+        }
+    } catch (IOException e) {
+        throw new ArchiveException("Could not use reset and mark operations.", e);
+    }
+
+    throw new ArchiveException("No Archiver found for the stream signature");
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+
+public class ImprovedArchiveStreamFactory {
+    public static void main(String[] args) {
+        try (InputStream testInput = TestUtils.createTestInputStream(TestUtils.AIFF, "audio/x-aiff", "aiff audio file")) {
+            InputStream wrappedInput = wrapWithDetection(testInput);
+
+            if (!(wrappedInput instanceof ArArchiveInputStream)) {
+                System.out.println("Error: AIFF file detected as an Ar archive instead of an audio format.");
+            }
+        } catch (IOException e) {
+            System.out.println("An I/O error occurred during testing: " + e.getMessage());
+        }
+    }
+
+    private static InputStream wrapWithDetection(InputStream input) throws IOException {
+        final byte[] signature = new byte[512];
+        int signatureLength = input.read(signature);
+
+        if (signatureLength > 0 && TarArchiveInputStream.matches(signature, signatureLength)) {
+            return new TarArchiveInputStream(input);
+        }
+
+        if (signatureLength > 0 && DumpArchiveInputStream.matches(signature, signatureLength)) {
+            return new DumpArchiveInputStream(input);
+        }
+
+        if (signatureLength > 0 && ArArchiveInputStream.matches(signature, signatureLength)) {
+            return new ArArchiveInputStream(input);
+        }
+
+        if (signatureLength > 0 && CpioArchiveInputStream.matches(signature, signatureLength)) {
+            return new CpioArchiveInputStream(input);
+        }
+
+        if (signatureLength > 0 && JarArchiveInputStream.matches(signature, signatureLength)) {
+            return new JarArchiveInputStream(input);
+        }
+
+        if (signatureLength > 0 && ZipArchiveInputStream.matches(signature, signatureLength)) {
+            return new ZipArchiveInputStream(input);
+        }
+
+        // If none of the above conditions are met, we can conclude that it's not a recognized archive type
+        // Returning the original input stream will cause an exception in ArchiveStreamFactory.createArchiveInputStream
+        return input;
+    }
+}
+```
+assistant
+```java
+package org.apache.commons.compress.archivers.tar;
+
+import java.io.EOFException;
+import java.io.FilterInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+
+/**
+ * Wraps an existing {@link InputStream} and checks its contents against a set
+ * of known archive signatures. This class cannot detect all types of archives,
+ * but is able to reliably differentiate between TAR files and other kinds of
+ * streams.
+ */
+public final class RelaxedTarInputStream extends FilterInputStream {
+
+    /**
+     * The size of a TAR entry header in bytes.
+     */
+    private static final int TAR_ENTRY_HEADER_SIZE = 512;
+
+    /**
+     * A buffer used for reading data from the underlying stream.
+     */
+    private final byte[] buffer = new byte[TAR_ENTRY_HEADER_SIZE];
+
+    /**
+     * The current offset within the buffer.
+     */
+    private int offset = 0;
+
+    /**
+     * Constructs a new instance with the specified input stream.
+     *
+     * @param inputStream the input stream to be wrapped
+     * @throws NullPointerException if the input stream is {@code null}
+     */
+    public RelaxedTarInputStream(InputStream inputStream) throws NullPointerException {
+        super(checkNotNull(inputStream));
+    }
+
+    /**
+     * Skips the next entry in the archive, ignoring any errors that occur.
+     */
+    public void skipNextEntry() {
+        try {
+            long recordSize = getRecordSize();
+
+            while (recordSize > 0) {
+                if (in.read(buffer, 0, (int) Math.min(recordSize, buffer.length)) < 0) {
+                    break;
+                }
+                recordSize -= buffer.length;
+            }
+        } catch (IOException ex) {
+            // Ignore and proceed to the next entry
+        }
+    }
+
+    /**
+     * Gets the size of the next entry in the archive.
+     *
+     * @return the size of the next entry
+     */
+    public long getNextEntrySize() {
+        String sizeField = new String(buffer, offset + 124, 12);
+
+        try {
+            return Long.parseLong(sizeField.trim());
+        } catch (NumberFormatException ex) {
+            return 0;
+        }
+    }
+
+    /**
+     * Determines the size of a TAR record based on its contents.
+     *
+     * @return the size of the current TAR record
+     * @throws EOFException         if the end of the input stream is reached
+     * @throws IOException           if an I/O error occurs
+     * @throws IllegalStateException if the current position in the buffer is invalid
+     */
+    public long getRecordSize() throws EOFException, IOException, IllegalStateException {
+        ensureValidOffset();
+
+        if (!isHeaderEndOfFile()) {
+            return TAR_ENTRY_HEADER_SIZE;
+        }
+
+        long recordSize = 0;
+        boolean zeroBlockFound = false;
+
+        while (true) {
+            if (readBlock() < 0) {
+                if (zeroBlockFound) {
+                    return record

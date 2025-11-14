@@ -1,0 +1,145 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Missing type checks when using polymorphic type ids
+(report by Lukes Euler)
+JavaType supports limited amount of generic typing for textual representation, originally just to support typing needed for EnumMap (I think). Based on some reports, it appears that some of type compatibility checks are not performed in those cases; if so, they should be made since there is potential for abuse.
+The problem here although actual type assignment will fail later on, ability to trigger some of processing (instantiation of incompatible classes, perhaps assingnment of properties) may itself be vulnerability.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/jsontype/impl/ClassNameIdResolver.java):
+```java
+protected JavaType _typeFromId(String id, DatabindContext ctxt) throws IOException
+{
+    /* 30-Jan-2010, tatu: Most ids are basic class names; so let's first
+     *    check if any generics info is added; and only then ask factory
+     *    to do translation when necessary
+     */
+    TypeFactory tf = ctxt.getTypeFactory();
+    if (id.indexOf('<') > 0) {
+        // note: may want to try combining with specialization (esp for EnumMap)?
+        // 17-Aug-2017, tatu: As per [databind#1735] need to ensure assignment
+        //    compatibility -- needed later anyway, and not doing so may open
+        //    security issues.
+        JavaType t = tf.constructFromCanonical(id);
+            // Probably cleaner to have a method in `TypeFactory` but can't add in patch
+        return t;
+    }
+    Class<?> cls;
+    try {
+        cls =  tf.findClass(id);
+    } catch (ClassNotFoundException e) {
+        // 24-May-2016, tatu: Ok, this is pretty ugly, but we should always get
+        //   DeserializationContext, just playing it safe
+        if (ctxt instanceof DeserializationContext) {
+            DeserializationContext dctxt = (DeserializationContext) ctxt;
+            // First: we may have problem handlers that can deal with it?
+            return dctxt.handleUnknownTypeId(_baseType, id, this, "no such class found");
+        }
+        // ... meaning that we really should never get here.
+        return null;
+    } catch (Exception e) {
+        throw new IllegalArgumentException("Invalid type id '"+id+"' (for id type 'Id.class'): "+e.getMessage(), e);
+    }
+    return tf.constructSpecializedType(_baseType, cls);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+Certainly! The issue described relates to **incorrect handling of generic types** via polymorphic type IDs (`@JsonTypeInfo`) in Jackson's deserialization mechanism.
+
+---
+
+## ✅ Summary of the Problem:
+
+In the given method `_typeFromId`, when the ID string contains `<` characters (indicating a parameterized type), the method uses:
+
+```java
+tf.constructFromCanonical(id);
+```
+
+This line attempts to create a `JavaType` from a full type string like `"com.example.MyClass<java.lang.String>"`. However, this approach **does not perform proper type safety checks**, potentially allowing unsafe or incorrect assignments, which could lead to:
+
+- **Incorrect instantiation** of unrelated classes,
+- **Security risks** due to possible injection attacks,
+- **Unintended type conversions**, which may cause subtle bugs during deserialization.
+
+Jackson's `constructFromCanonical()` method does not verify whether the resulting type is actually compatible with the expected base type, especially when used in conjunction with `@JsonTypeInfo`.
+
+---
+
+## 🛠️ Solution Overview:
+
+We need to **enforce proper type compatibility** when constructing `JavaType` instances from canonical strings derived from polymorphic type IDs.
+
+### 💡 Key Steps:
+1. Use `TypeFactory`'s built-in methods to safely construct generic types.
+2. Ensure that the constructed type is **assignable from the base type**.
+3. Validate that the constructed type doesn’t violate type system constraints.
+
+---
+
+## 🔧 Fixed Code (with Explanation):
+
+Here’s a revised version of the problematic block:
+
+```java
+if (id.indexOf('<') > 0) {
+    // Extract base class name before generic parameters
+    String[] parts = id.split("<", 2);  // Split into [BaseClass, GenericParams]
+    String baseTypeName = parts[0].trim();
+
+    try {
+        // Find base class
+        Class<?> baseClass = tf.findClass(baseTypeName);
+
+        // Construct the full type including generics
+        JavaType type = tf.constructFromCanonical(id);
+
+        // Enforce assignment compatibility
+        if (!type.isAssignableFrom(_baseType)) {
+            throw new IllegalArgumentException(
+                String.format("Type '%s' is not assignable from base type '%s'", 
+                              type.toString(), _baseType.toString()));
+        }
+
+        return type;
+
+    } catch (ClassNotFoundException e) {
+        // Handle unknown class as before
+        if (ctxt instanceof DeserializationContext) {
+            DeserializationContext dctxt = (DeserializationContext) ctxt;
+            return dctxt.handleUnknownTypeId(_baseType, id, this, "no such class found");
+        }
+        return null;
+    } catch (Exception e) {
+        throw new IllegalArgumentException("Invalid type id '" + id +
+                                           "' (for id type 'Id.class'): " + e.getMessage(), e);
+    }
+}
+```
+
+---
+
+## ✅ Why This Fix Works:
+
+- It explicitly splits the type string into **base class** and **generic arguments**.
+- Uses `findClass()` to validate that the base class exists.
+- Uses `constructFromCanonical()` to handle complex generics.
+- Performs a safety check: `isAssignableFrom(_baseType)` ensures that the constructed type is compatible with the known base type.
+- Prevents arbitrary class creation and mitigates potential security risks.
+
+---
+
+## 📌 Additional Considerations:
+
+- If your use case involves **custom type resolution logic** (like custom `TypeIdResolver`), make sure you still perform these compatibility checks at all points where the type is instantiated.
+- In production, consider wrapping `constructFromCanonical()` calls with a validation layer to prevent malformed input from causing unexpected behavior.
+
+---
+
+If you’d like, I can also provide a more generalized version that works within a broader Jackson integration context (e.g., using `@JsonTypeInfo`). Let me know!

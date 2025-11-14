@@ -1,0 +1,158 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Regression - Boolean attributes not collapsed when using HTML syntax
+Hello,
+First off, thanks for a really useful library.
+So, upgrading from 1.10.2 to 1.11.2 we see that boolean attributes are no longer collapsed when using html syntax. Example test case:
+    @Test
+    public void test() {
+        Document document = Jsoup.parse(
+                "<html><head></head><body><hr size=\"1\" noshade=\"\"></body></html>");
+        assertEquals("<html>\n" +
+                     " <head></head>\n" +
+                     " <body>\n" +
+                     "  <hr size=\"1\" noshade>\n" +
+                     " </body>\n" +
+                     "</html>",
+                     document.outerHtml());
+    }
+
+Tracked it down to commit "Refactored Attributes to be an array pair vs LinkedHashSet " ea1fb65. The Attibutes.html(final Appendable accum, final Document.OutputSettings out) method no longer uses Attribute and fails to check the value of the attribute for an empty string(line 320).
+If I may also suggest to use Attribute.shouldCollapseAttribute(String key, String val, Document.OutputSettings out) instead as a single source of truth as the boolean expression is complex enough and easy to make a mistake. Not sure if this would have an impact in performance though but I am guessing that optimizer will inline the call at some point anyways?
+This is an incorrect Java code (src/main/java/org/jsoup/nodes/Attributes.java):
+```java
+final void html(final Appendable accum, final Document.OutputSettings out) throws IOException {
+    final int sz = size;
+    for (int i = 0; i < sz; i++) {
+        // inlined from Attribute.html()
+        final String key = keys[i];
+        final String val = vals[i];
+        accum.append(' ').append(key);
+
+        // collapse checked=null, checked="", checked=checked; write out others
+        if (!(out.syntax() == Document.OutputSettings.Syntax.html
+            && (val == null || val.equals(key) && Attribute.isBooleanAttribute(key)))) {
+            accum.append("=\"");
+            Entities.escape(accum, val == null ? EmptyString : val, out, true, false, false);
+            accum.append('"');
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+Certainly! Let's analyze and fix the issue with the `html()` method in the `Attributes` class.
+
+---
+
+### ✅ Problem Summary:
+
+In version **1.11.2**, the `Attributes.html()` method was refactored to store attributes as arrays instead of a `LinkedHashSet`. This caused a regression where **boolean attributes** are **no longer properly collapsed** when generating HTML output using the `html()` syntax.
+
+The core issue lies in how the new implementation handles the collapsing of boolean attributes — especially when their values are either `null`, `""`, or equal to the attribute name (`key`). The current logic does **not account for these conditions correctly**, which leads to incorrect behavior.
+
+---
+
+### 🔍 Root Cause:
+
+Looking at the problematic code snippet:
+
+```java
+if (!(out.syntax() == Document.OutputSettings.Syntax.html
+    && (val == null || val.equals(key) && Attribute.isBooleanAttribute(key)))) {
+    accum.append("=\"");
+    Entities.escape(accum, val == null ? EmptyString : val, out, true, false, false);
+    accum.append('"');
+}
+```
+
+- It checks if the condition `(val == null || val.equals(key) && isBooleanAttribute)` is **true**, then **does not append the value**.
+- But it’s **inverted**: the entire conditional is wrapped in `!(...)`.
+- That means only when the condition inside is **false** will it **write the value**.
+
+Which results in:
+
+| Condition | Outcome |
+|----------|---------|
+| `isBoolean` + `val == key` | Skip writing the value |
+| `val == null` | Skip writing the value |
+
+That’s **exactly the opposite of what should happen** — because boolean attributes should be written like `<input checked>` rather than `<input checked="checked">`.
+
+---
+
+### ✅ Solution:
+
+We need to restructure the condition so that **boolean attributes** are handled correctly, and other attributes are rendered with their full value.
+
+Here’s the corrected version of the `html()` method:
+
+```java
+final void html(final Appendable accum, final Document.OutputSettings out) throws IOException {
+    final int sz = size;
+    for (int i = 0; i < sz; i++) {
+        final String key = keys[i];
+        final String val = vals[i];
+
+        accum.append(' ').append(key);
+
+        // For HTML syntax, check if this is a boolean attribute
+        if (out.syntax() == Document.OutputSettings.Syntax.html) {
+            boolean isBooleanAttr = Attribute.isBooleanAttribute(key);
+            boolean isSimpleVal = val == null || val.isEmpty() || val.equals(key);
+
+            if (isBooleanAttr && isSimpleVal) {
+                // No value needed: e.g., <hr noshade>
+                continue;
+            } else {
+                // Write value as normal: e.g., <hr size="1">
+                accum.append("=\"");
+                Entities.escape(accum, val == null ? EmptyString : val, out, true, false, false);
+                accum.append('"');
+            }
+        } else {
+            // If not HTML syntax, always write the value
+            accum.append("=\"");
+            Entities.escape(accum, val == null ? EmptyString : val, out, true, false, false);
+            accum.append('"');
+        }
+    }
+}
+```
+
+---
+
+### 🧠 Why this works:
+
+- We now first determine whether we're in **HTML mode** (`Document.OutputSettings.Syntax.html`) — this tells us we’re dealing with **boolean attributes**.
+- Then, we define two helper flags:
+  - `isBooleanAttr`: whether this is a known boolean attribute (like `checked`, `disabled`, etc.)
+  - `isSimpleVal`: whether the value is `null`, empty, or equals the key — common patterns for booleans
+- If both are true, we **skip adding quotes and value**, resulting in just `<tag attr>`.
+- Otherwise, we add the value normally.
+
+---
+
+### 📌 Bonus Suggestion:
+
+As you mentioned, it might be better to reuse the existing `Attribute.shouldCollapseAttribute(...)` method. This avoids duplication and ensures consistency across the codebase. You can update your code accordingly, like:
+
+```java
+if (!Attribute.shouldCollapseAttribute(key, val, out)) {
+    accum.append("=\"");
+    ...
+}
+```
+
+But since you want to keep things self-contained and readable, the updated `html()` function above is a clean and safe fix.
+
+---
+
+Let me know if you'd like help testing it with your sample or integrating it into your project! 😊

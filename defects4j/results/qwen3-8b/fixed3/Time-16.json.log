@@ -1,0 +1,126 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# #148 DateTimeFormatter.parseInto broken when no year in format
+In Joda Time 2.0, the default year was set to 2000 so that Feb 29 could be parsed correctly. However, parseInto now overwrites the given instant's year with 2000 (or whatever iDefaultYear is set to). The correct behavior would seem to be to use the given instant's year instead of iDefaultYear.
+This does mean that Feb 29 might not be parseable if the instant's year is not a leap year, but in this case the caller asked for that in a sense.
+This is an incorrect Java code (src/main/java/org/joda/time/format/DateTimeFormatter.java):
+```java
+public int parseInto(ReadWritableInstant instant, String text, int position) {
+    DateTimeParser parser = requireParser();
+    if (instant == null) {
+        throw new IllegalArgumentException("Instant must not be null");
+    }
+    
+    long instantMillis = instant.getMillis();
+    Chronology chrono = instant.getChronology();
+    long instantLocal = instantMillis + chrono.getZone().getOffset(instantMillis);
+    chrono = selectChronology(chrono);
+    
+    DateTimeParserBucket bucket = new DateTimeParserBucket(
+        instantLocal, chrono, iLocale, iPivotYear, iDefaultYear);
+    int newPos = parser.parseInto(bucket, text, position);
+    instant.setMillis(bucket.computeMillis(false, text));
+    if (iOffsetParsed && bucket.getOffsetInteger() != null) {
+        int parsedOffset = bucket.getOffsetInteger();
+        DateTimeZone parsedZone = DateTimeZone.forOffsetMillis(parsedOffset);
+        chrono = chrono.withZone(parsedZone);
+    } else if (bucket.getZone() != null) {
+        chrono = chrono.withZone(bucket.getZone());
+    }
+    instant.setChronology(chrono);
+    if (iZone != null) {
+        instant.setZone(iZone);
+    }
+    return newPos;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+The issue described in **Joda-Time issue #148** highlights a problem with the `parseInto` method in the `DateTimeFormatter` class. Specifically, it modifies the given `instant`'s year with `iDefaultYear`, even though the original intent may have been to respect the provided `instant`'s year.
+
+### ✅ Summary of the Problem:
+- When parsing date/time strings using `parseInto`, the code incorrectly sets the `instant`'s year to `iDefaultYear`.
+- This overrides any year already present in the input `instant`.
+- This breaks compatibility with scenarios where the input has a specific year and expects it to remain unchanged.
+- The concern is about **February 29**, which can only occur in leap years—so using `iDefaultYear=2000` always makes it valid, regardless of whether the actual year is a leap year or not.
+
+---
+
+### 🛠️ Solution
+
+To fix this, we need to:
+
+1. Respect the existing year from the `instant` when it’s available.
+2. Only apply the `iDefaultYear` if there is **no year in the input string** being parsed.
+
+We should modify the part where the year is updated:
+
+#### ❌ Original Code (Incorrect)
+```java
+instant.setMillis(bucket.computeMillis(false, text));
+```
+
+#### ✅ Corrected Code
+```java
+long computedMillis = bucket.computeMillis(false, text);
+
+// If the original instant had a defined year, preserve it
+if (instant instanceof LocalDateTime || instant instanceof LocalDateTime) {
+    // Get the year from the original instant
+    int originalYear = ((LocalDateTime) instant).getYear(); // Or use proper type checking
+    // Compute the year from the parsed result
+    int parsedYear = (int) (computedMillis / MILLIS_PER_YEAR % YEAR_MASK);
+
+    // If the original instant had a year and the parsed one is different,
+    // update the computedMillis to match the original year
+    if (originalYear != parsedYear) {
+        computedMillis = computeMillisWithYear(computedMillis, originalYear);
+    }
+}
+
+instant.setMillis(computedMillis);
+```
+
+> 💡 Note: You will likely need to implement a helper function like `computeMillisWithYear(long millis, int year)` that calculates the time at a specific year while preserving other fields like month, day, hour, etc.
+
+---
+
+### 🔧 Suggested Helper Function
+
+Here’s an example of how you could implement `computeMillisWithYear`:
+
+```java
+private static final long MILLIS_PER_YEAR = 365L * 24 * 60 * 60 * 1000;
+
+/**
+ * Sets the year of the given millisecond timestamp while keeping all other
+ * fields intact.
+ */
+private static long computeMillisWithYear(long millis, int year) {
+    // Parse the original datetime into a LocalDate
+    LocalDate localDate = LocalDate.fromEpochDay((millis + 86400000L) / 86400000L);
+    
+    // Set the new year
+    localDate = localDate.withYear(year);
+    
+    // Convert back to milliseconds
+    return (localDate.toEpochDay() - 86400000L) * 86400000L;
+}
+```
+
+> ⚠️ Make sure to handle daylight saving transitions, time zones, etc., based on your application requirements.
+
+---
+
+### ✅ Final Thoughts
+
+This change allows users who provide an `instant` with a known year to retain that value during parsing. It still supports the fallback behavior of using `iDefaultYear` for cases where no year is specified, but only **when necessary**—which aligns more closely with expected usage patterns and avoids unexpected behavior.
+
+If you're working directly with the source code of Joda-Time, consider submitting a **pull request** with these changes and tests to address this bug officially.

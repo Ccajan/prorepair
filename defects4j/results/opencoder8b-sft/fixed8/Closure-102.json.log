@@ -1,0 +1,178 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# compiler assumes that 'arguments' can be shadowed
+The code:
+function name() {
+   var arguments = Array.prototype.slice.call(arguments, 0);
+}
+
+gets compiled to:
+function name(){ var c=Array.prototype.slice.call(c,0); }
+
+Thanks to tescosquirrel for the report.
+This is an incorrect Java code (src/com/google/javascript/jscomp/Normalize.java):
+```java
+public void process(Node externs, Node root) {
+  NodeTraversal.traverse(compiler, root, this);
+  if (MAKE_LOCAL_NAMES_UNIQUE) {
+    MakeDeclaredNamesUnique renamer = new MakeDeclaredNamesUnique();
+    NodeTraversal t = new NodeTraversal(compiler, renamer);
+    t.traverseRoots(externs, root);
+  }
+  removeDuplicateDeclarations(root);
+  new PropogateConstantAnnotations(compiler, assertOnChange)
+      .process(externs, root);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import com.google.common.base.Preconditions;
+import com.google.common.collect.HashMultimap;
+import com.google.common.collect.Multimap;
+import com.google.javascript.jscomp.AbstractCompiler;
+import com.google.javascript.jscomp.JSClosureException;
+import com.google.javascript.rhino.Node;
+import com.google.javascript.rhino.Token;
+
+public class Normalize {
+
+  public static boolean isExpressionClosureCall(Node node) {
+    return node.isFunction()
+        && node.getParent().isExprResult()
+        && node.getParent().getParent().isBlock();
+  }
+
+  public void process(Node externs, Node root) {
+    NodeTraversal.traverse(compiler, root, this);
+    if (MAKE_LOCAL_NAMES_UNIQUE) {
+      Preconditions.checkState(null != compiler);
+      MakeDeclaredNamesUnique renamer =
+          new MakeDeclaredNamesUnique(compiler, true);
+      NodeTraversal t = new NodeTraversal(compiler, renamer);
+      t.traverseRoots(externs, root);
+    }
+    removeDuplicateDeclarations(root);
+    new PropogateConstantAnnotations(compiler, assertOnChange)
+        .process(externs, root);
+  }
+
+  private AbstractCompiler compiler;
+  private final boolean MAKE_LOCAL_NAMES_UNIQUE;
+  private final boolean assertOnChange;
+
+  public Normalize(AbstractCompiler compiler, boolean uniqueNames, boolean assertOnChange) {
+    this.compiler = compiler;
+    this.MAKE_LOCAL_NAMES_UNIQUE = uniqueNames;
+    this.assertOnChange = assertOnChange;
+  }
+  
+  public void visitFunctionName(Node function) {
+    String originalName = function.getString();
+    String newName = CompilerDeps.findUniqueSafeName(originalName);
+
+    if (!originalName.equals(newName)) {
+      function.setToken(Token.NAME);
+      function.setString(newName);
+    }
+  }
+}
+
+class MakeDeclaredNamesUnique extends ScopedCallback implements Callback {
+
+  protected MakeDeclaredNamesUnique(AssignVariables compiler, boolean assertOnChange) {
+    super(compiler, assertOnChange);
+  }
+
+  @Override
+  public boolean shouldTraverse(Node n, Node parent) {
+    return n.getType() == Token.FUNCTION || parent.getType() == Token.FUNCTION ||
+           parent.getType() == Token.LABEL_NAME;
+  }
+
+  @Override
+  public void traverseScope(Scope s) {
+    Multimap<String, Node> allBindingsByName = HashMultimap.create();
+
+    // Walk through all bindings in scope...
+    for (String ident : s.getOwnIdentifiers()) {
+      Node binding = s.getLocalDeclaration(ident);
+      if (binding != null) {
+        allBindingsByName.put(ident, binding);
+      }
+    }
+
+    for (Node binding : allBindingsByName.values()) {
+      if (binding != null && binding.getParent() != null) {
+        tryRenameBinding(allBindingsByName, binding, s.getName());
+      }
+    }
+  }
+  
+  /**
+   * Attempts to rename one of the nodes bound to the given name.
+   */
+  protected void tryRenameBinding(
+      Multimap<String, Node> allBindingsByName,
+      Node binding,
+      String origVar) {
+    Preconditions.checkArgument(origVar != null);
+
+    for (Node oldBinding : allBindingsByName.get(origVar)) {
+      Preconditions.checkNotNull(oldBinding);
+      
+      Node grandparent = oldBinding.getParent();
+      Preconditions.checkNotNull(grandparent);
+
+      if (!oldBinding.getParent().isStatement() &&
+          !oldBinding.getParent().getType() == Token.ASSIGN &&
+          !oldBinding.getParent().getType() == Token.EXPR_RESULT ) {
+        continue;
+      }
+      
+      String safeVar = findUniqueSafeName(origVar);
+      
+      oldBinding.setString(safeVar);
+    }
+  }
+
+  /**
+   * Finds a unique version of "name" that won't cause us any problems.
+   */
+  protected static String findUniqueSafeName(String name) {
+    return CompilerDeps.findUniqueSafeName(name);
+  }
+}
+
+final class CompilerDeps {
+  private CompilerDeps() {}
+
+  static String findUniqueSafeName(final String name) {
+    int i = 1;
+    String safeName = makeUniqueSafeVariableName(i, name);
+    while (!isValidIdentifierPart(safeName)) {
+      safeName = makeUniqueSafeVariableName(++i, name);
+    }
+    return safeName;
+  }
+
+  static String makeUniqueSafeVariableName(int i, String name) {
+    return name + "$$" + Integer.toString(i);
+  }
+
+  static boolean isValidIdentifierPart(final String id) {
+    if ("Infinity".equals(id) || "-Infinity".equals(id) || "NaN".equals(id)) {
+      return false;
+    }
+    if (id.length() > MAX_SAFE_LENGTH) {
+      return false;
+    }
+    return true;
+  }
+}
+```
+

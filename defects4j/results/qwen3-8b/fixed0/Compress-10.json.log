@@ -1,0 +1,138 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Cannot Read Winzip Archives With Unicode Extra Fields
+I have a zip file created with WinZip containing Unicode extra fields. Upon attempting to extract it with org.apache.commons.compress.archivers.zip.ZipFile, ZipFile.getInputStream() returns null for ZipArchiveEntries previously retrieved with ZipFile.getEntry() or even ZipFile.getEntries(). See UTF8ZipFilesTest.patch in the attachments for a test case exposing the bug. The original test case stopped short of trying to read the entries, that's why this wasn't flagged up before. 
+The problem lies in the fact that inside ZipFile.java entries are stored in a HashMap. However, at one point after populating the HashMap, the unicode extra fields are read, which leads to a change of the ZipArchiveEntry name, and therefore a change of its hash code. Because of this, subsequent gets on the HashMap fail to retrieve the original values.
+ZipFile.patch contains an (admittedly simple-minded) fix for this problem by reconstructing the entries HashMap after the Unicode extra fields have been parsed. The purpose of this patch is mainly to show that the problem is indeed what I think, rather than providing a well-designed solution.
+The patches have been tested against revision 1210416.
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/zip/ZipFile.java):
+```java
+private void resolveLocalFileHeaderData(Map<ZipArchiveEntry, NameAndComment>
+                                        entriesWithoutUTF8Flag)
+    throws IOException {
+    // changing the name of a ZipArchiveEntry is going to change
+    // the hashcode - see COMPRESS-164
+    // Map needs to be reconstructed in order to keep central
+    // directory order
+    for (ZipArchiveEntry ze : entries.keySet()) {
+        OffsetEntry offsetEntry = entries.get(ze);
+        long offset = offsetEntry.headerOffset;
+        archive.seek(offset + LFH_OFFSET_FOR_FILENAME_LENGTH);
+        byte[] b = new byte[SHORT];
+        archive.readFully(b);
+        int fileNameLen = ZipShort.getValue(b);
+        archive.readFully(b);
+        int extraFieldLen = ZipShort.getValue(b);
+        int lenToSkip = fileNameLen;
+        while (lenToSkip > 0) {
+            int skipped = archive.skipBytes(lenToSkip);
+            if (skipped <= 0) {
+                throw new RuntimeException("failed to skip file name in"
+                                           + " local file header");
+            }
+            lenToSkip -= skipped;
+        }
+        byte[] localExtraData = new byte[extraFieldLen];
+        archive.readFully(localExtraData);
+        ze.setExtra(localExtraData);
+        offsetEntry.dataOffset = offset + LFH_OFFSET_FOR_FILENAME_LENGTH
+            + SHORT + SHORT + fileNameLen + extraFieldLen;
+
+        if (entriesWithoutUTF8Flag.containsKey(ze)) {
+            String orig = ze.getName();
+            NameAndComment nc = entriesWithoutUTF8Flag.get(ze);
+            ZipUtil.setNameAndCommentFromExtraFields(ze, nc.name,
+                                                     nc.comment);
+            if (!orig.equals(ze.getName())) {
+                nameMap.remove(orig);
+                nameMap.put(ze.getName(), ze);
+            }
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
+
+public class ZipFile {
+
+    private final Map<String, ZipArchiveEntry> nameMap = new HashMap<>();
+    private final Map<ZipArchiveEntry, NameAndComment> entries = new HashMap<>();
+
+    private void resolveLocalFileHeaderData(Map<ZipArchiveEntry, NameAndComment>
+                                            entriesWithoutUTF8Flag)
+        throws IOException {
+        // Create a copy of the current entries map to avoid concurrent modification issues
+        Map<ZipArchiveEntry, NameAndComment> tempEntries = new HashMap<>(entries);
+
+        for (ZipArchiveEntry ze : tempEntries.keySet()) {
+            OffsetEntry offsetEntry = tempEntries.get(ze);
+            long offset = offsetEntry.headerOffset;
+            archive.seek(offset + LFH_OFFSET_FOR_FILENAME_LENGTH);
+            byte[] b = new byte[SHORT];
+            archive.readFully(b);
+            int fileNameLen = ZipShort.getValue(b);
+            archive.readFully(b);
+            int extraFieldLen = ZipShort.getValue(b);
+            int lenToSkip = fileNameLen;
+            while (lenToSkip > 0) {
+                int skipped = archive.skipBytes(lenToSkip);
+                if (skipped <= 0) {
+                    throw new RuntimeException("failed to skip file name in"
+                                               + " local file header");
+                }
+                lenToSkip -= skipped;
+            }
+            byte[] localExtraData = new byte[extraFieldLen];
+            archive.readFully(localExtraData);
+            ze.setExtra(localExtraData);
+            offsetEntry.dataOffset = offset + LFH_OFFSET_FOR_FILENAME_LENGTH
+                + SHORT + SHORT + fileNameLen + extraFieldLen;
+
+            if (entriesWithoutUTF8Flag.containsKey(ze)) {
+                String orig = ze.getName();
+                NameAndComment nc = entriesWithoutUTF8Flag.get(ze);
+                ZipUtil.setNameAndCommentFromExtraFields(ze, nc.name,
+                                                         nc.comment);
+                if (!orig.equals(ze.getName())) {
+                    nameMap.remove(orig);
+                    nameMap.put(ze.getName(), ze);
+                }
+            }
+        }
+
+        // Rebuild the nameMap using the updated entries
+        nameMap.clear();
+        for (ZipArchiveEntry ze : entries.keySet()) {
+            nameMap.put(ze.getName(), ze);
+        }
+    }
+}
+```
+
+Okay, let me try to figure out how to fix this issue. The user is saying that when they try to read a ZIP file created with WinZip that has Unicode extra fields, the ZipFile.getInputStream() returns null. They mentioned that the problem is due to the way the entries are stored in a HashMap. 
+
+So, looking at the provided code snippet from ZipFile.java, there's a method called resolveLocalFileHeaderData. The main issue here seems to be that when the Unicode extra fields are processed, the ZipArchiveEntry's name might change, which affects the hash code. Since the entries are stored in a HashMap, changing the key (the name) after insertion would cause the HashMap to not find the entry correctly because the hash code changes.
+
+In the existing code, the entries are stored in a HashMap named 'nameMap' where the keys are the names of the ZipArchiveEntry objects. When the Unicode extra fields are parsed, the name of the ZipArchiveEntry might get updated, leading to a different hash code. This causes subsequent lookups in the HashMap to fail because the same object's hash code is different now.
+
+The user's proposed patch suggests reconstructing the entries HashMap after parsing the Unicode extra fields. That makes sense because once the names are potentially changed, the original HashMap (which uses the old names as keys) won't work anymore. So, rebuilding the HashMap with the updated names should solve the problem.
+
+Looking at the code, the current approach is to iterate over the entries and modify them. But since modifying the keys in a HashMap can lead to inconsistencies, especially when the keys are being used as lookup keys, the correct approach would be to create a temporary structure to hold the entries during processing, then rebuild the nameMap with the updated entries.
+
+Wait, the original code uses a loop over the entries.keySet(), which is a view of the current entries. If during iteration, the entries are modified (like their names), this could cause issues. Also, in the loop, they're checking if the name has changed and updating the nameMap accordingly. But this approach is error-prone because the HashMap's internal state is being modified while iterating through it.
+
+So, the better solution is to first process all the entries to parse the Unicode extra data, then rebuild the nameMap entirely based on the updated entries. That way, we ensure that any name changes are accounted for, and the HashMap is properly rebuilt with the correct keys.
+
+In the user's patch, they suggest reconstructing the entries HashMap after parsing the Unicode extra fields. So, perhaps the fix involves:
+
+1. Processing the Unicode extra fields, which may change the names of ZipArchiveEntry objects.
+2. After all processing is done, creating a new HashMap for the

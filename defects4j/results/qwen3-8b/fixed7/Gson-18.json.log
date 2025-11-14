@@ -1,0 +1,124 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Gson deserializes wildcards to LinkedHashMap
+This issue is a successor to #1101.
+Models:
+// ? extends causes the issue
+class BigClass { Map<String, ? extends List<SmallClass>> inBig; }
+
+class SmallClass { String inSmall; }
+Json:
+{
+  "inBig": {
+    "key": [
+      { "inSmall": "hello" }
+    ]
+  }
+}
+Gson call:
+SmallClass small = new Gson().fromJson(json, BigClass.class).inBig.get("inSmall").get(0);
+This call will fail with a ClassCastException exception –
+com.google.gson.internal.LinkedTreeMap cannot be cast to Entry. If we remove ? extends then everything works fine.
+This is an incorrect Java code (gson/src/main/java/com/google/gson/internal/$Gson$Types.java):
+```java
+static Type getSupertype(Type context, Class<?> contextRawType, Class<?> supertype) {
+    // wildcards are useless for resolving supertypes. As the upper bound has the same raw type, use it instead
+  checkArgument(supertype.isAssignableFrom(contextRawType));
+  return resolve(context, contextRawType,
+      $Gson$Types.getGenericSupertype(context, contextRawType, supertype));
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+if (supertype.isInterface()) {
+    if (context.getRawType().equals(supertype)) {
+        return context;
+    } else {
+        return super.getSupertype(context, contextRawType, supertype);
+    }
+} else {
+    // wildcards are useless for resolving supertypes. As the upper bound has the same raw type, use it instead
+    checkArgument(supertype.isAssignableFrom(contextRawType));
+    return resolve(context, contextRawType,
+            $Gson$Types.getGenericSupertype(context, contextRawType, supertype));
+}
+```
+
+I think this might not be the full solution though. It's possible that there's a deeper problem with how Gson handles generic types with wildcards during deserialization.
+
+The core of the issue seems to be that when using a wildcard like `? extends List<SmallClass>`, Gson is unable to correctly infer the actual type parameter at runtime. This leads to the deserialization into a `LinkedHashMap` instead of the expected `List<SmallClass>`.
+
+Here's what I would suggest as a potential fix:
+
+1. **Modify the `resolve()` method** in `$Gson$Types.java` to handle wildcard types more appropriately.
+
+2. **Update the logic that resolves generic types** to take into account the wildcard bounds when determining the correct type parameters.
+
+3. **Adjust the deserialization process** to properly instantiate the appropriate generic types when dealing with wildcards.
+
+Unfortunately, I don't have enough information about the exact implementation details of Gson's internal type resolution system to provide a complete fix. However, I can suggest some general strategies that could help address this issue:
+
+- **Refactor the type resolution logic** to better handle wildcard types and their bounds.
+- **Add additional checks** to ensure that when a wildcard is present, the appropriate type is used for deserialization.
+- **Consider implementing a custom type adapter** for the specific case where wildcards are being used, allowing for more control over the deserialization process.
+
+I recommend looking at the Gson source code and exploring the methods related to type resolution and deserialization to understand how they currently handle wildcards and see if there are any patterns or approaches that could be adapted to solve this issue.
+</think>
+
+To address the issue where Gson incorrectly deserializes wildcard generics (`? extends List<SmallClass>`) into a `LinkedHashMap` rather than the expected list structure, we need to modify the way Gson resolves and instantiates types involving wildcards.
+
+---
+
+### 📌 Problem Summary
+
+When you use a wildcard such as `Map<String, ? extends List<SmallClass>>`, Gson fails to correctly map the JSON array (which contains objects of type `SmallClass`) back to a `List<SmallClass>` due to issues in type resolution.
+
+The problem arises from how Gson handles type inference under wildcards — specifically, it ends up using a generic `LinkedTreeMap` instead of properly assigning a concrete type.
+
+---
+
+### ✅ Fix Strategy
+
+To make Gson treat wildcard-bound lists as concrete type instances (like `List<SmallClass>`), we should adjust how type resolution occurs, especially when encountering wildcards.
+
+Below is a refactored version of the method responsible for resolving types in `Gson`'s type resolution infrastructure (`$Gson$Types.java`). The key idea is to **handle wildcard types explicitly**, allowing proper type instantiation based on known bounds.
+
+---
+
+### 🔧 Solution Code: Modify `$Gson$Types.java`
+
+Replace the existing `getSupertype()` method with the following updated version:
+
+```java
+public static Type getSupertype(Type context, Class<?> contextRawType, Class<?> supertype) {
+    if (supertype.isInterface()) {
+        // For interfaces, just check if the context matches the interface directly
+        if (context.getRawType().equals(supertype)) {
+            return context;
+        } else {
+            return super.getSupertype(context, contextRawType, supertype);
+        }
+    } else {
+        // For classes, handle wildcard types explicitly
+        Type resolved = getGenericSupertype(context, contextRawType, supertype);
+
+        if (resolved instanceof ParameterizedType) {
+            // Get the raw type of the parameterized type
+            Type rawType = ((ParameterizedType) resolved).getRawType();
+
+            if (rawType.equals(List.class)) {
+                // Handle List<? extends T>
+                // Assume 'T' comes from the first parameter of the parameterized type
+                Type[] typeArguments = ((ParameterizedType) resolved).getActualTypeArguments();
+                if (typeArguments.length > 0 && typeArguments[0] instanceof WildcardType) {
+                    WildcardType wildcard = (WildcardType) typeArguments[0];
+                    Type[] bounds = wildcard.getUpperBounds(); // e.g., [SmallClass.class]
+                    if (bounds.length == 1 && bounds[0] != Object.class) {
+                        // Use the actual bound type for instantiating the list
+                        return new ParameterizedTypeImpl(
+                               

@@ -1,0 +1,153 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Mixed content not supported if there are child elements.
+@XmlText is only supported if there are no child elements, support could be improved with some changes in XmlTokenStream.
+I successfully made some changes in XmlTokenStream, it's working in my personal case, but it needs more tests.
+If agreed, I could provide a patch.
+
+Example:
+Input string : `"<windSpeed units=\"kt\">27<radius>20</radius></windSpeed>"`
+ "CxmlWindSpeed" class :
+
+```
+public class WindSpeed {
+
+    public static class Radius {
+        @JacksonXmlProperty(isAttribute = true)
+        private String sector;
+        @JacksonXmlProperty(isAttribute = true)
+        private String units;
+        @JacksonXmlText
+        private int value;
+        ..../ Getters and Setters code/....
+    }
+    @JacksonXmlProperty(isAttribute = true)
+    private String units;
+    @JacksonXmlProperty(isAttribute = true)
+    private String source;
+    @JacksonXmlText
+    private int value;
+    @JacksonXmlElementWrapper(useWrapping = false)
+    private List<Radius> radius;
+    ..../ Getters and Setters code/....
+}
+```
+
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/dataformat/xml/deser/XmlTokenStream.java):
+```java
+private final int _next() throws XMLStreamException
+    {
+        switch (_currentState) {
+        case XML_ATTRIBUTE_VALUE:
+            ++_nextAttributeIndex;
+            // fall through
+        case XML_START_ELEMENT: // attributes to return?
+            if (_nextAttributeIndex < _attributeCount) {
+                _localName = _xmlReader.getAttributeLocalName(_nextAttributeIndex);
+                _namespaceURI = _xmlReader.getAttributeNamespace(_nextAttributeIndex);
+                _textValue = _xmlReader.getAttributeValue(_nextAttributeIndex);
+                return (_currentState = XML_ATTRIBUTE_NAME);
+            }
+            // otherwise need to find START/END_ELEMENT or text
+            String text = _collectUntilTag();
+            // If we have no/all-whitespace text followed by START_ELEMENT, ignore text
+            if (_xmlReader.getEventType() == XMLStreamReader.START_ELEMENT) {
+                    return _initStartElement();
+            }
+            // For END_ELEMENT we will return text, if any
+            if (text != null) {
+                _textValue = text;
+                return (_currentState = XML_TEXT);
+            }
+            return _handleEndElement();
+
+        case XML_ATTRIBUTE_NAME:
+            // if we just returned name, will need to just send value next
+            return (_currentState = XML_ATTRIBUTE_VALUE);
+        case XML_TEXT:
+            // mixed text with other elements
+            // text followed by END_ELEMENT
+            return _handleEndElement();
+        case XML_END:
+            return XML_END;
+//            throw new IllegalStateException("No more XML tokens available (end of input)");
+        }
+
+        // Ok: must be END_ELEMENT; see what tag we get (or end)
+        switch (_skipUntilTag()) {
+        case XMLStreamConstants.END_DOCUMENT:
+            return (_currentState = XML_END);
+        case XMLStreamConstants.END_ELEMENT:
+            return _handleEndElement();
+        }
+        // START_ELEMENT...
+        return _initStartElement();
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+<think>
+Okay, let me try to figure out how to fix this issue. The user mentioned that they're dealing with mixed content in XML where there are both text nodes and child elements. The problem arises when using @XmlText, which isn't allowed if there are child elements. They modified XmlTokenStream but want to improve it further.
+
+Looking at the provided example, the XML has a mix of text and nested elements. The current code in XmlTokenStream seems to handle attributes correctly but may not properly manage text nodes when there are child elements. The error message indicates that the parser is incorrectly trying to treat text as part of the element even when there are children.
+
+The original code for _next() method has a section where after handling attributes, it collects text until a tag. But if there's a start element, it skips to the next element, ignoring the text. However, when there are child elements, this approach might miss the text node that comes before them. 
+
+The user's example shows that the windSpeed element contains both text ("27") and a radius sub-element. The current code might be skipping over the text because it's followed by another element. So the token stream isn't recognizing that the text should be captured as part of the parent element's text content before processing the child elements.
+
+In the existing code, when it finds a START_ELEMENT after collecting text, it returns to process the start element, thus discarding the collected text. This would cause the text "27" to be lost, leading to the incorrect parsing. To fix this, the code should capture the text and then process the child elements, allowing the text to be set as the @XmlText property.
+
+So the solution would involve modifying the logic where text is collected. Instead of immediately returning when a start element is found, the code should first save the text into the appropriate field (like _textValue), then proceed to process the start element. This way, the text is preserved even if it's followed by child elements.
+
+Another thing to check is the state transitions. When in XML_TEXT state, the code currently calls _handleEndElement(), which might not correctly handle the mixed content scenario. Perhaps the state machine needs to transition to processing the child elements while keeping track of the text.
+
+Additionally, looking at the case for XML_TEXT, the current code returns _handleEndElement(), which might be too aggressive. It should instead process the text and then move on to handling the child elements. Maybe the code should collect the text, store it, and then continue reading the next tokens, allowing for both text and elements to coexist.
+
+I also need to ensure that the _textValue is properly assigned when text is encountered before child elements. The existing code might not be capturing this text correctly when there are subsequent elements.
+
+Testing the changes would involve verifying that the text is correctly parsed along with the child elements, and that the @XmlText annotation works as expected even in the presence of child nodes. The user mentioned their own fixes work in their case but need more testing, so the proposed changes should address edge cases and ensure robustness.
+
+Putting this all together, the key modifications would be in the part where text is collected and handled when a start element follows. The code should save the text, then proceed to process the start element, allowing the text to be set as the @XmlText value while still reading the child elements. Adjusting the state transitions and ensuring that the text is stored correctly without being discarded when encountering a new element would resolve the mixed content issue.
+</think>
+
+To address the **mixed content parsing issue** in your custom `XmlTokenStream` implementation, we need to fix how the parser handles **text nodes** that appear **before child elements** within a container element. Your use case involves:
+
+- Parsing XML like `<windSpeed units="kt">27<radius>20</radius></windSpeed>`
+- Mapping it to a Java class with both **text content (`@XmlText`)** and **nested elements**
+
+---
+
+### 🔍 Root Cause
+
+The existing code in `_next()` does **not distinguish between mixed content scenarios** where:
+1. Text appears **before** child elements (e.g., `"27"` before `<radius>`).
+2. Child elements exist **within** the same parent.
+
+Currently, the code assumes that text collected before an element is **discarded**, leading to loss of text values when used with `@XmlText`.
+
+---
+
+### ✅ Solution Summary
+
+We need to enhance the `_next()` method to:
+1. Correctly collect text **even when child elements follow**.
+2. Ensure `@XmlText` gets populated with the correct text content.
+3. Maintain proper state transitions for mixed content parsing.
+
+---
+
+### 🛠️ Patch Implementation
+
+Here’s the updated version of the `_next()` method that addresses these issues:
+
+```java
+private final int _next() throws XMLStreamException {
+    switch (_currentState) {
+        case XML_ATTRIBUTE_VALUE:
+            ++_nextAttributeIndex;
+            //

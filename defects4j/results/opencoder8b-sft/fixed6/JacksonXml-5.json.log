@@ -1,0 +1,139 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# @JacksonXmlRootElement malfunction when using it with multiple XmlMappers and disabling annotations
+Found this in version 2.9.4 running some tests that go back and forth serializing with an XML mapper that uses annotations, and another one that ignores them. May be related to issue #171 and the cache of class annotations.
+When running this code, the second print statement should use the annotation's localName but it instead uses the class name.
+@JacksonXmlRootElement(localName = "myname")
+public class XMLTest {
+
+    public static void main(String[] s) throws Exception {
+
+        final ObjectMapper xmlMapper = new XmlMapper();
+        final ObjectMapper noAnnotationsXmlMapper = xmlMapper.copy()
+                .configure(MapperFeature.USE_ANNOTATIONS, false)
+                .configure(SerializationFeature.FAIL_ON_EMPTY_BEANS, false);
+
+        System.out.println(noAnnotationsXmlMapper.writeValueAsString(new XMLTest()));
+        System.out.println(xmlMapper.writeValueAsString(new XMLTest()));
+
+    }
+
+}
+
+Output:
+<XMLTest/>
+<XMLTest/>
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/dataformat/xml/ser/XmlSerializerProvider.java):
+```java
+protected XmlSerializerProvider(XmlSerializerProvider src) {
+    super(src);
+    // 21-May-2018, tatu: As per [dataformat-xml#282], should NOT really copy
+    //    root name lookup as that may link back to diff version, configuration
+    _rootNameLookup = src._rootNameLookup;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+package com.fasterxml.jackson.dataformat.xml.ser;
+
+import com.fasterxml.jackson.annotation.JacksonAnnotation;
+import com.fasterxml.jackson.databind.AnnotationIntrospector;
+import com.fasterxml.jackson.databind.JavaType;
+import com.fasterxml.jackson.databind.JsonMappingException;
+import com.fasterxml.jackson.databind.SerializationConfig;
+import com.fasterxml.jackson.databind.introspect.AnnotatedClass;
+import com.fasterxml.jackson.databind.ser.BeanPropertyWriter;
+import com.fasterxml.jackson.databind.util.ClassUtil;
+import java.io.IOException;
+
+public abstract class XmlSerializerProvider extends SerializerProvider {
+    protected transient ClassInternsCache _classInternsCache;
+    protected final AnnotationIntrospector.ReferenceInfo _rootNameLookup;
+
+    protected XmlSerializerProvider(
+            XmlSerializerProvider src,
+            SerializationConfig config,
+            ClassInternsCache cache) {
+        super(src, config);
+        this._classInternsCache = cache;
+        
+        if (!config.isAnnotationProcessingEnabled()) { 
+            this._rootNameLookup = null; 
+            return;
+        }
+        AnnotationIntrospector intr = config.getAnnotationIntrospector();
+        AnnotatedClass ac = config.introspectClassAnnotations(getClass());
+        
+        JacksonXmlElementWrapper wrapperAnn = intr.findObjectAnnotation(ac, JacksonXmlElementWrapper.class); 
+        String wrapPrefix = null, wrapLocalName = null;
+        
+        if (wrapperAnn != null) {
+            String propName = wrapperAnn.localName(); 
+            
+            if (!propName.isEmpty()) {
+                wrapLocalName = propName; 
+            }
+            
+            wrapPrefix = wrapperAnn.namespace(); 
+            this.setPropertySerializer(JACKSON_PROPERTY_SERIALIZER_WRAPPER); 
+        } 
+        
+        this._rootNameLookup =
+                new AnnotationIntrospector.ReferenceInfo(wrapPrefix, wrapLocalName); 
+    }
+
+    public XmlSerializerProvider createInstance(
+            SerializationConfig config, ClassInternsCache cache) {
+        return newInstance(this, config, cache);
+    }
+
+    protected abstract XmlSerializerProvider newInstance(
+            XmlSerializerProvider base,
+            SerializationConfig config,
+            ClassInternsCache cache);
+
+    public JsonSerializer<?> findBeanSerializer(JavaType type, SerializerProvider provider)
+            throws JsonMappingException {
+        
+        AnnotationIntrospector.ReferenceInfo refInfo = _rootNameLookup;
+        
+        if (refInfo == null || refInfo.hasLocalName()) { 
+            return super.findBeanSerializer(type, provider);
+        }
+        
+        try {
+            return super.findBeanSerializer(type, this);
+        } catch (JsonMappingException e) {
+            throw ClassUtil.addMessage(e, "Failed to access configured element-local-name for serialization");
+        }
+    }
+    
+    protected BeanPropertyWriter buildPropertyWriter(
+            AnnotationIntrospector intr, 
+            PropertyBuilderContext builderCtx, 
+            AnnotatedMember member, 
+            boolean hasProp,
+            Object valueSerializerOrNull)
+        throws IOException
+    {
+        AnnotationIntrospector.PropertyInfo propertyInfo
+                = intr.findProperties(member.getType().getRawClass(), true);
+        if (propertyInfo != null && !propertyInfo.hasEmptySerializer()) { 
+            return propertyInfo.createWriter(builderCtx, member);
+        }
+        return super.buildPropertyWriter(intr, builderCtx, member, hasProp, valueSerializerOrNull);
+    }
+
+    protected JsonSerializer<Object> _createAndCacheUntypedSerializer(
+            JavaType type, TypeBindings bindings) throws JsonMappingException {
+        // first, check cache
+        return _serializerCache.findOrCreateUnboundedByType(
+                type, this, bindings, true, null, null, null);
+    }
+}
+```

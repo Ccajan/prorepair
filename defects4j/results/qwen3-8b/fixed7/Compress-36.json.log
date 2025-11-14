@@ -1,0 +1,151 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Calling SevenZFile.read() on empty SevenZArchiveEntry throws IllegalStateException
+I'm pretty sure COMPRESS-340 breaks reading empty archive entries. When calling getNextEntry() and that entry has no content, the code jumps into the first block at line 830 (SevenZFile.class), clearing the deferredBlockStreams. When calling entry.read(...) afterwards an IllegalStateException ("No current 7z entry (call getNextEntry() first).") is thrown. IMHO, there should be another check for entry.getSize() == 0.
+This worked correctly up until 1.10.
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/sevenz/SevenZFile.java):
+```java
+private InputStream getCurrentStream() throws IOException {
+    if (deferredBlockStreams.isEmpty()) {
+        throw new IllegalStateException("No current 7z entry (call getNextEntry() first).");
+    }
+    
+    while (deferredBlockStreams.size() > 1) {
+        // In solid compression mode we need to decompress all leading folder'
+        // streams to get access to an entry. We defer this until really needed
+        // so that entire blocks can be skipped without wasting time for decompression.
+        final InputStream stream = deferredBlockStreams.remove(0);
+        IOUtils.skip(stream, Long.MAX_VALUE);
+        stream.close();
+    }
+
+    return deferredBlockStreams.get(0);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+if (deferredBlockStreams.isEmpty()) {
+    if (entry != null && entry.getSize() == 0) {
+        return new ByteArrayInputStream(new byte[0]);
+    } else {
+        throw new IllegalStateException("No current 7z entry (call getNextEntry() first).");
+    }
+}
+```
+
+But I think the better approach would be to check for the size before throwing the exception.
+
+So here's my suggested fix:
+
+```java
+private InputStream getCurrentStream() throws IOException {
+    if (deferredBlockStreams.isEmpty()) {
+        // Check if the entry is present but has zero size
+        if (entry != null && entry.getSize() == 0) {
+            // Return an empty stream for zero-sized entries
+            return new ByteArrayInputStream(new byte[0]);
+        } else {
+            throw new IllegalStateException("No current 7z entry (call getNextEntry() first).");
+        }
+    }
+
+    while (deferredBlockStreams.size() > 1) {
+        // In solid compression mode we need to decompress all leading folder'
+        // streams to get access to an entry. We defer this until really needed
+        // so that entire blocks can be skipped without wasting time for decompression.
+        final InputStream stream = deferredBlockStreams.remove(0);
+        IOUtils.skip(stream, Long.MAX_VALUE);
+        stream.close();
+    }
+
+    return deferredBlockStreams.get(0);
+}
+```
+
+This way, when an entry has zero size, we still provide a valid input stream, allowing read operations to complete successfully without throwing an exception.
+
+The problem lies in the fact that the code does not account for zero-sized entries properly. The original code assumes that if there's no current entry, then there's nothing to read, but for zero-sized entries, we should still allow the read operation to succeed by returning an empty stream.
+</think>
+
+To address the issue described — where `SevenZFile.read()` throws an `IllegalStateException` when attempting to read from an **empty** `SevenZArchiveEntry`, which was working properly prior to version 1.10 — we need to modify how the `getCurrentStream()` method handles entries of size zero.
+
+---
+
+### ✅ Problem Summary
+
+In the existing implementation of `getCurrentStream()`:
+
+```java
+private InputStream getCurrentStream() throws IOException {
+    if (deferredBlockStreams.isEmpty()) {
+        throw new IllegalStateException("No current 7z entry (call getNextEntry() first).");
+    }
+    
+    while (deferredBlockStreams.size() > 1) {
+        ...
+    }
+
+    return deferredBlockStreams.get(0);
+}
+```
+
+When `getNextEntry()` returns an entry with `getSize() == 0`, the call to `.read()` will trigger a check for the presence of a "current" entry. This logic does not differentiate between a missing entry and one with zero size, thus it throws an `IllegalStateException`.
+
+However, according to logical expectations, even an entry of size zero should still yield a stream — just an empty one. Thus, we must explicitly check whether the entry exists and is of size zero before throwing an exception.
+
+---
+
+### 🔧 Proposed Fix
+
+Here’s the updated and corrected method signature and implementation:
+
+```java
+private InputStream getCurrentStream() throws IOException {
+    if (deferredBlockStreams.isEmpty()) {
+        if (entry != null && entry.getSize() == 0) {
+            // Provide an empty stream for zero-sized entries
+            return new ByteArrayInputStream(new byte[0]);
+        } else {
+            throw new IllegalStateException("No current 7z entry (call getNextEntry() first).");
+        }
+    }
+
+    while (deferredBlockStreams.size() > 1) {
+        // Process solid compression blocks as necessary
+        final InputStream stream = deferredBlockStreams.remove(0);
+        IOUtils.skip(stream, Long.MAX_VALUE);
+        stream.close();
+    }
+
+    return deferredBlockStreams.get(0);
+}
+```
+
+---
+
+### 📌 Key Improvements
+
+1. **Zero-Sized Entry Support**: If `entry != null` and `entry.getSize() == 0`, it now returns a valid empty `ByteArrayInputStream`. This allows the caller to proceed without errors even though the entry contains no data.
+   
+2. **Preservation of Current Behavior**: For actual missing or invalid entries, the same exception is raised, preserving correct behavior in other cases.
+
+3. **Consistency with Legacy Behavior**: This aligns with previous functionality (before v1.10) that allowed reading from empty entries, ensuring backward compatibility.
+
+---
+
+### ✅ Result
+
+With this change, the following scenarios will behave as expected:
+
+| Scenario                          | Outcome                                             |
+|----------------------------------|-----------------------------------------------------|
+| Reading from a non-empty entry   | Works normally                                      |
+| Reading from an empty entry      | Returns an empty stream (no exception)              |
+| Attempting to read with no entry | Throws `IllegalStateException` (as intended)        |
+
+This makes the library more robust, intuitive, and consistent in its handling of edge case archives.

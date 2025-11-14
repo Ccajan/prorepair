@@ -1,0 +1,92 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# #148 DateTimeFormatter.parseInto broken when no year in format
+In Joda Time 2.0, the default year was set to 2000 so that Feb 29 could be parsed correctly. However, parseInto now overwrites the given instant's year with 2000 (or whatever iDefaultYear is set to). The correct behavior would seem to be to use the given instant's year instead of iDefaultYear.
+This does mean that Feb 29 might not be parseable if the instant's year is not a leap year, but in this case the caller asked for that in a sense.
+This is an incorrect Java code (src/main/java/org/joda/time/format/DateTimeFormatter.java):
+```java
+public int parseInto(ReadWritableInstant instant, String text, int position) {
+    DateTimeParser parser = requireParser();
+    if (instant == null) {
+        throw new IllegalArgumentException("Instant must not be null");
+    }
+    
+    long instantMillis = instant.getMillis();
+    Chronology chrono = instant.getChronology();
+    long instantLocal = instantMillis + chrono.getZone().getOffset(instantMillis);
+    chrono = selectChronology(chrono);
+    
+    DateTimeParserBucket bucket = new DateTimeParserBucket(
+        instantLocal, chrono, iLocale, iPivotYear, iDefaultYear);
+    int newPos = parser.parseInto(bucket, text, position);
+    instant.setMillis(bucket.computeMillis(false, text));
+    if (iOffsetParsed && bucket.getOffsetInteger() != null) {
+        int parsedOffset = bucket.getOffsetInteger();
+        DateTimeZone parsedZone = DateTimeZone.forOffsetMillis(parsedOffset);
+        chrono = chrono.withZone(parsedZone);
+    } else if (bucket.getZone() != null) {
+        chrono = chrono.withZone(bucket.getZone());
+    }
+    instant.setChronology(chrono);
+    if (iZone != null) {
+        instant.setZone(iZone);
+    }
+    return newPos;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public int parseInto(ReadWritableInstant instant, String text, int position) {
+    DateTimeParser parser = requireParser();
+    if (iOffsetParsed && bucket.getOffsetInteger() != null) {
+        int parsedOffset = bucket.getOffsetInteger();
+        DateTimeZone parsedZone = DateTimeZone.forOffsetMillis(parsedOffset);
+        chrono = chrono.withZone(parsedZone);
+    } else if (bucket.getZone() != null) {
+        chrono = chrono.withZone(bucket.getZone());
+    }
+    // If we have no year information, then use the default year
+    if (bucket.getYearsParsed() < 1) {
+        bucket.addYear(iDefaultYear);
+    }
+    instant.setMillis(bucket.computeMillis(false, text));
+    instant.setChronology(chrono);
+    if (iZone != null) {
+        instant.setZone(iZone);
+    }
+    return newPos;
+}
+```
+
+Okay, I need to fix the issue where `parseInto` in Joda Time 2.0 is overwriting the given instant's year with `iDefaultYear` even when the input doesn't include a year. Let me understand the problem first.
+
+The user says that in Joda Time 2.0, the default year was set to 2000 to handle February 29th parsing. But the current implementation overrides the provided instant's year with `iDefaultYear`. They argue that using the given instant's year makes more sense unless the input lacks a year. However, this can cause issues with parsing February 29th if the year isn't a leap year. 
+
+Looking at the code they provided, here's what happens:
+
+- It creates a `DateTimeParserBucket` with the instant's local time, chronology, locale, pivot year, and default year.
+- Then it parses the text into the bucket.
+- Finally, it sets the millis from the bucket and updates the chronology and zone.
+
+The key part seems to be how the bucket handles years. If the input doesn't provide a year, the bucket might use the default year (`iDefaultYear`) which is set to 2000. But the original code uses the bucket's computed millisecond value after setting the default year, which overwrites the original instant's year.
+
+The user suggests that instead of overwriting the year, the code should use the original instant's year if no year is present in the input. So, the fix would involve checking whether the parsed text includes a year. If it doesn't, use the original year from the `ReadWritableInstant`.
+
+Wait, but looking at their proposed fix, they're adding a condition: if the number of years parsed (`bucket.getYearsParsed()`) is less than 1, add the default year. That means if no year is present in the input, the default year is used. But that's exactly the current behavior. Hmm, maybe there's confusion here.
+
+Wait, the original code is setting `bucket.computeMillis(...)` which would use the default year if no year is provided. So the problem is that the original `ReadWritableInstant`'s year is being overwritten with the default year, regardless of whether the input had a year or not. Wait, no— the `ReadWritableInstant` is the one whose milliseconds are being modified. Let me think again.
+
+When you call `parseInto`, you pass an instance of `ReadWritableInstant`, which has its own millis. The code inside `parseInto` calls `bucket.computeMillis(...)`, which computes the resulting millis based on the parsed data. If the input doesn't include a year, the bucket may use the default year (like 2000), leading to `computeMillis` using that year. Thus, the final `instant.setMillis(...)` would set the millis to the value computed with the default year, potentially overriding the original year.
+
+But the user argues that the original year should be preserved unless the input specifies a different year. For example, suppose the original instant is in the year 2023, but the input string is "Feb 29" without a year. In that case, since 2023 isn't a leap year, parsing Feb 29 would fail, but the user wants to allow that scenario because the caller might have intended to use the original year, even though it's not a leap year.
+
+So the problem is that `bucket.computeMillis(...)` is using the default year if no year is specified in the input. The fix is to make sure that if the input does not specify a year, the original year from the `ReadWritableInstant` is used instead of the default year.
+
+So how to adjust that? Let me check the `DateTimeParserBucket` class. When parsing, if a year is not provided, the bucket might have a default year. But perhaps the `bucket.computeMillis(...)` method is using the default year if none was parsed.
+
+To fix this, we need to ensure that if no year is parsed from the input,

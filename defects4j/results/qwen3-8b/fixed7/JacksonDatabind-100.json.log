@@ -1,0 +1,160 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# TreeTraversingParser does not take base64 variant into account
+This affects at least 2.6.4 to current versions. In TreeTraversingParser#getBinaryValue, a Base64Variant is accepted but ignored. The call to n.binaryValue(), when n is a TextNode, then uses the default Base64 variant instead of what's specified. It seems the correct behavior would be to call TextNode#getBinaryValue instead.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/node/TreeTraversingParser.java):
+```java
+public byte[] getBinaryValue(Base64Variant b64variant)
+    throws IOException, JsonParseException
+{
+    // Multiple possibilities...
+    JsonNode n = currentNode();
+    if (n != null) {
+        // [databind#2096]: although `binaryValue()` works for real binary node
+        // and embedded "POJO" node, coercion from TextNode may require variant, so:
+        byte[] data = n.binaryValue();
+        if (data != null) {
+            return data;
+        }
+        if (n.isPojo()) {
+            Object ob = ((POJONode) n).getPojo();
+            if (ob instanceof byte[]) {
+                return (byte[]) ob;
+            }
+        }
+    }
+    // otherwise return null to mark we have no binary content
+    return null;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public byte[] getBinaryValue(Base64Variant b64variant)
+    throws IOException, JsonParseException
+{
+    // Multiple possibilities...
+    JsonNode n = currentNode();
+    if (n != null) {
+        // [databind#2096]: although `binaryValue()` works for real binary node
+        // and embedded "POJO" node, coercion from TextNode may require variant, so:
+        byte[] data = null;
+        if (n.isTextual()) {
+            data = n.textValue().getBytes(StandardCharsets.UTF_8);
+        } else if (n.isBinary()) {
+            data = n.binaryValue(); // This will use the default Base64 variant
+        } else if (n.isPojo()) {
+            Object ob = ((POJONode) n).getPojo();
+            if (ob instanceof byte[]) {
+                return (byte[]) ob;
+            }
+        }
+
+        // If it's a TextNode, we need to decode using the provided Base64 variant
+        if (n.isTextual() && data != null) {
+            try {
+                return Base64.getDecoder(b64variant).decode(data);
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException("Invalid Base64 encoding", e);
+            }
+        }
+
+        return data;
+    }
+    // otherwise return null to mark we have no binary content
+    return null;
+}
+```
+
+Wait, I think I made a mistake in this approach. Let me revise it:
+
+The original problem is that when dealing with a TextNode, the method should decode its text value as binary using the specified Base64Variant, but currently it's using the default.
+
+Here's a better fix:
+
+```java
+public byte[] getBinaryValue(Base64Variant b64variant)
+    throws IOException, JsonParseException
+{
+    // Multiple possibilities...
+    JsonNode n = currentNode();
+    if (n != null) {
+        byte[] data = null;
+
+        // First check if it's a binary node, which can directly provide bytes
+        if (n.isBinary()) {
+            data = n.binaryValue(); // This uses the default Base64 variant
+        }
+        // Check for POJO nodes that might contain byte[]
+        else if (n.isPojo()) {
+            Object ob = ((POJONode) n).getPojo();
+            if (ob instanceof byte[]) {
+                return (byte[]) ob;
+            }
+        }
+        // For textual nodes, we need to manually decode using the provided variant
+        else if (n.isTextual()) {
+            String text = n.textValue();
+            try {
+                data = Base64.getDecoder(b64variant).decode(text);
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException("Invalid Base64 encoding", e);
+            }
+        }
+
+        return data;
+    }
+    // otherwise return null to mark we have no binary content
+    return null;
+}
+```
+
+Yes, this revised version correctly handles the scenario where a TextNode contains Base64 encoded data and needs to be decoded using the specified Base64Variant. The key change is that when the node is textual, we explicitly decode its text value using the passed-in Base64Variant rather than relying on the default one.
+
+I've removed the unnecessary conversion from text to bytes since that's already handled by the Base64 decoder. Also, I've simplified the logic to make it more readable.
+</think>
+
+To address the issue with `TreeTraversingParser.getBinaryValue` in Jackson Databind, we need to ensure that when handling a `TextNode`, the decoding process respects the specified `Base64Variant`. 
+
+---
+
+### 🧠 Problem Summary
+
+In the existing implementation:
+
+- When the node (`JsonNode`) is a `TextNode`, `n.binaryValue()` is called.
+- However, `n.binaryValue()` implicitly uses the **default** Base64 variant, regardless of what was passed in as a parameter.
+- As a result, even though the caller has specified their own `Base64Variant`, it's being ignored.
+
+This leads to incorrect or inconsistent binary value extraction from textual fields that are Base64-encoded.
+
+---
+
+### ✅ Correct Approach
+
+We must override the default Base64 decoding behavior when the node is textual by calling `Base64.getDecoder(b64variant)` and using that to decode the string value.
+
+Here’s how to properly fix the method:
+
+---
+
+### 🔧 Fixed Code
+
+```java
+public byte[] getBinaryValue(Base64Variant b64variant)
+    throws IOException, JsonParseException
+{
+    JsonNode n = currentNode();
+    if (n != null) {
+        byte[] data = null;
+
+        // If it's a binary node, just retrieve its raw byte array
+        if (n.isBinary()) {
+            data = n.binaryValue(); // Uses default variant unless overridden
+        }
+
+        // If it's a POJO node,

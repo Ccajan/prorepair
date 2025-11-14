@@ -1,0 +1,144 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Regression - Boolean attributes not collapsed when using HTML syntax
+Hello,
+First off, thanks for a really useful library.
+So, upgrading from 1.10.2 to 1.11.2 we see that boolean attributes are no longer collapsed when using html syntax. Example test case:
+    @Test
+    public void test() {
+        Document document = Jsoup.parse(
+                "<html><head></head><body><hr size=\"1\" noshade=\"\"></body></html>");
+        assertEquals("<html>\n" +
+                     " <head></head>\n" +
+                     " <body>\n" +
+                     "  <hr size=\"1\" noshade>\n" +
+                     " </body>\n" +
+                     "</html>",
+                     document.outerHtml());
+    }
+
+Tracked it down to commit "Refactored Attributes to be an array pair vs LinkedHashSet " ea1fb65. The Attibutes.html(final Appendable accum, final Document.OutputSettings out) method no longer uses Attribute and fails to check the value of the attribute for an empty string(line 320).
+If I may also suggest to use Attribute.shouldCollapseAttribute(String key, String val, Document.OutputSettings out) instead as a single source of truth as the boolean expression is complex enough and easy to make a mistake. Not sure if this would have an impact in performance though but I am guessing that optimizer will inline the call at some point anyways?
+This is an incorrect Java code (src/main/java/org/jsoup/nodes/Attributes.java):
+```java
+final void html(final Appendable accum, final Document.OutputSettings out) throws IOException {
+    final int sz = size;
+    for (int i = 0; i < sz; i++) {
+        // inlined from Attribute.html()
+        final String key = keys[i];
+        final String val = vals[i];
+        accum.append(' ').append(key);
+
+        // collapse checked=null, checked="", checked=checked; write out others
+        if (!(out.syntax() == Document.OutputSettings.Syntax.html
+            && (val == null || val.equals(key) && Attribute.isBooleanAttribute(key)))) {
+            accum.append("=\"");
+            Entities.escape(accum, val == null ? EmptyString : val, out, true, false, false);
+            accum.append('"');
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+    final void html(final Appendable accum, final Document.OutputSettings out) throws IOException {
+        final int sz = size;
+        for (int i = 0; i < sz; i++) {
+            final String key = keys[i];
+            final String val = vals[i];
+            accum.append(' ').append(key);
+
+            if (isBooleanAttribute(key, val, out)) {
+                // For boolean attributes, only output the attribute name without a value
+                // However, if the value is explicitly set to an empty string, we need to output it as ""
+                if (val != null && !val.isEmpty()) {
+                    accum.append("=\"\"");
+                }
+            } else {
+                // For non-boolean attributes, append the value
+                accum.append("=\"");
+                Entities.escape(accum, val == null ? EmptyString : val, out, true, false, false);
+                accum.append('"');
+            }
+        }
+    }
+
+    private boolean isBooleanAttribute(String key, String val, Document.OutputSettings out) {
+        return out.syntax() == Document.OutputSettings.Syntax.html
+                && (val == null || val.equals(key) || val.isEmpty())
+                && Attribute.isBooleanAttribute(key);
+    }
+```
+
+The issue is with how the code handles boolean attributes in HTML syntax. When upgrading to version 1.11.2, the change in attribute handling led to issues with collapsing boolean attributes.
+
+Here's what the original code was doing:
+
+1. It was checking if the attribute wasn't a boolean one (using `!(...)`), which caused incorrect behavior for boolean attributes.
+2. It wasn't properly considering the case where a boolean attribute might have an explicit empty string value.
+
+The fix involves:
+
+1. Creating a helper method `isBooleanAttribute()` to encapsulate the logic for determining if an attribute should be treated as boolean.
+2. In the main loop, checking if the attribute is a boolean one:
+   - If it is, and the value isn't explicitly set to an empty string, we don't add a value.
+   - If it is, and the value *is* explicitly set to an empty string, we output `" ""` to represent it.
+3. This ensures that the behavior matches the expected rules for HTML boolean attributes while maintaining correct formatting.
+
+The solution preserves the intended behavior of collapsing boolean attributes in HTML syntax while properly handling edge cases like explicit empty string values. It follows the same logic as the existing `Attribute.isBooleanAttribute()` method and applies it correctly to the current implementation.
+</think>
+
+The provided code has an error in its approach to handling boolean attributes when generating HTML. Specifically, it incorrectly checks whether an attribute should be considered boolean and doesn't handle certain corner cases effectively, leading to improper rendering of attributes such as `<hr noshade="">`.
+
+---
+
+### ✅ **Problem Summary**
+
+In older versions of Jsoup (before v1.11.2), the `Attributes.html(...)` method handled boolean attributes according to standard HTML rules:
+
+- Boolean attributes such as `checked`, `disabled`, etc., typically do not require values and can be written as just their names (`<input checked>`).
+- If explicitly given a value (e.g., `checked="true"` or even `checked=""`), they must still be rendered accordingly, especially for strict HTML compliance.
+
+However, due to refactoring in `Attributes.java`, this behavior was broken. The core problem is the incorrect condition used in the loop inside the `html(...)` function — specifically, the logic that determines if an attribute should be treated as boolean is flawed.
+
+---
+
+### 🔧 **Fix Explanation**
+
+#### ✅ Goal
+Correctly render boolean attributes following HTML standards, ensuring proper collapsing and correct handling of empty strings.
+
+#### ✅ Key Fixes Implemented
+1. **Introduce Helper Method**: A new private method `isBooleanAttribute(String key, String val, Document.OutputSettings out)` abstracts the conditional checking logic about whether an attribute should be interpreted as boolean.
+   
+2. **Clear Handling for Boolean Attributes**:
+   - **True Boolean Attributes**: Rendered without a value.
+   - **Explicit Empty Strings**: Rendered as `""` to preserve intent.
+   - **Non-Boolean Values**: Properly quoted and escaped.
+
+3. **Use of `Attribute.isBooleanAttribute(...)`**: Ensures consistency with the internal mechanism responsible for identifying boolean attributes, reducing duplication and potential bugs.
+
+4. **Maintain Compatibility with Output Settings**: Takes into account whether the output format is HTML, ensuring compatibility with different markup formats.
+
+---
+
+### 🛠️ Updated Code Fix
+
+```java
+private final String[] keys;
+private final String[] vals;
+
+final void html(final Appendable accum, final Document.OutputSettings out) throws IOException {
+    final int sz = size;
+    for (int i = 0; i < sz; i++) {
+        final String key = keys[i];
+        final String val = vals[i];
+
+        accum.append(' ').append(key);
+
+        if (isBooleanAttribute(key, val, out))

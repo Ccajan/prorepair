@@ -1,0 +1,134 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# ObjectReader.readValues() ignores offset and length when reading an array
+ObjectReader.readValues ignores offset and length when reading an array. If _dataFormatReaders it will always use the full array:
+https://github.com/FasterXML/jackson-databind/blob/2.7/src/main/java/com/fasterxml/jackson/databind/ObjectReader.java#L1435
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/ObjectReader.java):
+```java
+public <T> MappingIterator<T> readValues(byte[] src, int offset, int length)
+    throws IOException, JsonProcessingException
+{
+    if (_dataFormatReaders != null) {
+        return _detectBindAndReadValues(_dataFormatReaders.findFormat(src, offset, length), false);
+    }
+    return _bindAndReadValues(_considerFilter(_parserFactory.createParser(src), 
+            true));
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public <T> MappingIterator<T> readValues(byte[] src, int offset, int length)
+    throws IOException, JsonProcessingException
+{
+    if (_dataFormatReaders != null) {
+        // Use the data format reader to create a parser with the specified offset and length
+        DataFormatReader dfReader = _dataFormatReaders.findFormat(src, offset, length);
+        if (dfReader != null) {
+            return _detectBindAndReadValues(dfReader, false);
+        } else {
+            // Fallback to default parser creation if no data format matches
+            return _bindAndReadValues(_considerFilter(_parserFactory.createParser(src),
+                    true));
+        }
+    } else {
+        // No data format readers available, fall back to default parser creation
+        return _bindAndReadValues(_considerFilter(_parserFactory.createParser(src),
+                true));
+    }
+}
+```
+
+The issue is that `findFormat()` may not correctly respect the provided offset and length parameters in some contexts, especially for certain data formats.
+
+I've modified the code to explicitly check if the `DataFormatReader` was found before proceeding. This ensures that we only use the format-specific parser creation logic when there's actually a matching format. In cases where no format is found, we fallback to the standard parser creation.
+
+I'd also recommend verifying the implementation of `findFormat()` in the `DataFormatReaders` class to ensure it's properly considering the offset and length parameters when determining which format to use.
+</think>
+
+To address the issue that `ObjectReader.readValues(byte[] src, int offset, int length)` does **not** respect the `offset` and `length` parameters when selecting the appropriate data format or creating the parser, we need to **ensure that these parameters are correctly passed down through all levels of the parsing logic**, including any format detection mechanisms like `_dataFormatReaders`.
+
+---
+
+### ✅ Problem Summary
+
+In your current implementation:
+
+```java
+if (_dataFormatReaders != null) {
+    return _detectBindAndReadValues(
+        _dataFormatReaders.findFormat(src, offset, length), false);
+}
+return _bindAndReadValues(...);
+```
+
+There’s a subtle but important flaw: even though you pass `offset` and `length` into `_dataFormatReaders.findFormat(...)`, the method might be using its own internal buffer handling (like `byte[]` slicing internally) and thus **ignoring those values**, leading to incorrect results.
+
+---
+
+### ✅ Solution
+
+The core fix lies in ensuring that the entire chain of method calls — from `readValues()` down to any parser or data format-specific processing — respects the given `offset` and `length`. We must make sure:
+
+- The `DataFormatReader.findFormat(...)` is respecting both `offset` and `length`.
+- Any subsequent parser construction uses just that **sub-bytearray** (from `offset` to `offset + length`) rather than the full array.
+- We avoid unnecessary fallbacks unless needed (e.g., no matching format).
+
+Here’s how to revise the function:
+
+---
+
+## 🛠️ Fixed Code
+
+```java
+public <T> MappingIterator<T> readValues(byte[] src, int offset, int length)
+    throws IOException, JsonProcessingException
+{
+    if (_dataFormatReaders != null) {
+        // Try to find a matching data format
+        DataFormatReader dfReader = _dataFormatReaders.findFormat(src, offset, length);
+
+        if (dfReader != null) {
+            // Use the format-specific parsing path
+            return _detectBindAndReadValues(dfReader, false);
+        } else {
+            // No matching format; fallback to default parser
+            return _bindAndReadValues(
+                _considerFilter(
+                    _parserFactory.createParser(src, offset, length),
+                    true
+                )
+            );
+        }
+    }
+
+    // If no data format readers were registered, fall back to default parser
+    return _bindAndReadValues(
+        _considerFilter(
+            _parserFactory.createParser(src, offset, length),
+            true
+        )
+    );
+}
+```
+
+---
+
+## ✅ Key Improvements
+
+| Change | Why It Matters |
+|-------|----------------|
+| Pass `offset` and `length` to `_parserFactory.createParser()` | Ensures that only the relevant part of the byte array is used as input. |
+| Explicitly handle `DataFormatReader` fallback | Prevents unexpected behavior where `findFormat` returns nothing but parsing still occurs. |
+| Avoid unnecessary fallbacks | Keeps the code clean and avoids redundant checks. |
+
+---
+
+## ⚠️ Additional Recommendations
+
+1. **Verify `findFormat(...)`**: Ensure this method properly respects both `offset` and `length` parameters to choose the correct format, especially if the implementation has custom buffering or slicing.
+2. **Check `createParser(...)` usage**: Make sure all data format readers and parsers built from them utilize the provided offset and length in their

@@ -1,0 +1,136 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Statistics.setVarianceImpl makes getStandardDeviation produce NaN
+Invoking SummaryStatistics.setVarianceImpl(new Variance(true/false) makes getStandardDeviation produce NaN. The code to reproduce it:
+
+int[] scores = {1, 2, 3, 4};
+SummaryStatistics stats = new SummaryStatistics();
+stats.setVarianceImpl(new Variance(false)); //use "population variance"
+for(int i : scores) {
+  stats.addValue(i);
+}
+double sd = stats.getStandardDeviation();
+System.out.println(sd);
+
+A workaround suggested by Mikkel is:
+
+  double sd = FastMath.sqrt(stats.getSecondMoment() / stats.getN());
+This is an incorrect Java code (src/main/java/org/apache/commons/math/stat/descriptive/SummaryStatistics.java):
+```java
+public void addValue(double value) {
+    sumImpl.increment(value);
+    sumsqImpl.increment(value);
+    minImpl.increment(value);
+    maxImpl.increment(value);
+    sumLogImpl.increment(value);
+    secondMoment.increment(value);
+    // If mean, variance or geomean have been overridden,
+    // need to increment these
+    if (!(meanImpl instanceof Mean)) {
+        meanImpl.increment(value);
+    }
+    if (!(varianceImpl instanceof Variance)) {
+        varianceImpl.increment(value);
+    }
+    if (!(geoMeanImpl instanceof GeometricMean)) {
+        geoMeanImpl.increment(value);
+    }
+    n++;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+To fix the issue where calling `setVarianceImpl` with a `Variance` object and then using `getStandardDeviation()` results in `NaN`, we must understand how the standard deviation calculation works within the `SummaryStatistics` class.
+
+### Root Cause Analysis:
+The method `getStandardDeviation()` calculates the square root of the variance. However, when the variance is set directly via `setVarianceImpl(Variance variance)`, the internal logic that tracks the necessary values for computing the standard deviation might be **inconsistent** with what's stored inside `varianceImpl`.
+
+In particular, when a `Variance` instance is explicitly assigned, the system may not update other related statistics like `secondMoment` or `n` properly. This leads to inconsistent data during the `getStandardDeviation()` call, which can result in `NaN` due to taking the square root of a negative number or a zero denominator.
+
+---
+
+### Recommended Fix:
+We should ensure that after setting the variance implementation (`varianceImpl`), all dependent statistics—especially those used in calculating the standard deviation—are updated correctly. Specifically:
+
+- `secondMoment`: this holds the sum of squares of the values.
+- `n`: the count of elements.
+- `sum`: the total sum of the values (used for mean).
+  
+Thus, the solution involves updating `secondMoment`, `n`, and any relevant internal variables every time we call `addValue()` or change `varianceImpl`.
+
+Here’s a revised version of the `addValue` method, ensuring correct synchronization between statistics:
+
+```java
+public void addValue(double value) {
+    sumImpl.increment(value);
+    sumsqImpl.increment(value);
+    minImpl.increment(value);
+    maxImpl.increment(value);
+    sumLogImpl.increment(value);
+    secondMoment.increment(value);
+    // If mean, variance or geomean have been overridden,
+    // need to increment these
+    if (!(meanImpl instanceof Mean)) {
+        meanImpl.increment(value);
+    }
+    if (!(varianceImpl instanceof Variance)) {
+        varianceImpl.increment(value);
+    }
+    if (!(geoMeanImpl instanceof GeometricMean)) {
+        geoMeanImpl.increment(value);
+    }
+    n++;
+    
+    // Ensure secondMoment and n are consistent even if variance was set externally
+    if (varianceImpl instanceof Variance) {
+        Variance v = (Variance) varianceImpl;
+        if (v.isSample()) {
+            // Sample variance: [sumsq - sum^2/n] / (n-1)
+            secondMoment.setValue(v.getSumsq());
+        } else {
+            // Population variance: [sumsq - sum^2/n] / n
+            secondMoment.setValue(v.getSumsq());
+        }
+        n = v.getN();
+    }
+}
+```
+
+> ✅ **Note:** This assumes `Variance` has methods like `getSumsq()` and `getN()` which provide the accumulated squared values and the sample size. In most math libraries (like Apache Commons Math), such properties should already exist.
+
+---
+
+### Additional Improvements:
+You could also refactor `getStandardDeviation()` to use direct computation from the second moment and `n` as fallbacks, especially when `varianceImpl` is not a valid source:
+
+```java
+public double getStandardDeviation() {
+    if (varianceImpl != null && varianceImpl instanceof Variance) {
+        return FastMath.sqrt(varianceImpl.getVariance());
+    }
+
+    if (n <= 0 || secondMoment.getValue() < 0 || secondMoment.getValue() == Double.POSITIVE_INFINITY) {
+        return Double.NaN;
+    }
+
+    return FastMath.sqrt(secondMoment.getValue() / n);
+}
+```
+
+This ensures consistent behavior whether the variance is calculated internally or externally.
+
+---
+
+### Final Notes:
+- Always verify that your data types and internal variable updates are synchronized across all statistical components.
+- Use `FastMath.sqrt(...)` instead of `Math.sqrt(...)` for better precision and performance in numerical computations.
+- Consider adding defensive checks around critical operations involving division or square roots.
+
+Let me know if you'd like help implementing similar fixes in specific environments or libraries!

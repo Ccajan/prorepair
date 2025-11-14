@@ -1,0 +1,175 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Allow use	of `StdDateFormat.setLenient()`
+ObjectMapper uses the StdDateFormat for date serialization. Jackson date parsing is lenient by default, so 2015-01-32 gets parsed as 2015-02-01.  Jackson’s StdDateParser is matching default behavior of DateParser.  
+
+StdDateParser wasn’t really designed for extension to just enable strict date parsing.  If it were, we could just call objectMapper.setDateFormat(new StdDateFormat().setLenient(false)). But StdDateFomrat doesn't support setting lenient to false. And i.e. the reason date like 2015-01-32 gets parsed as 2015-02-01 ad Jackson date parsing is lenient by defualt.
+
+Can StdDateFormat can be enhanced to support to non lenient date parsing?
+
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/util/StdDateFormat.java):
+```java
+private final static DateFormat _cloneFormat(DateFormat df, String format,
+            TimeZone tz, Locale loc, Boolean lenient)
+    {
+        if (!loc.equals(DEFAULT_LOCALE)) {
+            df = new SimpleDateFormat(format, loc);
+            df.setTimeZone((tz == null) ? DEFAULT_TIMEZONE : tz);
+        } else {
+            df = (DateFormat) df.clone();
+            if (tz != null) {
+                df.setTimeZone(tz);
+            }
+        }
+        return df;
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+The issue you're facing is that **`StdDateFormat`** does not provide direct access to its internal `lenient` flag, which controls whether date parsing and formatting is "lenient" — allowing values outside normal ranges to be adjusted automatically (e.g., `"2015-01-32"` becomes `"2015-02-01"`).
+
+### ✅ Summary:
+
+Jackson's `StdDateFormat` was not originally designed with flexibility in mind for enabling **strict date parsing**, and it has no public API to set `lenient = false`. While it's possible to bypass this limitation using workarounds, directly modifying or extending `StdDateFormat` to support `setLenient()` would require significant changes, including rethinking how date formats are cloned, initialized, and used internally within the Jackson library.
+
+---
+
+## 🛠️ Option 1: Use a Custom Date Format (Recommended)
+
+Instead of trying to modify `StdDateFormat`, consider replacing it with your own custom `DateTimeFormatter` for strict parsing.
+
+### ✅ Example: Using Java 8+ `java.time.format.DateTimeFormatter`
+
+If you're using **Java 8+**, here’s how you can use `DateTimeFormatter.ISO_LOCAL_DATE` for strict parsing:
+
+```java
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+
+public class StrictDateExample {
+    public static void main(String[] args) throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+
+        // Register a custom deserializer using Java time
+        mapper.setDateFormat(new DateTimeFormatterISO());
+
+        String json = "{\"date\":\"2015-01-32\"}";
+
+        try {
+            MyData data = mapper.readValue(json, MyData.class);
+            System.out.println("Parsed date: " + data.date);
+        } catch (Exception e) {
+            System.out.println("Strict parsing failed: " + e.getMessage());
+        }
+    }
+
+    static class MyData {
+        public LocalDate date;
+    }
+
+    static class DateTimeFormatterISO extends SimpleDateFormat {
+        private static final long serialVersionUID = 1L;
+
+        public DateTimeFormatterISO() {
+            super(DateTimeFormatter.ISO_LOCAL_DATE.toString());
+        }
+
+        @Override
+        public Object parseObject(String text, ParseContext ctxt) throws IOException {
+            try {
+                return super.parse(text);
+            } catch (ParseException ex) {
+                throw new IllegalArgumentException("Invalid date format: " + text, ex);
+            }
+        }
+    }
+}
+```
+
+> 💡 This approach avoids altering Jackson internals and ensures that any malformed input (like `"2015-01-32"`) will fail validation instead of being silently adjusted.
+
+---
+
+## 🚧 Option 2: Modify `StdDateFormat` Internally (Not Recommended)
+
+If you must alter `StdDateFormat` itself, you'd need to update the internal logic that constructs the `SimpleDateFormat` object. Here's how you might do it **as a workaround**, but note that it's not safe for production and violates encapsulation principles.
+
+### ⚠️ Patched Version of `_cloneFormat()` Method
+
+Here's a corrected version of the method that allows setting `lenient` explicitly, assuming we can subclass `StdDateFormat` and override the necessary methods:
+
+```java
+import java.text.DateFormat;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.Locale;
+import java.util.TimeZone;
+
+public class StrictStdDateFormat extends StdDateFormat {
+
+    private boolean lenient = true;
+
+    public void setLenient(boolean lenient) {
+        this.lenient = lenient;
+    }
+
+    @Override
+    protected DateFormat _cloneFormat(
+        DateFormat df, 
+        String format, 
+        TimeZone tz, 
+        Locale loc, 
+        Boolean lenient
+    ) {
+        if (format == null || format.isEmpty()) {
+            return super._cloneFormat(df, format, tz, loc, lenient);
+        }
+
+        if (!loc.equals(DEFAULT_LOCALE)) {
+            df = new SimpleDateFormat(format, loc);
+            df.setTimeZone((tz == null) ? DEFAULT_TIMEZONE : tz);
+        } else {
+            df = (DateFormat) df.clone();
+            if (tz != null) {
+                df.setTimeZone(tz);
+            }
+        }
+
+        // Set lenient flag based on our configuration
+        if (df instanceof SimpleDateFormat) {
+            ((SimpleDateFormat) df).setLenient(this.lenient);
+        }
+
+        return df;
+    }
+}
+```
+
+Then, in your application:
+
+```java
+ObjectMapper mapper = new ObjectMapper();
+mapper.setDateFormat(new StrictStdDateFormat().setLenient(false));
+```
+
+### ⚠️ Risks:
+- This modifies internal Jackson classes.
+- May break compatibility with future updates.
+- Harder to maintain and debug.
+- Not thread-safe or intended for modification.
+
+---
+
+## ✅ Best Practice Recommendation
+
+Avoid modifying Jackson internals when possible. Instead, prefer:
+
+- Using **`java.time`** types with `DateTimeFormatter` for

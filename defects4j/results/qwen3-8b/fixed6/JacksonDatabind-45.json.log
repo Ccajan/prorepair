@@ -1,0 +1,183 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Fix for #1154
+Looks pretty good, but would it be possible to have a unit test that would fail before fix, pass after? Would be great to have something to guard against regression.
+I may want to change the logic a little bit, however; if shape is explicitly defined as NUMBER, textual representation should not be enabled even if Locale (etc) happen to be specified: explicit shape value should have precedence. I can make that change, or you can do it, either way is fine.
+I'll also need to merge this again 2.7 branch instead of master, to get in 2.7.3.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/ser/std/DateTimeSerializerBase.java):
+```java
+public JsonSerializer<?> createContextual(SerializerProvider serializers,
+        BeanProperty property) throws JsonMappingException
+{
+    if (property != null) {
+        JsonFormat.Value format = serializers.getAnnotationIntrospector().findFormat((Annotated)property.getMember());
+        if (format != null) {
+
+        	// Simple case first: serialize as numeric timestamp?
+            JsonFormat.Shape shape = format.getShape();
+            if (shape.isNumeric()) {
+                return withFormat(Boolean.TRUE, null);
+            }
+
+            if (format.getShape() == JsonFormat.Shape.STRING) {
+                TimeZone tz = format.getTimeZone();
+                final String pattern = format.hasPattern()
+                                ? format.getPattern()
+                                : StdDateFormat.DATE_FORMAT_STR_ISO8601;
+                final Locale loc = format.hasLocale()
+                                ? format.getLocale()
+                                : serializers.getLocale();
+                SimpleDateFormat df = new SimpleDateFormat(pattern, loc);
+                if (tz == null) {
+                    tz = serializers.getTimeZone();
+                }
+                df.setTimeZone(tz);
+                return withFormat(Boolean.FALSE, df);
+            }
+        }
+    }
+    return this;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public JsonSerializer<?> createContextual(SerializerProvider serializers,
+        BeanProperty property) throws JsonMappingException
+{
+    if (property != null) {
+        JsonFormat.Value format = serializers.getAnnotationIntrospector().findFormat((Annotated)property.getMember());
+        if (format != null) {
+
+        	// Simple case first: serialize as numeric timestamp?
+            JsonFormat.Shape shape = format.getShape();
+            if (shape.isNumeric()) {
+                return withFormat(Boolean.TRUE, null);
+            }
+
+            // If shape is explicitly set to NUMBER, do not enable text formatting
+            if (shape == JsonFormat.Shape.NUMBER) {
+                return this;
+            }
+
+            if (format.getShape() == JsonFormat.Shape.STRING) {
+                TimeZone tz = format.getTimeZone();
+                final String pattern = format.hasPattern()
+                                ? format.getPattern()
+                                : StdDateFormat.DATE_FORMAT_STR_ISO8601;
+                final Locale loc = format.hasLocale()
+                                ? format.getLocale()
+                                : serializers.getLocale();
+                SimpleDateFormat df = new SimpleDateFormat(pattern, loc);
+                if (tz == null) {
+                    tz = serializers.getTimeZone();
+                }
+                df.setTimeZone(tz);
+                return withFormat(Boolean.FALSE, df);
+            }
+        }
+    }
+    return this;
+}
+```
+
+The problem was that the original code didn't handle the case where the shape was explicitly set to `NUMBER`. In such cases, we shouldn't allow any text-based formatting (even if locale or pattern were specified). The fix adds a check for `shape == JsonFormat.Shape.NUMBER` and returns early without applying any formatting.
+
+For testing, you'd want to create a unit test that:
+1. Creates a class with a field annotated with @JsonFormat(shape = Shape.NUMBER)
+2. Verifies that serialization produces a number rather than a string
+3. Also verifies that changing the shape to STRING works as expected
+
+Would you like me to help write the corresponding unit tests?
+</think>
+
+To address the issue described and ensure robustness against potential regressions, here's how we can approach fixing and validating the provided Java code:
+
+---
+
+## ✅ **Fix Explanation**
+
+### 📌 Problem
+The original code failed to account for the scenario when `shape` is explicitly set to `JsonFormat.Shape.NUMBER`. Even though the shape could be configured as `STRING`, the presence of `NUMBER` should take precedence over any other configurations like patterns or locales. This led to inconsistent behavior where `NUMBER` shapes might still result in text formatting if certain conditions were met.
+
+### 🛠️ Solution
+We added an additional check for `shape == JsonFormat.Shape.NUMBER` right after retrieving the `shape`. If so, we immediately return `this` without proceeding to further configuration steps—ensuring that no text formatting is applied regardless of the rest of the settings.
+
+---
+
+## 🧪 Unit Test Suggestion
+
+Below is a sample unit test using JUnit 5 along with Jackson’s JSON testing capabilities. It checks both valid and invalid scenarios to verify correctness and prevent future regressions.
+
+> ⚠️ Make sure you're running these tests on your project setup with appropriate dependencies like Jackson Databind and JUnit 5 included.
+
+```java
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.annotation.JsonFormat;
+import com.fasterxml.jackson.databind.ser.std.DateTimeSerializerBase;
+import com.fasterxml.jackson.databind.ser.std.StdDateFormat;
+import com.fasterxml.jackson.databind.type.TypeFactory;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import java.io.IOException;
+import java.time.LocalDateTime;
+import java.util.Locale;
+import java.util.TimeZone;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class DateTimeSerializerTest {
+
+    private ObjectMapper mapper;
+
+    @BeforeEach
+    void setUp() {
+        mapper = new ObjectMapper();
+        mapper.findAndRegisterModules(); // Ensure modules are registered correctly
+    }
+
+    @Test
+    void testNumberShapeIsNotFormattedAsText() throws IOException {
+        // Given
+        MyData data = new MyData(LocalDateTime.now());
+
+        // When
+        String json = mapper.writeValueAsString(data);
+
+        // Then
+        assertTrue(json.matches("-?\\d+")); // Should output a number
+    }
+
+    @Test
+    void testStringShapeUsesCustomFormatting() throws IOException {
+        // Given
+        MyDataWithFormat data = new MyDataWithFormat(LocalDateTime.now());
+
+        // When
+        String json = mapper.writeValueAsString(data);
+
+        // Then
+        assertTrue(json.contains("ISO-8601")); // Expected ISO 8601 formatted date/time
+    }
+
+    @Test
+    void testStringShapeOverriddenByNumberShape() throws IOException {
+        // Given
+        MyDataWithFormat data = new MyDataWithFormat(LocalDateTime.now());
+
+        // When
+        String json = mapper.writeValueAsString(data);
+
+        // Then
+        assertFalse(json.matches("-?\\d+")); // Should NOT output a number
+    }
+}
+
+class MyData {
+    public LocalDateTime dateTime;
+    public

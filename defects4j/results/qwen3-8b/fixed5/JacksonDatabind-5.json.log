@@ -1,0 +1,195 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Mixin annotations lost when using a mixin class hierarchy with non-mixin interfaces
+In summary, mixin annotations are lost when Jackson scans a parent mixin class with Json annotations followed by an interface implemented by the parent mixin class that does not have the same Json annotations.
+Jackson version: 2.4.0
+Detail:
+I have the following class structure
+public interface Contact {
+    String getCity();
+}
+
+public class ContactImpl implements Contact {
+    public String getCity() { ... }
+}
+
+public class ContactMixin implements Contact {
+    @JsonProperty
+    public String getCity() { return null; }
+}
+
+public interface Person extends Contact {}
+
+public class PersonImpl extends ContactImpl implements Person {}
+
+public class PersonMixin extends ContactMixin implements Person {}
+and I configure a module as
+// There are other getters/properties in the Impl class that do not need to be serialized and so
+// I am using the Mixin to match the interface and explicitly annotate all the inherited methods
+module.disable(MapperFeature.ALLOW_FINAL_FIELDS_AS_MUTATORS)
+    .disable(MapperFeature.AUTO_DETECT_FIELDS)
+    .disable(MapperFeature.AUTO_DETECT_GETTERS)
+    .disable(MapperFeature.AUTO_DETECT_IS_GETTERS)
+    .disable(MapperFeature.INFER_PROPERTY_MUTATORS);
+module.setMixInAnnotation(Person.class, PersonMixin.class);
+When a PersonImpl instance is serialized, city is not included.
+I debugged the code and this is what happens:
+In AnnotatedClass.resolveMemberMethods() the supertypes of PersonImpl are [Person.class, Contact.class, ContactImpl.class] in that order.
+It starts with Person for which it finds PersonMixin and proceeds to AnnotatedClass._addMethodMixIns(). Here the parents list has [PersonMixin, ContactMixin, Contact]. When it processes ContactMixin it adds getCity() with the JsonProperty annotation. Then it processes Contact, doesn't find getCity() in methods map and so creates a new AnnotatedMethod for getCity() with the one from the interface which has no annotation which replaces the one from ContactMixin
+The workaround for this issue is to explicitly add any parent mixins to the module i.e.
+module.setMixInAnnotation(Contact.class, ContactMixin.class);
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/introspect/AnnotatedClass.java):
+```java
+protected void _addMethodMixIns(Class<?> targetClass, AnnotatedMethodMap methods,
+        Class<?> mixInCls, AnnotatedMethodMap mixIns)
+{
+    List<Class<?>> parents = new ArrayList<Class<?>>();
+    parents.add(mixInCls);
+    ClassUtil.findSuperTypes(mixInCls, targetClass, parents);
+    for (Class<?> mixin : parents) {
+        for (Method m : mixin.getDeclaredMethods()) {
+            if (!_isIncludableMemberMethod(m)) {
+                continue;
+            }
+            AnnotatedMethod am = methods.find(m);
+            /* Do we already have a method to augment (from sub-class
+             * that will mask this mixIn)? If so, add if visible
+             * without masking (no such annotation)
+             */
+            if (am != null) {
+                _addMixUnders(m, am);
+                /* Otherwise will have precedence, but must wait
+                 * until we find the real method (mixIn methods are
+                 * just placeholder, can't be called)
+                 */
+            } else {
+                // Well, or, as per [Issue#515], multi-level merge within mixins...
+                    mixIns.add(_constructMethod(m));
+            }
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+    protected void _addMethodMixIns(Class<?> targetClass, AnnotatedMethodMap methods,
+                                   Class<?> mixInCls, AnnotatedMethodMap mixIns)
+    {
+        List<Class<?>> parents = new ArrayList<Class<?>>();
+        parents.add(mixInCls);
+        ClassUtil.findSuperTypes(mixInCls, targetClass, parents);
+        
+        // Iterate through each parent class in reverse order
+        Collections.reverse(parents);
+        
+        for (Class<?> mixin : parents) {
+            for (Method m : mixin.getDeclaredMethods()) {
+                if (!_isIncludableMemberMethod(m)) {
+                    continue;
+                }
+                
+                // Check if the method already exists in the target class
+                AnnotatedMethod am = methods.find(m);
+                
+                if (am != null) {
+                    // If the method exists, try to apply the mix-in annotations
+                    _applyAnnotationsFromMixIn(am, m);
+                } else {
+                    // If the method does not exist, create a new entry with mix-in annotations
+                    mixIns.add(_constructMethodWithAnnotations(m));
+                }
+            }
+        }
+    }
+
+    private void _applyAnnotationsFromMixIn(AnnotatedMethod am, Method m) {
+        Annotation[] annotationsOnMixin = m.getAnnotations();
+        for (Annotation ann : annotationsOnMixin) {
+            am.addAnnotation(ann.annotationType(), ann);
+        }
+    }
+
+    private AnnotatedMethod _constructMethodWithAnnotations(Method m) {
+        AnnotatedMethod am = _constructMethod(m);
+        Annotation[] annotationsOnMixin = m.getAnnotations();
+        for (Annotation ann : annotationsOnMixin) {
+            am.addAnnotation(ann.annotationType(), ann);
+        }
+        return am;
+    }
+```
+
+This solution addresses the problem by modifying the `_addMethodMixIns` method:
+
+1. **Reversing the Parent Order**: The original code processed parents in the order they were found (which is typically from most specific to least specific). By reversing this order, we ensure that more specific mix-ins (like `ContactMixin`) are applied before less specific ones.
+
+2. **Improved Annotation Handling**: 
+   - A helper method `_applyAnnotationsFromMixIn` is added to apply mix-in annotations to existing methods.
+   - Another helper method `_constructMethodWithAnnotations` ensures that newly created methods include their mix-in annotations.
+
+3. **Correct Method Matching**: This approach ensures that when multiple mix-ins define the same method, the annotations from the more specific mix-in are properly applied, preventing the loss of annotations seen in the original implementation.
+
+These changes should help maintain the correct annotations when dealing with complex mixin hierarchies, ensuring that serialization works as expected even when interfaces are involved.
+</think>
+
+To resolve the issue where mixin annotations are being lost during Jackson's property discovery process, particularly when there's a combination of mixin classes and non-mixin interfaces, we need to address how Jackson handles inheritance and annotation application in its introspection logic.
+
+---
+
+### 🔍 Problem Summary
+
+- Jackson uses **mixin annotations** to control JSON serialization/deserialization behavior on POJOs.
+- When a **non-mixin interface** is used as a superinterface and has **mixin annotations**, those annotations can be **lost** if the mixin is applied to the interface.
+- In the current implementation (`_addMethodMixIns`), **method annotations from mix-ins are overwritten** when another method (e.g., from a non-mixin interface) is discovered later in the parent chain.
+
+---
+
+### 🛠️ Solution Approach
+
+We enhance the logic to:
+1. Process mixin classes **starting from the most specific** (i.e., reverse the parent ordering).
+2. Ensure that **annotations from mixin classes take precedence over those from the base class/interface**.
+3. **Preserve annotations from mixin classes** even if they are overridden at runtime.
+
+---
+
+### ✅ Fixed Implementation
+
+Here’s the corrected implementation of the `_addMethodMixIns` method along with auxiliary utility functions:
+
+```java
+protected void _addMethodMixIns(Class<?> targetClass, AnnotatedMethodMap methods,
+                                Class<?> mixInCls, AnnotatedMethodMap mixIns)
+{
+    List<Class<?>> parents = new ArrayList<>();
+    parents.add(mixInCls);
+    ClassUtil.findSuperTypes(mixInCls, targetClass, parents);
+
+    // Reverse the order of parents to ensure more specific mixins come first
+    Collections.reverse(parents);
+
+    for (Class<?> mixin : parents) {
+        for (Method m : mixin.getDeclaredMethods()) {
+            if (!_isIncludableMemberMethod(m)) {
+                continue;
+            }
+
+            AnnotatedMethod am = methods.find(m);
+
+            if (am != null) {
+                // If the method already exists in the target, apply the mixin annotations
+                _applyAnnotationsFromMixIn(am, m);
+            } else {
+                // If the method doesn’t exist, construct a new annotated method with mixin annotations
+                mixIns.add(_constructMethodWithAnnotations(m));
+            }
+        }
+    }
+}
+
+

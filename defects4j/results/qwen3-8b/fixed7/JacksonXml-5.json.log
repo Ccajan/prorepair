@@ -1,0 +1,109 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# @JacksonXmlRootElement malfunction when using it with multiple XmlMappers and disabling annotations
+Found this in version 2.9.4 running some tests that go back and forth serializing with an XML mapper that uses annotations, and another one that ignores them. May be related to issue #171 and the cache of class annotations.
+When running this code, the second print statement should use the annotation's localName but it instead uses the class name.
+@JacksonXmlRootElement(localName = "myname")
+public class XMLTest {
+
+    public static void main(String[] s) throws Exception {
+
+        final ObjectMapper xmlMapper = new XmlMapper();
+        final ObjectMapper noAnnotationsXmlMapper = xmlMapper.copy()
+                .configure(MapperFeature.USE_ANNOTATIONS, false)
+                .configure(SerializationFeature.FAIL_ON_EMPTY_BEANS, false);
+
+        System.out.println(noAnnotationsXmlMapper.writeValueAsString(new XMLTest()));
+        System.out.println(xmlMapper.writeValueAsString(new XMLTest()));
+
+    }
+
+}
+
+Output:
+<XMLTest/>
+<XMLTest/>
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/dataformat/xml/ser/XmlSerializerProvider.java):
+```java
+protected XmlSerializerProvider(XmlSerializerProvider src) {
+    super(src);
+    // 21-May-2018, tatu: As per [dataformat-xml#282], should NOT really copy
+    //    root name lookup as that may link back to diff version, configuration
+    _rootNameLookup = src._rootNameLookup;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+protected XmlSerializerProvider(XmlSerializerProvider src) {
+    super(src);
+    // Copy the root name lookup if needed, ensuring it's not shared between instances
+    // This prevents issues where changes to one instance affect others, especially when annotations are disabled
+    _rootNameLookup = src != null ? new RootNameLookup(src._rootNameLookup) : null;
+}
+```
+
+The key change here is creating a new instance of `RootNameLookup` rather than sharing the same object reference. This avoids the potential for cached annotations to interfere with each other between different mappers.
+
+In your test case, when you create a new `ObjectMapper` without annotations, it should correctly use the `@JacksonXmlRootElement` annotation even though it's configured to ignore annotations. The original code was causing both mappers to share the same `_rootNameLookup`, which led to the wrong behavior.
+
+Make sure to implement the `RootNameLookup` constructor properly to ensure it copies the necessary information from the source. This fix addresses the issue with caching class annotations and ensures that each mapper operates independently with its own settings.
+</think>
+
+The issue arises because the `XmlSerializerProvider` class in Jackson's XML module shares the `_rootNameLookup` instance between different `ObjectMapper` instances, leading to unexpected behavior when annotations are disabled. Here's how to resolve it:
+
+### Problem Summary
+- **Scenario**: When creating two `ObjectMapper` instances—one with annotations enabled and another disabled—the second mapper (`noAnnotationsXmlMapper`) fails to respect the `@JacksonXmlRootElement` annotation due to shared state.
+- **Root Cause**: The `XmlSerializerProvider` constructor copies the `_rootNameLookup` directly, causing both mappers to reference the same internal state. This leads to inconsistent behavior when annotations are disabled or re-enabled.
+
+---
+
+### Solution
+
+To fix this, we need to ensure that each `XmlSerializerProvider` has its own independent `_rootNameLookup`. Modify the constructor of `XmlSerializerProvider` as follows:
+
+#### ✅ Corrected Code
+```java
+protected XmlSerializerProvider(XmlSerializerProvider src) {
+    super(src);
+    // Create a deep copy of the root name lookup to avoid shared state
+    _rootNameLookup = src != null ? new RootNameLookup(src._rootNameLookup) : null;
+}
+```
+
+---
+
+### Explanation
+- **Why the Change?**  
+  By explicitly copying the `RootNameLookup`, we prevent cross-instance interference. Each `XmlSerializerProvider` now manages its own state, including whether or not to apply annotations. This resolves conflicts caused by shared annotation caches, especially critical when annotations are dynamically enabled/disabled across different `ObjectMapper` configurations.
+
+- **How It Works**  
+  - `RootNameLookup` must have a proper constructor that accepts another `RootNameLookup` instance and initializes itself accordingly.
+  - This guarantees that each mapper uses its own set of rules for determining root element names, respecting the configuration (`USE_ANNOTATIONS`) at creation time.
+
+---
+
+### Additional Notes
+- Ensure that `RootNameLookup` has a constructor like:
+  ```java
+  public RootNameLookup(RootNameLookup other) {
+      this.name = other.name;
+      this.type = other.type;
+      // ...copy all relevant fields
+  }
+  ```
+- After applying this fix, your test case should output:
+  ```
+  <myname/>
+  <XMLTest/>
+  ```
+  Which reflects correct behavior: the first mapper respects the annotation, while the second uses the default class name.
+
+---
+
+### Conclusion
+By isolating the `_rootNameLookup` for each `XmlSerializerProvider`, we eliminate race conditions and inconsistent states that occur during serialization operations. This makes the library more robust and predictable when working with mixed annotation configurations.

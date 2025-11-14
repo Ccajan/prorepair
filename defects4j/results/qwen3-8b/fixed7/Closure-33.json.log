@@ -1,0 +1,177 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# weird object literal invalid property error on unrelated object prototype
+Apologies in advance for the convoluted repro case and the vague summary.
+
+Compile the following code (attached as repro.js) with:
+java -jar build/compiler.jar --compilation_level=ADVANCED_OPTIMIZATIONS --jscomp_error=accessControls --jscomp_error=checkTypes --jscomp_error=checkVars --js repro.js *
+
+/**
+ * @param {{text: string}} opt_data
+ * @return {string}
+ */
+function temp1(opt_data) {
+  return opt_data.text;
+}
+
+/**
+ * @param {{activity: (boolean|number|string|null|Object)}} opt_data
+ * @return {string}
+ */
+function temp2(opt_data) {
+  /** @notypecheck */
+  function __inner() {
+    return temp1(opt_data.activity);
+  }
+  return __inner();
+}
+
+/**
+ * @param {{n: number, text: string, b: boolean}} opt_data
+ * @return {string}
+ */
+function temp3(opt_data) {
+  return 'n: ' + opt_data.n + ', t: ' + opt_data.text + '.';
+}
+
+function callee() {
+  var output = temp3({
+    n: 0,
+    text: 'a string',
+    b: true
+  })
+  alert(output);
+}
+
+callee();
+
+yields:
+repro.js:30: ERROR - actual parameter 1 of temp3 does not match formal parameter
+found   : {b: boolean, n: number, text: (string|undefined)}
+required: {b: boolean, n: number, text: string}
+  var output = temp3({
+
+It seems like temp3 is actually being called with the right type {b: boolean, n: number, text: string} though it seems to think that text is a (string|undefined)
+This seems to happen because of the seemingly unrelated code in functions temp1 and temp2. If I change the name of the text property (as in repro3.js) it works.
+Additionally, if I fix the type of the activity property in the record type of temp2 it works (as in repro2.js)
+
+This comes up in our codebase in some situations where we don't have type info for all the objects being passed into a function. It's always a tricky one to find because it reports an error at a location that looks correct.
+
+* it also fails with SIMPLE_OPTIMIZATIONS
+This is an incorrect Java code (src/com/google/javascript/rhino/jstype/PrototypeObjectType.java):
+```java
+public void matchConstraint(ObjectType constraintObj) {
+  // We only want to match contraints on anonymous types.
+
+  // Handle the case where the constraint object is a record type.
+  //
+  // param constraintObj {{prop: (number|undefined)}}
+  // function f(constraintObj) {}
+  // f({});
+  //
+  // We want to modify the object literal to match the constraint, by
+  // taking any each property on the record and trying to match
+  // properties on this object.
+  if (constraintObj.isRecordType()) {
+    for (String prop : constraintObj.getOwnPropertyNames()) {
+      JSType propType = constraintObj.getPropertyType(prop);
+      if (!isPropertyTypeDeclared(prop)) {
+        JSType typeToInfer = propType;
+        if (!hasProperty(prop)) {
+          typeToInfer = getNativeType(JSTypeNative.VOID_TYPE)
+              .getLeastSupertype(propType);
+        }
+        defineInferredProperty(prop, typeToInfer, null);
+      }
+    }
+  }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public void matchConstraint(ObjectType constraintObj) {
+  // We only want to match constraints on anonymous types.
+
+  // Handle the case where the constraint object is a record type.
+  //
+  // param constraintObj {{prop: (number|undefined)}}
+  // function f(constraintObj) {}
+  // f({});
+  //
+  // We want to modify the object literal to match the constraint, by
+  // taking any each property on the record and trying to match
+  // properties on this object.
+  if (constraintObj.isRecordType()) {
+    for (String prop : constraintObj.getOwnPropertyNames()) {
+      JSType propType = constraintObj.getPropertyType(prop);
+      if (!isPropertyTypeDeclared(prop)) {
+        JSType typeToInfer = propType;
+        // Check if this object has the property defined
+        if (!hasProperty(prop)) {
+          // When the property is not present in the current object,
+          // infer its type based on the constraint. However, in such cases,
+          // the property might be optional or have a default value.
+          // To avoid inferring undefined when the property isn't provided,
+          // use the least supertype of propType and VOID_TYPE to account for
+          // optional or default values.
+          typeToInfer = getNativeType(JSTypeNative.VOID_TYPE)
+              .getLeastSupertype(propType);
+        }
+        defineInferredProperty(prop, typeToInfer, null);
+      }
+    }
+  }
+}
+```
+
+The issue stems from how the code handles property inference when the property is not present in the object. Specifically, when `!hasProperty(prop)` evaluates to `true`, it infers the type as the least supertype of the constraint's property type and `VOID_TYPE`. This can lead to incorrect type inferences, particularly when the property is expected to be required but may be missing.
+
+Here's the step-by-step explanation of the solution:
+
+1. **Identify the Problem**: The original code incorrectly infers the type of a missing property as the least supertype of the constraint's property type and `VOID_TYPE`, which introduces `undefined` as a possible value when the property is absent.
+
+2. **Analyze the Code Logic**:
+   - `if (!isPropertyTypeDeclared(prop))`: Checks if the property type hasn't been explicitly declared.
+   - `if (!hasProperty(prop))`: Determines if the property is not present in the current object.
+   - In such cases, `typeToInfer` was set to the least supertype of the constraint's property type and `VOID_TYPE`.
+
+3. **Refine the Type Inference Logic**:
+   - Instead of using `VOID_TYPE`, we should consider whether the property is optional or has a default value.
+   - For optional properties, it makes more sense to allow the property to be either the constrained type or `undefined`.
+   - Hence, we need to adjust the logic to accurately represent these scenarios without introducing incorrect inferred types like `undefined`.
+
+4. **Modify the Code**:
+   - Change the line `typeToInfer = getNativeType(JSTypeNative.VOID_TYPE).getLeastSupertype(propType);` to better reflect the intention of allowing the property to be either the constrained type or `undefined`.
+   - Ensure that the code correctly captures the intent of optional properties while avoiding incorrect inferences that could lead to errors in type checking.
+
+By refining this part of the code, we ensure that the type inference remains accurate and avoids the issue described, leading to fewer false positives in the type checking process.
+</think>
+
+The problem arises due to an incorrect handling of optional properties during type inference in JavaScript type checking. Let's analyze and resolve the issue step by step.
+
+### ✅ Root Cause:
+- The method incorrectly assumes that when a property is not found in the current object (`!hasProperty(prop)`), it must be optional or have a default value. 
+- It then applies a generic "least supertype" approach between the constraint's property type and `VOID_TYPE`, which inadvertently introduces `undefined` as a possible value for the property even when it’s not explicitly optional or missing.
+  
+This causes **false positive errors** in type checking when a property is **explicitly required** but not found in the object literal.
+
+---
+
+### 🔧 Fix Strategy:
+
+We need to make two key changes:
+
+#### 1. **Accurate Handling of Optional Properties**
+Instead of applying a universal `VOID_TYPE`, we should differentiate between **optional** vs. **required** properties during type inference.
+
+This means:
+- If the property is **missing** in the object, we assume it’s optional (i.e., can be `undefined`) unless the constraint explicitly states otherwise.
+- If the property is **present**, but no explicit type is declared, it matches the constraint type directly.
+
+#### 2. **Correct Use of `JSType.getLeastSupertype()`**
+When the property is **not present** in the object, we

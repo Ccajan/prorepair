@@ -1,0 +1,105 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# ObjectReader.readValues() ignores offset and length when reading an array
+ObjectReader.readValues ignores offset and length when reading an array. If _dataFormatReaders it will always use the full array:
+https://github.com/FasterXML/jackson-databind/blob/2.7/src/main/java/com/fasterxml/jackson/databind/ObjectReader.java#L1435
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/ObjectReader.java):
+```java
+public <T> MappingIterator<T> readValues(byte[] src, int offset, int length)
+    throws IOException, JsonProcessingException
+{
+    if (_dataFormatReaders != null) {
+        return _detectBindAndReadValues(_dataFormatReaders.findFormat(src, offset, length), false);
+    }
+    return _bindAndReadValues(_considerFilter(_parserFactory.createParser(src), 
+            true));
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public <T> MappingIterator<T> readValues(byte[] src, int offset, int length)
+    throws IOException, JsonProcessingException
+{
+    if (_dataFormatReaders != null) {
+        // Check if any data format reader supports the given source bytes with specified offset and length.
+        for (DataFormatReader dr : _dataFormatReaders) {
+            if (dr.canRead(src, offset, length)) {
+                return _detectBindAndReadValues(dr, false);
+            }
+        }
+    }
+    // If no data format reader is found, create a parser using the provided byte array, offset, and length.
+    return _bindAndReadValues(_considerFilter(_parserFactory.createParser(src, offset, length),
+            true));
+}
+```
+
+The original issue is that `readValues()` wasn't correctly passing the `offset` and `length` parameters to the data format readers when determining which one to use. This could lead to incorrect behavior if different data formats support different parts of the byte array.
+
+In my modified solution, I loop through each `DataFormatReader` in `_dataFormatReaders` and check if it can read from the specific part of the byte array indicated by the `offset` and `length`. If a suitable reader is found, it's used to create the mapping iterator.
+
+If none of the data format readers can handle the specified portion of the byte array, we fall back to creating a parser with the entire byte array but still respecting the provided `offset` and `length` values when parsing. This way, both cases are handled appropriately: using the correct data format reader or fallback to standard parsing with the specified range.
+</think>
+
+To address the issue where `ObjectReader.readValues()` incorrectly ignores the `offset` and `length` parameters when reading from a byte array, we need to ensure that **both** the `DataFormatReader` selection process and the underlying parser creation respect these arguments.
+
+---
+
+### ✅ Problem Summary:
+
+- The method `readValues(byte[] src, int offset, int length)` currently does not pass the `offset` and `length` parameters properly to all possible data format readers.
+- It only uses the `findFormat(...)` method, which might be unable to accurately determine the appropriate data format based on just the byte array and not its position within the buffer.
+- As a result, it may default to using the entire byte array rather than processing a sub-range as expected.
+
+---
+
+### ✅ Solution:
+
+We need to explicitly test each `DataFormatReader` in the `_dataFormatReaders` list to see whether it **can read from the specific segment** defined by `offset` and `length`.
+
+Here’s how the corrected version should look:
+
+```java
+public <T> MappingIterator<T> readValues(byte[] src, int offset, int length)
+    throws IOException, JsonProcessingException
+{
+    if (_dataFormatReaders != null) {
+        for (DataFormatReader dr : _dataFormatReaders) {
+            if (dr.canRead(src, offset, length)) {
+                return _detectBindAndReadValues(dr, false);
+            }
+        }
+    }
+
+    // Fallback to standard JSON parsing if no data format matches
+    return _bindAndReadValues(
+        _considerFilter(_parserFactory.createParser(src, offset, length), true)
+    );
+}
+```
+
+---
+
+### 🧠 Why this works:
+
+- The loop over `DataFormatReader`s allows us to **select the best matching data format** for the *specific* subsection of the byte array (`src[offset:length]`) rather than the whole array.
+- We avoid calling `findFormat(...)` directly because that doesn’t fully account for the byte range; instead, we rely on `canRead(...)` for more precise filtering.
+- In the fallback case, the parser is still constructed with the correct `offset` and `length`, ensuring that the resulting `MappingIterator` processes the intended subset of the input array.
+
+---
+
+### 📌 Notes:
+
+- Ensure that your `DataFormatReader` implementation overrides the `canRead(byte[], int, int)` method so that it respects the offset and length.
+- This change improves compatibility with custom data formats that work on segments of a larger byte stream (e.g., streaming, partial reads).
+
+---
+
+### ✅ Result:
+
+After applying this fix, the `readValues` method now **correctly respects the offset and length parameters**, allowing applications to read only the required portion of the data, improving performance and correctness.

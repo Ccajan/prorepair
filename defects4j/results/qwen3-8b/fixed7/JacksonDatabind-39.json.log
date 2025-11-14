@@ -1,0 +1,181 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Jackson not continue to parse after DeserializationFeature.FAIL_ON_INVALID_SUBTYPE error
+After FAIL_ON_INVALID_SUBTYPE error, jackson should continue to parse, but seems jackson doesn't.
+The output:
+CallRecord [version=0.0, application=123, ] // doesn't read item2 which is valid
+CallRecord [version=0.0, application=123, ]
+CallRecord [version=0.0, ] // doesn't read application after invalid item.
+
+@JsonInclude(Include.NON_NULL)
+public class CallRecord {
+    public float version;
+    public String application;
+    public Item item;
+    public Item item2;
+    public CallRecord() {}
+
+    public static void main(final String[] args) throws IOException {
+        final ObjectMapper objectMapper = new ObjectMapper().disable(DeserializationFeature.FAIL_ON_INVALID_SUBTYPE,
+                DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, DeserializationFeature.FAIL_ON_IGNORED_PROPERTIES);
+        final CallRecord call = new CallRecord();
+
+        final Event event = new Event();
+        event.location = "location1";
+        call.item = event;
+        call.item2 = event;
+        call.application = "123";
+        // System.out.println(objectMapper.writeValueAsString(call));
+        String json =
+                "{\"version\":0.0,\"application\":\"123\",\"item\":{\"type\":\"xevent\",\"location\":\"location1\"},\"item2\":{\"type\":\"event\",\"location\":\"location1\"}}";
+        // can't read item2 - which is valid
+        System.out.println(objectMapper.readValue(json, CallRecord.class));
+
+        json = "{\"version\":0.0,\"application\":\"123\"},{\"item\":{\"type\":\"xevent\",\"location\":\"location1\"}";
+        System.out.println(objectMapper.readValue(json, CallRecord.class));
+
+        json = "{\"item\":{\"type\":\"xevent\",\"location\":\"location1\"}, \"version\":0.0,\"application\":\"123\"}";
+        // order matters: move item to the fornt, now it can't read application property
+        System.out.println(objectMapper.readValue(json, CallRecord.class));
+    }
+    @Override
+    public String toString() {
+        final StringBuilder builder = new StringBuilder();
+        builder.append("CallRecord [version=").append(version).append(", ");
+        if (application != null) {
+            builder.append("application=").append(application).append(", ");
+        }
+        if (item != null) {
+            builder.append("item=").append(item);
+        }
+        builder.append("]");
+        return builder.toString();
+    }
+}
+
+@JsonTypeInfo(use = JsonTypeInfo.Id.NAME, include = JsonTypeInfo.As.PROPERTY, property = "type", visible = true)
+@JsonSubTypes({@Type(value = Event.class, name = Event.TYPE)})
+public interface Item {
+}
+
+public final class Event implements Item {
+    public String location;
+    public static final String TYPE = "event";
+    public Event() {}
+}
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/deser/std/NullifyingDeserializer.java):
+```java
+public Object deserialize(JsonParser p, DeserializationContext ctxt) throws IOException
+{
+    // 29-Jan-2016, tatu: Simple skipping for all other tokens, but FIELD_NAME bit
+    //    special unfortunately
+        p.skipChildren();
+    return null;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public Object deserialize(JsonParser p, DeserializationContext ctxt) throws IOException
+{
+    // 29-Jan-2016, tatu: Skip any content that may be present within this element
+    // So skip past current token and any children
+    p.skipChildren();
+    return null;
+}
+```
+
+The problem here is that when deserializing invalid subtypes (like xevent instead of event), Jackson is not properly handling the parsing context. The original implementation skips all children, which leads to the parser not processing subsequent fields correctly. 
+
+To fix this issue, we need to modify the `deserialize` method to ensure that the parser continues processing after encountering an invalid subtype. Here's how:
+
+1. **Skip only the immediate content**: Instead of skipping all children, we should just skip the current token and leave the rest of the JSON structure intact. This way, the parser will continue reading subsequent fields.
+
+2. **Maintain proper state**: Ensure that the parser's internal state remains consistent so that the remaining fields can be processed without interference from the skipped content.
+
+Here is the corrected code:
+
+```java
+public Object deserialize(JsonParser p, DeserializationContext ctxt) throws IOException
+{
+    // Skip the current token (e.g., the object start or field value) but not its children
+    p.nextToken();
+    return null;
+}
+```
+
+By calling `p.nextToken()`, we advance the parser past the current token, allowing it to process the next elements in the JSON structure. This ensures that even after encountering an invalid subtype, the parser will continue reading the remaining fields as expected.
+
+Additionally, we should consider using more robust error handling to provide better feedback when invalid subtypes are encountered, while still maintaining the ability to parse the rest of the JSON document.
+
+### Key Points:
+- **Skipped Children vs Token**: Skipping children completely prevents further parsing. Instead, we should skip only the current token.
+- **Parser State**: Ensuring the parser state is correct allows for continued processing of the JSON.
+- **Robust Error Handling**: Providing meaningful error messages can help with debugging but does not interfere with parsing.
+
+With these changes, the `NullifyingDeserializer` will handle invalid subtypes appropriately without stopping the entire parsing process.
+</think>
+
+To address the issue where Jackson prematurely stops parsing after encountering an invalid subtype (`xevent` instead of the expected `event`), we need to understand the behavior of the `NullifyingDeserializer`. This deserializer is used internally by Jackson when it encounters an unexpected type during deserialization — such as an invalid subclass of a polymorphic type.
+
+---
+
+## 🔍 Problem Summary
+
+Jackson throws an exception if it detects an invalid subtype when using features like `FAIL_ON_INVALID_SUBTYPE`. However, your goal appears to be that **Jackson should ignore this invalid type**, yet continue parsing the rest of the JSON structure (including other properties).
+
+In your test case, you observe:
+
+```java
+CallRecord [version=0.0, application=123, ] 
+CallRecord [version=0.0, application=123, ]
+CallRecord [version=0.0, ]
+```
+
+These outputs indicate that **some fields (like `item2`) are not parsed** when an invalid subtype is found. Your current approach uses a custom deserializer that simply calls:
+
+```java
+p.skipChildren();  // Skips all children of the current token
+return null;
+```
+
+This causes Jackson to stop reading beyond the malformed subtype and does not attempt to parse any additional data, leading to incomplete objects being constructed.
+
+---
+
+## ✅ Solution
+
+We want **Jackson to skip only the current token (not its children)** and continue parsing the rest of the input. This change ensures that all subsequent properties (like `application`, `item2`, etc.) are parsed, even if one type is invalid.
+
+Here’s the fixed version of the deserializer:
+
+```java
+public Object deserialize(JsonParser p, DeserializationContext ctxt) throws IOException {
+    // Advance the parser to the next token (i.e., skip the current one),
+    // but do *not* skip its children.
+    p.nextToken();
+    return null;
+}
+```
+
+---
+
+## 📌 Why This Works
+
+- `p.nextToken()` advances the parser to the **next logical element** in the JSON stream (such as another object field).
+- It **does not skip the contents** of the current node, ensuring that any subsequent fields are still available for parsing.
+- This avoids prematurely terminating the overall parsing operation due to an invalid subtype.
+
+---
+
+## 🧠 Additional Notes
+
+- **Do Not Disable `FAIL_ON_INVALID_SUBTYPE`:**
+  If you disable this feature, Jackson will attempt to deserialize unknown types silently, possibly leading to unsafe deserialization. Use this setting carefully and consider validating types if security is a concern.
+
+- **Consider Using Custom Type Resolution:**
+  If the mismatch between `xevent` and `event` is frequent, you might consider implementing a custom resolver that maps the string `"xevent"`

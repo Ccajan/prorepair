@@ -1,0 +1,176 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Regression - Boolean attributes not collapsed when using HTML syntax
+Hello,
+First off, thanks for a really useful library.
+So, upgrading from 1.10.2 to 1.11.2 we see that boolean attributes are no longer collapsed when using html syntax. Example test case:
+    @Test
+    public void test() {
+        Document document = Jsoup.parse(
+                "<html><head></head><body><hr size=\"1\" noshade=\"\"></body></html>");
+        assertEquals("<html>\n" +
+                     " <head></head>\n" +
+                     " <body>\n" +
+                     "  <hr size=\"1\" noshade>\n" +
+                     " </body>\n" +
+                     "</html>",
+                     document.outerHtml());
+    }
+
+Tracked it down to commit "Refactored Attributes to be an array pair vs LinkedHashSet " ea1fb65. The Attibutes.html(final Appendable accum, final Document.OutputSettings out) method no longer uses Attribute and fails to check the value of the attribute for an empty string(line 320).
+If I may also suggest to use Attribute.shouldCollapseAttribute(String key, String val, Document.OutputSettings out) instead as a single source of truth as the boolean expression is complex enough and easy to make a mistake. Not sure if this would have an impact in performance though but I am guessing that optimizer will inline the call at some point anyways?
+This is an incorrect Java code (src/main/java/org/jsoup/nodes/Attributes.java):
+```java
+final void html(final Appendable accum, final Document.OutputSettings out) throws IOException {
+    final int sz = size;
+    for (int i = 0; i < sz; i++) {
+        // inlined from Attribute.html()
+        final String key = keys[i];
+        final String val = vals[i];
+        accum.append(' ').append(key);
+
+        // collapse checked=null, checked="", checked=checked; write out others
+        if (!(out.syntax() == Document.OutputSettings.Syntax.html
+            && (val == null || val.equals(key) && Attribute.isBooleanAttribute(key)))) {
+            accum.append("=\"");
+            Entities.escape(accum, val == null ? EmptyString : val, out, true, false, false);
+            accum.append('"');
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+Certainly! Let's walk through how to **repair** the problematic `html` method in the `Attributes` class within **Jsoup**, particularly the issue with **boolean attributes not being properly collapsed** after the refactoring.
+
+---
+
+## ✅ Problem Summary
+
+In your test case, you're observing that:
+
+- A boolean attribute like `noshade=""` (which should be collapsed into just `noshade`) is now being written as `noshade=""`.
+- This behavior changed in version **1.11.2**, likely due to the change in how attributes were stored internally (from a `LinkedHashSet` to an array).
+
+The problem lies in the logic used in the `html()` method, which incorrectly determines whether a boolean attribute should be collapsed.
+
+---
+
+## 🔍 Key Observation
+
+From the code snippet provided:
+
+```java
+if (!(out.syntax() == Document.OutputSettings.Syntax.html
+    && (val == null || val.equals(key) && Attribute.isBooleanAttribute(key)))) {
+```
+
+This condition checks if the attribute should **not** be collapsed. But there's a subtle logical error here: it returns `true` even if both conditions are met, leading to incorrect appending of quotes around the value — even for empty or boolean values.
+
+### ❌ Incorrect Behavior:
+- If the attribute name matches its value (`val.equals(key)`), and it’s a boolean attribute (`isBooleanAttribute(key)`), then it **should** be collapsed into just the key.
+
+---
+
+## ✅ Corrected Logic
+
+We want to append the attribute **without** quotes **only if** the following holds:
+- It is a boolean attribute
+- Its value is either `null`, `"true"` (case-insensitive), `"false"` (case-insensitive), or it matches the attribute name (i.e., `val.equals(key)`)
+
+Let’s restructure the condition so that it correctly identifies **collapsible** boolean attributes.
+
+Here is the corrected version of the `html` method:
+
+```java
+private final void html(final Appendable accum, final Document.OutputSettings out) throws IOException {
+    final int sz = size();
+    for (int i = 0; i < sz; i++) {
+        final String key = keys[i];
+        final String val = vals[i];
+
+        accum.append(' ').append(key);
+
+        // Decide whether to include value (and escape) or just append the key
+        if (!Attribute.shouldCollapseAttribute(key, val, out)) {
+            accum.append("=\"");
+            Entities.escape(accum, val == null ? "" : val, out, true, false, false);
+            accum.append('"');
+        }
+    }
+}
+```
+
+---
+
+## 📌 Additional Suggestion: Use Helper Method
+
+As you suggested, it's cleaner and safer to move the **collapsing logic** to a helper method `shouldCollapseAttribute`. Here’s what that could look like:
+
+```java
+private static boolean shouldCollapseAttribute(String key, String val, Document.OutputSettings out) {
+    if (out.syntax() != Document.OutputSettings.Syntax.html) {
+        return false;
+    }
+
+    // Collapse for boolean attributes if:
+    // 1. The value is empty or equal to the key (i.e., "true", "false")
+    // 2. Or the attribute is explicitly marked as boolean
+    return (val == null || val.trim().equalsIgnoreCase("true") || val.trim().equalsIgnoreCase("false"))
+           || Attribute.isBooleanAttribute(key);
+}
+```
+
+> ⚠️ Note: We use `.trim()` to ensure `"true "` or similar are still considered valid.
+
+---
+
+## ✅ Final Thoughts
+
+- This approach ensures consistent and correct behavior across all versions.
+- The helper function provides a **single source of truth**, improving maintainability and reducing errors.
+- No performance penalty expected — Java optimizers often inline such calls.
+
+---
+
+## ✅ Summary of Fix
+
+| Before | After |
+|-------|-------|
+| Direct conditional inside loop | Replaced with clean, readable helper method |
+| Unreliable collapsing logic | Precise logic based on JSoup's `isBooleanAttribute` and actual values |
+
+---
+
+## ✅ Updated Code Snippet
+
+Here's the fully updated code block you can use:
+
+```java
+private final void html(final Appendable accum, final Document.OutputSettings out) throws IOException {
+    final int sz = size();
+    for (int i = 0; i < sz; i++) {
+        final String key = keys[i];
+        final String val = vals[i];
+
+        accum.append(' ').append(key);
+
+        if (!Attribute.shouldCollapseAttribute(key, val, out)) {
+            accum.append("=\"");
+            Entities.escape(accum, val == null ? "" : val, out, true, false, false);
+            accum.append('"');
+        }
+    }
+}
+```
+
+--- 
+
+Let me know if you'd like this as a patch file or integration guide too!

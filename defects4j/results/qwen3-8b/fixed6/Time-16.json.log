@@ -1,0 +1,134 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# #148 DateTimeFormatter.parseInto broken when no year in format
+In Joda Time 2.0, the default year was set to 2000 so that Feb 29 could be parsed correctly. However, parseInto now overwrites the given instant's year with 2000 (or whatever iDefaultYear is set to). The correct behavior would seem to be to use the given instant's year instead of iDefaultYear.
+This does mean that Feb 29 might not be parseable if the instant's year is not a leap year, but in this case the caller asked for that in a sense.
+This is an incorrect Java code (src/main/java/org/joda/time/format/DateTimeFormatter.java):
+```java
+public int parseInto(ReadWritableInstant instant, String text, int position) {
+    DateTimeParser parser = requireParser();
+    if (instant == null) {
+        throw new IllegalArgumentException("Instant must not be null");
+    }
+    
+    long instantMillis = instant.getMillis();
+    Chronology chrono = instant.getChronology();
+    long instantLocal = instantMillis + chrono.getZone().getOffset(instantMillis);
+    chrono = selectChronology(chrono);
+    
+    DateTimeParserBucket bucket = new DateTimeParserBucket(
+        instantLocal, chrono, iLocale, iPivotYear, iDefaultYear);
+    int newPos = parser.parseInto(bucket, text, position);
+    instant.setMillis(bucket.computeMillis(false, text));
+    if (iOffsetParsed && bucket.getOffsetInteger() != null) {
+        int parsedOffset = bucket.getOffsetInteger();
+        DateTimeZone parsedZone = DateTimeZone.forOffsetMillis(parsedOffset);
+        chrono = chrono.withZone(parsedZone);
+    } else if (bucket.getZone() != null) {
+        chrono = chrono.withZone(bucket.getZone());
+    }
+    instant.setChronology(chrono);
+    if (iZone != null) {
+        instant.setZone(iZone);
+    }
+    return newPos;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+You're absolutely right—this behavior is problematic and has been reported as an issue in the Joda-Time project.
+
+### Problem Summary:
+
+The current implementation of `parseInto` **overwrites** the provided `instant`'s year with `iDefaultYear`, even though the user may have already specified a year through the `instant`. This can cause unexpected behavior, especially when parsing dates like "Feb 29" which only exist in leap years.
+
+If the input date is February 29th but the `instant`'s year is not a leap year (e.g., 2023), then Joda-Time will try to interpret it as being in the default year (say, 2000), which is a leap year. But once it parses it into the default year, it reassigns the entire `instant` to that year—which is **not what the user intended**.
+
+---
+
+### Suggested Fix:
+
+We need to ensure that the `instant`'s original **year is preserved**, and only modified if needed based on parsing rules (like leap-year handling or other date constraints).
+
+Here’s how we can fix the method:
+
+#### ✅ Corrected Code:
+```java
+public int parseInto(ReadWritableInstant instant, String text, int position) {
+    DateTimeParser parser = requireParser();
+    if (instant == null) {
+        throw new IllegalArgumentException("Instant must not be null");
+    }
+
+    long initialInstantMillis = instant.getMillis();
+    Chronology initialChrono = instant.getChronology();
+
+    // Preserve the original values before parsing
+    long originalInstantLocal = initialInstantMillis + initialChrono.getZone().getOffset(initialInstantMillis);
+
+    // Use the original chronology (no zone change yet)
+    Chronology chrono = initialChrono;
+
+    DateTimeParserBucket bucket = new DateTimeParserBucket(
+        originalInstantLocal, chrono, iLocale, iPivotYear, iDefaultYear);
+    int newPos = parser.parseInto(bucket, text, position);
+
+    // Now compute the final millisecond value based on parsed result
+    long computedMillis = bucket.computeMillis(false, text);
+
+    // Set the millisecond value without modifying the year from the original instant,
+    // unless necessary (e.g., due to invalid date, e.g., Feb 29 in non-leap year)
+    // In such cases, fallback to the iDefaultYear
+    if (bucket.isInvalid()) {
+        // Fallback to default year if the date is invalid
+        long adjustedMillis = bucket.computeMillis(true, text); // Adjust using default year
+        instant.setMillis(adjustedMillis);
+    } else {
+        // If valid, preserve the year from the original instant
+        long baseMillis = initialInstantMillis - (initialInstantMillis % MILLIS_PER_YEAR);
+        long newYearMillis = baseMillis + ((computedMillis / MILLIS_PER_YEAR) * MILLIS_PER_YEAR);
+        long remainingMillis = computedMillis - newYearMillis;
+        instant.setMillis(newYearMillis + remainingMillis);
+    }
+
+    // Apply any time zone changes from the parsing result
+    if (iOffsetParsed && bucket.getOffsetInteger() != null) {
+        int parsedOffset = bucket.getOffsetInteger();
+        DateTimeZone parsedZone = DateTimeZone.forOffsetMillis(parsedOffset);
+        chrono = chrono.withZone(parsedZone);
+    } else if (bucket.getZone() != null) {
+        chrono = chrono.withZone(bucket.getZone());
+    }
+
+    instant.setChronology(chrono);
+    if (iZone != null) {
+        instant.setZone(iZone);
+    }
+
+    return newPos;
+}
+```
+
+---
+
+### Key Changes & Explanation:
+
+- We **preserve** the original year from the `instant` to avoid overriding it with `iDefaultYear`.
+- When parsing yields a **valid date**, we construct the final millisecond value by combining the **original year** with the **parsed date components**.
+- If parsing results in an **invalid date** (e.g., Feb 29 in 2023), we fall back to using `iDefaultYear` as a safety net.
+- This ensures the **caller's intent** is respected: if they provided an `instant`, their year is used unless a specific date constraint forces a correction.
+
+---
+
+### Conclusion:
+
+The key issue was that the original logic treated the `instant` as a blank slate rather than preserving the user-provided context. By properly separating out the original year from the parsed result, we make the API more predictable and aligned with expectations.
+
+If you'd like, I can also help refactor the rest of the file or provide documentation around these fixes. Let me know!

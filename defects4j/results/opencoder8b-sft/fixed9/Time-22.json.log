@@ -1,0 +1,164 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# #113 Duration.toPeriod with fixed time zones.
+I have a question concerning the conversion of a Duration to Period. I'm not sure if this is a bug, or if there is a different way to do this.
+The basis of the problem, is that using Duration.toPeriod() uses the chronology of the default time zone to do the conversion. This can cause different results from a timezone with DST and one without. This can be reproduced easily with this test.
+//set default time zone with this argument -Duser.timezone="GMT"
+public void testForJodaForum()
+{
+    System.out.println("Timezone: " + DateTimeZone.getDefault());
+
+    //Duration of more than 24 hours
+    Duration aDuration = new Duration(DateTimeConstants.MILLIS_PER_HOUR * 30 + DateTimeConstants.MILLIS_PER_MINUTE * 50
+        + DateTimeConstants.MILLIS_PER_SECOND * 14);
+
+    System.out.println("Duration before: " + aDuration);
+    Period period = aDuration.toPeriod();
+    System.out.println("Period after: " + period);        
+}
+
+A fixed time zone produces this output
+Timezone: Etc/GMT
+Duration before: PT111014S
+Period after: P1DT6H50M14S
+A DST time zone produces this output
+Timezone: America/Chicago
+Duration before: PT111014S
+Period after: PT30H50M14S
+In the joda code, Duration.toPeriod() uses a period constructor that takes the chronology, but null is passed in, so the chronology of the default time zone is used, which leads to this behavior.
+The javadoc of toPeriod() states that only precise fields of hours, minutes, seconds, and millis will be converted. But for a fixed timezone, days and weeks are also precise, which is stated in the javadoc for toPeriod(Chronology chrono). In our app, we need consistent behavior regardless of the default time zone, which is to have all the extra hours put into the hours bucket. Since Duration is supposed to be a 'time zone independent' length of time, I don't think we should have to do any chronology manipulation to get this to work.
+Any help is appreciated.
+Thanks,
+Cameron
+This is an incorrect Java code (src/main/java/org/joda/time/base/BasePeriod.java):
+```java
+protected BasePeriod(long duration) {
+    this(duration, null, null);
+    // bug [3264409]
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+package org.joda.time;
+
+import java.util.concurrent.TimeUnit;
+import org.joda.convert.FromString;
+import org.joda.time.format.DateTimeFormatter;
+import static org.joda.time.base.BaseLocal.invalidInstant;
+import static org.joda.time.base.BaseDateTime.removeMillis;
+
+/**
+ * A duration in standard java.util.Date format.
+ *
+ * @author Brian S O'Neill
+ * @since 1.0
+ */
+@FromString
+public class Duration extends ReadableInterval {
+
+    public final static long MILLIS_PER_SECOND = TimeUnit.SECONDS.toMillis(1L);
+    public final static long SECONDS_PER_MINUTE = TimeUnit.MINUTES.toSeconds(1L);
+    public final static long MINUTES_PER_HOUR = TimeUnit.HOURS.toMinutes(1L);
+    public final static long HOURS_PER_DAY = 24;
+    public final static long DAYS_PER_YEAR = 365;
+    public final static int[] DAYS_IN_MONTH = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+
+    /** The number of milliseconds per hour. */
+    private static final long MILLIS_PER_HOUR = TimeUnit.HOURS.toMillis(1L);
+    /** The number of milliseconds per minute. */
+    private static final long MILLIS_PER_MINUTE = TimeUnit.MINUTES.toMillis(1L);
+    /** The number of milliseconds per second. */
+    private static final long MILLIS_PER_SECOND = TimeUnit.SECONDS.toMillis(1L);
+
+    /**
+     * Creates a duration based on a single unit of time.
+     *
+     * @param amount  the amount of the unit
+     * @param unit    the time unit, not null
+     * @return the readble instance, not null
+     */
+    public static Duration forFields(DurationField... fields) {
+        return new Duration(getDuration(fields));
+    }
+
+    private static long getDuration(DurationField[] fields) {
+        long instant = invalidInstant;
+        for (int i=fields.length-1; i>=0; --i) {
+            DurationField field = fields[i];
+            if (field != null) {
+                instant += field.getUnitMillis() * field.getValueAsLong();
+            }
+        }
+        return removeMillis(instant);
+    }
+
+    protected final long iDuration;
+
+    /**
+     * Constructor.
+     *
+     * @param duration the duration in milliseconds
+     */
+    protected Duration(long duration) {
+        super(null, null);
+        iDuration = duration;
+    }
+
+    public Duration withPeriodAdded(ReadablePeriod period, boolean positive) {
+        Chronology chrono = getChronology();
+        DateTime start = chrono.date().withMillis(getStartMillis()).plus(period, positive);
+        DateTime end = chrono.date().withMillis(getEndMillis()).plus(period, positive);
+        if (start.isAfter(end)) {
+            throw new ArithmeticException("Resulting interval has start > end");
+        }
+        return new Duration(start, end);
+    }
+
+    public Period toPeriod() {
+        return toPeriod(getChronology());
+    }
+
+    public Period toPeriod(Chronology chrono) {
+        long[] values = {0, 0, 0, 0};
+        if (hasMillis()) {
+            long millis = abs(getMillis());
+            values[3] = millis % 1000;
+            millis /= 1000;
+            values[2] = millis % 60;
+            millis /= 60;
+            values[1] = millis % 60;
+            millis /= 60;
+            values[0] = millis;
+        }
+        return new Period(chrono, values);
+    }
+
+    public ReadableDuration dividedBy(int factor) {
+        if (factor < 1) {
+            throw new IllegalArgumentException("Factor must be greater than zero");
+        }
+        return new Duration(iDuration / factor);
+    }
+
+    public long getMillis() {
+        return iDuration;
+    }
+
+    public String toString() {
+        return "P" +
+                getYears() + "Y" +
+                getMonthsOfYear() + "M" +
+                getWeeksOfWeekyear() + "W" +
+                getDays() + "D" +
+                ((hasHours() || hasMinutes() || hasSeconds() || hasMillis()) ? "T" : "") +
+                getHours() + "H" +
+                getMinutes() + "M" +
+                getSeconds() + "S";
+    }
+}
+```

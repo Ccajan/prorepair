@@ -1,0 +1,191 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# arguments is moved to another scope
+Using ADVANCED_OPTIMIZATIONS with CompilerOptions.collapsePropertiesOnExternTypes = true a script I used broke, it was something like:
+
+function () {
+  return function () {
+    var arg = arguments;
+    setTimeout(function() { alert(args); }, 0);
+  }
+}
+
+Unfortunately it was rewritten to:
+
+function () {
+  return function () {
+    setTimeout(function() { alert(arguments); }, 0);
+  }
+}
+
+arguments should not be collapsed.
+This is an incorrect Java code (src/com/google/javascript/jscomp/CollapseProperties.java):
+```java
+private void inlineAliases(GlobalNamespace namespace) {
+  // Invariant: All the names in the worklist meet condition (a).
+  Deque<Name> workList = new ArrayDeque<Name>(namespace.getNameForest());
+  while (!workList.isEmpty()) {
+    Name name = workList.pop();
+
+    // Don't attempt to inline a getter or setter property as a variable.
+    if (name.type == Name.Type.GET || name.type == Name.Type.SET) {
+      continue;
+    }
+
+    if (name.globalSets == 1 && name.localSets == 0 &&
+        name.aliasingGets > 0) {
+      // {@code name} meets condition (b). Find all of its local aliases
+      // and try to inline them.
+      List<Ref> refs = Lists.newArrayList(name.getRefs());
+      for (Ref ref : refs) {
+        if (ref.type == Type.ALIASING_GET && ref.scope.isLocal()) {
+          // {@code name} meets condition (c). Try to inline it.
+          if (inlineAliasIfPossible(ref, namespace)) {
+            name.removeRef(ref);
+          }
+        }
+      }
+    }
+
+    // Check if {@code name} has any aliases left after the
+    // local-alias-inlining above.
+    if ((name.type == Name.Type.OBJECTLIT ||
+         name.type == Name.Type.FUNCTION) &&
+        name.aliasingGets == 0 && name.props != null) {
+      // All of {@code name}'s children meet condition (a), so they can be
+      // added to the worklist.
+      workList.addAll(name.props);
+    }
+  }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+The issue is that the current implementation may be incorrectly collapsing 'arguments' properties when they shouldn't be. The code tries to inline aliases under certain conditions, but doesn't account for special cases like 'arguments'. 
+
+Here's a revised version of the method:
+
+private void inlineAliases(GlobalNamespace namespace) {
+  Deque<Name> workList = new ArrayDeque<>(namespace.getNameForest());
+  
+  while (!workList.isEmpty()) {
+    Name name = workList.pop();
+    
+    // Skip getters, setters, and arguments (special case)
+    if (name.type == Name.Type.GET || 
+        name.type == Name.Type.SET || 
+        name.name.equals("arguments")) {
+      continue;
+    }
+
+    if (name.globalSets == 1 && name.localSets == 0 &&
+        name.aliasingGets > 0) {
+      
+      List<Ref> refs = Lists.newArrayList(name.getRefs());
+      for (Ref ref : refs) {
+        if (ref.type == Type.ALIASING_GET && ref.scope.isLocal()) {
+          if (inlineAliasIfPossible(ref, namespace)) {
+            name.removeRef(ref);
+          }
+        }
+      }
+    }
+
+    if ((name.type == Name.Type.OBJECTLIT ||
+         name.type == Name.Type.FUNCTION) &&
+        name.aliasingGets == 0 && name.props != null) {
+      workList.addAll(name.props);
+    }
+  }
+}
+
+The key change is adding a check for the 'arguments' identifier. This prevents the code from attempting to inline aliases for the special 'arguments' object, which should remain untouched during optimizations.
+
+Note that this solution assumes that:
+1. The 'arguments' object is always identified by the string "arguments"
+2. We want to completely skip processing of 'arguments' properties
+3. The rest of the code correctly handles other alias inlining scenarios
+
+In a real-world scenario, we might want to add more sophisticated checks, such as checking if the name refers to the 'arguments' object rather than just matching the string, especially if there are variables named "arguments" in the code.
+</think>
+
+The problem described involves an issue with JavaScript compiler optimization where the `arguments` object is being incorrectly collapsed or optimized away, leading to unexpected behavior in code. The root cause lies in how the optimizer processes variable references, particularly with `arguments`.
+
+---
+
+### ✅ **Understanding the Problem**
+
+The original code snippet illustrates how the `arguments` variable is used inside a nested function:
+
+```js
+function () {
+  return function () {
+    var arg = arguments;
+    setTimeout(function() { alert(arg); }, 0);
+  };
+};
+```
+
+When optimizing using `ADVANCED_OPTIMIZATIONS` and setting `collapsePropertiesOnExternTypes = true`, the compiler may reinterpret `arg = arguments;` and replace `arguments` with itself in later code. That leads to losing access to the actual `arguments` object — which is **not** what the developer intended.
+
+As seen in your example, this results in the following broken transformation:
+
+```js
+function () {
+  return function () {
+    setTimeout(function() { alert(arguments); }, 0);
+  };
+};
+```
+
+Even though the same reference (`arguments`) is still present in the function call, the use of `arguments` here doesn’t retain the value assigned to `arg`. Therefore, this kind of optimization can break expected behaviors involving the `arguments` object.
+
+---
+
+### ⚠️ **Why is this dangerous?**
+
+- The `arguments` object is **not a regular variable**; it's a special built-in object tied directly to the function invocation context.
+- Optimizing or rewriting its usage can lead to:
+  - Loss of function argument values.
+  - Misaligned function execution expectations.
+  - Unexpected errors when trying to refer back to the original function’s parameters.
+
+So, it must be treated carefully.
+
+---
+
+### 🔧 **Fix Proposal: Avoid Collapsing `arguments` in Optimization Passes**
+
+To fix this, we need to prevent the optimizer from inlining or replacing the `arguments` reference in code transformations.
+
+The original faulty logic comes from `CollapseProperties.java` in `inlineAliases()` function, which attempts to inline variable aliases in various contexts. We need to modify that logic to exclude `arguments`.
+
+---
+
+### ✅ **Revised Java Code Fix**
+
+Below is a corrected and updated version of the relevant section of your code:
+
+```java
+private void inlineAliases(GlobalNamespace namespace) {
+  Deque<Name> workList = new ArrayDeque<>(namespace.getNameForest());
+
+  while (!workList.isEmpty()) {
+    Name name = workList.pop();
+
+    // Skip getters, setters, and the 'arguments' object
+    if (name.type == Name.Type.GET ||
+        name.type == Name.Type.SET ||
+        name.name.equals("arguments")) {
+      continue;
+    }
+
+    if (name.globalSets == 1 && name.localSets == 0 &&
+        name.aliasingGets > 0) {
+
+      List<Ref> refs = Lists.newArrayList(name.get

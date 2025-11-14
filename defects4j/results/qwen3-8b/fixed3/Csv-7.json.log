@@ -1,0 +1,169 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# HeaderMap is inconsistent when it is parsed from an input with duplicate columns names
+Given a parser format for csv files with a header line:
+{code}
+CSVFormat myFormat = CSVFormat.RFC4180.withDelimiter(",").withQuoteChar('"').withQuotePolicy(Quote.MINIMAL)
+				.withIgnoreSurroundingSpaces(true).withHeader().withSkipHeaderRecord(true);
+{code}
+
+And given a file with duplicate header names:
+ 
+Col1,Col2,Col2,Col3,Col4
+1,2,3,4,5
+4,5,6,7,8 
+
+The HeaderMap returned by the parser misses an entry because of the Column name being used as a key, leading to wrong behavior when we rely on it.
+
+If this is not supposed to happen in the file regarding the CSV format, at least this should raise an error. If not we should come up with a more clever way to store and access the headers.
+
+This is an incorrect Java code (src/main/java/org/apache/commons/csv/CSVParser.java):
+```java
+private Map<String, Integer> initializeHeader() throws IOException {
+        Map<String, Integer> hdrMap = null;
+        final String[] formatHeader = this.format.getHeader();
+        if (formatHeader != null) {
+            hdrMap = new LinkedHashMap<String, Integer>();
+
+            String[] header = null;
+            if (formatHeader.length == 0) {
+                // read the header from the first line of the file
+                final CSVRecord nextRecord = this.nextRecord();
+                if (nextRecord != null) {
+                    header = nextRecord.values();
+                }
+            } else {
+                if (this.format.getSkipHeaderRecord()) {
+                    this.nextRecord();
+                }
+                header = formatHeader;
+            }
+
+            // build the name to index mappings
+            if (header != null) {
+                for (int i = 0; i < header.length; i++) {
+                    hdrMap.put(header[i], Integer.valueOf(i));
+                }
+            }
+        }
+        return hdrMap;
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import org.apache.commons.csv.CSVFormat;
+import org.apache.commons.csv.CSVParser;
+import org.apache.commons.csv.CSVRecord;
+
+import java.io.FileReader;
+import java.io.IOException;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+public class Main {
+
+    public static void main(String[] args) throws IOException {
+        CSVFormat myFormat = CSVFormat.RFC4180.withDelimiter(",")
+                .withQuoteChar('"')
+                .withQuotePolicy(CSVFormat.Quote.MINIMAL)
+                .withIgnoreSurroundingSpaces(true)
+                .withHeader()
+                .withSkipHeaderRecord(true);
+
+        try (CSVParser parser = CSVParser.parse(new FileReader("path/to/file.csv"), myFormat)) {
+            Map<String, Integer> headerMap = parser.getHeaderMap();
+
+            System.out.println("Header Map:");
+            for (Map.Entry<String, Integer> entry : headerMap.entrySet()) {
+                System.out.println(entry.getKey() + " -> " + entry.getValue());
+            }
+        }
+    }
+}
+```
+
+Now let's analyze what's going on here:
+
+The original code has a problem with handling duplicate column names in CSV headers. When parsing a CSV file with duplicate headers like "Col2" appearing twice, the current implementation using a `LinkedHashMap` will only retain the last occurrence of each header name. This can lead to incorrect mapping when trying to access specific columns based on their header names.
+
+To fix this issue, I'll modify the code to handle duplicate headers properly. The solution involves changing the data structure used to store the header map to be able to hold multiple entries per header name.
+
+Here's my revised version of the method:
+
+```java
+private Map<String, java.util.List<Integer>> initializeHeader() throws IOException {
+    Map<String, java.util.List<Integer>> hdrMap = null;
+    final String[] formatHeader = this.format.getHeader();
+    if (formatHeader != null) {
+        hdrMap = new LinkedHashMap<>();
+
+        String[] header = null;
+        if (formatHeader.length == 0) {
+            // Read the header from the first line of the file
+            final CSVRecord nextRecord = this.nextRecord();
+            if (nextRecord != null) {
+                header = nextRecord.values();
+            }
+        } else {
+            if (this.format.getSkipHeaderRecord()) {
+                this.nextRecord();
+            }
+            header = formatHeader;
+        }
+
+        // Build the name to index mappings
+        if (header != null) {
+            for (int i = 0; i < header.length; i++) {
+                String headerName = header[i];
+                hdrMap.computeIfAbsent(headerName, k -> new java.util.ArrayList<>()).add(i);
+            }
+        }
+    }
+    return hdrMap;
+}
+```
+
+In this solution, I've changed the `hdrMap` from a `Map<String, Integer>` to a `Map<String, List<Integer>>`. This allows us to store all the indices where each header name appears. The `computeIfAbsent` method ensures that if a header name doesn't exist in the map yet, we create a new list for it and add the current index to the list. If the header name already exists, we simply add the index to the existing list.
+
+This approach handles duplicates correctly while maintaining the order of headers, which is important for CSV parsing. With this change, when accessing headers through the map, you'll get all the indices associated with each header name, allowing for proper handling of duplicate headers in your CSV processing.
+</think>
+
+To address the issue of duplicate header names in a CSV file when using Apache Commons CSV, we need to **modify the internal logic** that maps header names to their respective column positions. Specifically, the original `initializeHeader()` method uses a `Map<String, Integer>` which **overwrites duplicate keys**, resulting in loss of data and potential bugs.
+
+---
+
+### ✅ Problem Summary
+
+- **Issue**: Duplicate header names like `"Col2"` appear in the same row.
+- **Impact**: Using `Map<String, Integer>` causes the last occurrence of the header to overwrite previous ones.
+- **Result**: Missing or incorrect header mappings, which affects reliable column access during data processing.
+
+---
+
+### 🔧 Solution: Store Multiple Indexes for Duplicate Headers
+
+We replace `Map<String, Integer>` with `Map<String, List<Integer>>`, enabling the storage of **multiple indices** for duplicate headers. This preserves all positions where a particular header occurs, avoiding data loss.
+
+#### ✅ Revised Code:
+
+```java
+import org.apache.commons.csv.CSVFormat;
+import org.apache.commons.csv.CSVParser;
+import org.apache.commons.csv.CSVRecord;
+
+import java.io.FileReader;
+import java.io.IOException;
+import java.util.*;
+
+public class CsvHeaderFix {
+
+    public static void main(String[] args) throws IOException {
+        // Define CSV format with skip header and custom parsing rules
+        CSVFormat myFormat = CSVFormat.RFC4180.withDelimiter(",")
+                .withQuoteChar('"')
+                .withQuotePolicy(CSVFormat.Quote.MIN

@@ -1,0 +1,154 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Mockito can't create mock on public class that extends package-private class
+I created simple project to demonstrate this:
+https://github.com/astafev/mockito-package-private-class/
+
+Please take a look. Even if it can't be implemented, I think that mockito should throw some normal exception at time of creation.
+In my variant on first creation it returns wrong-working mock (invokes real method instead of stubbed). On second creation throws exception that doesn't really connected with problem.
+
+Everything works fine if you mock package-private parent.
+
+This is an incorrect Java code (src/org/mockito/internal/configuration/SpyAnnotationEngine.java):
+```java
+@SuppressWarnings("deprecation")
+    public void process(Class<?> context, Object testClass) {
+        Field[] fields = context.getDeclaredFields();
+        for (Field field : fields) {
+            if (field.isAnnotationPresent(Spy.class)) {
+                assertNoAnnotations(Spy.class, field, Mock.class, org.mockito.MockitoAnnotations.Mock.class, Captor.class);
+                boolean wasAccessible = field.isAccessible();
+                field.setAccessible(true);
+                try {
+                    Object instance = field.get(testClass);
+                    if (instance == null) {
+                        throw new MockitoException("Cannot create a @Spy for '" + field.getName() + "' field because the *instance* is missing\n" +
+                        		  "The instance must be created *before* initMocks();\n" +
+                                  "Example of correct usage of @Spy:\n" +
+                            	  "   @Spy List mock = new LinkedList();\n" +
+                            	  "   //also, don't forget about MockitoAnnotations.initMocks();");
+
+                    }
+                    if (new MockUtil().isMock(instance)) { 
+                        // instance has been spied earlier
+                        Mockito.reset(instance);
+                    } else {
+                        field.set(testClass, Mockito.spy(instance));
+                    }
+                } catch (IllegalAccessException e) {
+                    throw new MockitoException("Problems initiating spied field " + field.getName(), e);
+                } finally {
+                    field.setAccessible(wasAccessible);
+                }
+            }
+        }
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+package org.mockito.internal.configuration;
+
+import java.lang.annotation.Annotation;
+import java.lang.reflect.Field;
+import java.util.HashSet;
+import java.util.Set;
+import javax.annotation.Nullable;
+import org.mockito.exceptions.base.MockitoException;
+import org.mockito.internal.creation.instance.CglibMockMaker;
+import org.mockito.internal.creation.utility.MockitoTypeExtractor;
+import org.mockito.internal.util.Primitives;
+import static org.mockito.Mockito.mockingDetails;
+public class SpyAnnotationEngine extends AnnotationEngine {
+    private final Set<Object> alreadySpiedObjects = new HashSet<>();
+    @Override
+    protected void process(Class<?> context, Object testClass) {
+        Field[] fields = context.getDeclaredFields();
+        for (Field field : fields) {
+            if (field.isAnnotationPresent(Spy.class)) {
+                assertNoAnnotations(Spy.class, field, Mock.class, org.mockito.MockitoAnnotations.Mock.class, Captor.class);
+                if (field.getType().equals(Primitives.toWrapper(context))) {
+                    processStaticSpy(field);
+                    return;
+                }
+                Class<?> typeToCreateMockFor = MockitoTypeExtractor.findActualTypeArgument(field);
+                if (!alreadySpiedObjects.contains(typeToCreateMockFor)) {
+                    CglibMockMaker.createMock(Object.class, new HashSet<>());
+                    alreadySpiedObjects.add(typeToCreateMockFor);
+                }
+                tryMakeAccessibleAndSet(field, testClass, Mockito.spy(typeToCreateMockFor));
+            }
+        }
+    }
+    private void processStaticSpy(Field field) {
+        Class<?> context = getContextOfField(field);
+        boolean wasAccessible = field.isAccessible();
+        field.setAccessible(true);
+        if (field.trySet(null, Mockito.mock(context))) {
+            throw new MockitoException("Could not initialize a static spy. Make sure you have instantiated your object before calling 'mock(MyObjectWithStaticMethod.class)'");
+        }
+        field.setAccessible(wasAccessible);
+    }
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private <T> T instantiateIfNeeded(Class<T> mockedType, String message) {
+        try {
+            return (T) mockedType.newInstance();
+        } catch (InstantiationException | IllegalAccessException ex) {
+            throw new MockitoException(message, ex);
+        }
+    }
+    private <T> T extractFromParentIfExists(@Nullable Class<T> mockedType,
+                                                   String message) {
+        try {
+            return mockedType.getField("mock").get(null);
+        } catch (IllegalArgumentException | NoSuchFieldException |
+                 SecurityException | IllegalAccessException ex) {
+            return null;
+        }
+    }
+    private void tryMakeAccessibleAndSet(Field field,
+                                                Object testInstance,
+                                                Object mock) {
+        boolean wasAccessible = field.isAccessible();
+        field.setAccessible(true);
+        makeSureWeCreateNewMockPerTest(
+                testInstance,
+                mock,
+                "You have two different fields with @Spy: "
+                        + field.getName()
+                        + " and "
+                        + getOtherFieldName(field, testInstance.getClass()));
+        setMockOnField(field, testInstance, mock);
+        field.setAccessible(wasAccessible);
+    }
+    private static String getOtherFieldName(Field field, Class<?> clazz) {
+        for (Field f : clazz.getDeclaredFields()) {
+            if (f != field && f.isAnnotationPresent(Spy.class)) {
+                return f.getName();
+            }
+        }
+        return "";
+    }
+    private <T> void makeSureWeCreateNewMockPerTest(
+            Object testInstance,
+            T mock,
+            String messageWhenDuplicatedSpy) {
+        if (isAlreadySpiedMock(testInstance, mock)) {
+            throw new MockitoException(messageWhenDuplicatedSpy);
+        }
+    }
+    private boolean isAlreadySpiedMock(Object testInstance, Object mock) {
+        return mockingDetails(mock).getMockCreationSettings().isDefaultMock();
+    }
+    private <T> void setMockOnField(Field field, Object testInstance, T mock) {
+        Reflection.switchReturnType((ReflectionInvocationHandler)
+                Reflection.getJavaDelegate(mock), Primitives.unwrap(mock.getClass()));
+        Reflection.setter(field.getName(), field.getType()).invoke(testInstance, mock);
+    }
+}
+```
+

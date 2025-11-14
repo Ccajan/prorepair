@@ -1,0 +1,170 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Cleaning html containing the cid identifier breaks images
+Ok, so in mail type HTML the following is common
+
+The item after CID: can be almost anything (US-ASCII I think) and of any length. It corresponds to an image linked elsewhere in MIME say like this
+--mimebounday
+Content-ID:
+Content-Type: image/jpeg.....
+(snip)
+So, to mark a long story somewhat shorter, I use Jsoup's sanitizer extensively. However, I need these CID references to be preserved post sanitization. addProtocols does not work because the items are not valid URLs. As a result
+the above becomes . Which for my purposes is not good :)
+This is an incorrect Java code (src/main/java/org/jsoup/safety/Whitelist.java):
+```java
+private boolean testValidProtocol(Element el, Attribute attr, Set<Protocol> protocols) {
+    // try to resolve relative urls to abs, and optionally update the attribute so output html has abs.
+    // rels without a baseuri get removed
+    String value = el.absUrl(attr.getKey());
+    if (!preserveRelativeLinks)
+        attr.setValue(value);
+    
+    for (Protocol protocol : protocols) {
+        String prot = protocol.toString() + ":";
+        if (value.toLowerCase().startsWith(prot)) {
+            return true;
+        }
+    }
+    return false;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import org.jsoup.nodes.Attribute;
+import org.jsoup.nodes.Element;
+import org.jsoup.safety.Protocol;
+
+public class Whitelist {
+
+    private final static Set<Protocol> VALID_CIDS_PROTOCOLS = new HashSet<>(Arrays.asList(
+            Protocol.CID,
+            Protocol.MIME,
+            Protocol.DATA
+    ));
+
+    private boolean testValidProtocol(Element el, Attribute attr, Set<Protocol> protocols) {
+        // Try to resolve relative URLs to absolute URLs, but leave CID/MIME/Data as they are
+        String value = attr.getValue();  // Do not call absUrl for CID/MIME/Data
+        
+        // Check if it's a CID or MIME or DATA protocol
+        for (Protocol protocol : protocols) {
+            String prot = protocol.toString().toLowerCase();
+            if (value.toLowerCase().startsWith(prot + ":")) {
+                return true;
+            }
+        }
+
+        // If not a known protocol, check if it's a valid URL
+        try {
+            URI uri = new URI(value);
+            String scheme = uri.getScheme().toLowerCase();
+            for (Protocol p : protocols) {
+                if (p.toString().equalsIgnoreCase(scheme)) {
+                    return true;
+                }
+            }
+        } catch (URISyntaxException e) {
+            // Not a valid URL, proceed to check against allowed protocols
+        }
+
+        return false;
+    }
+}
+```
+
+Here's what this solution does:
+
+1. Added a new constant `VALID_CIDS_PROTOCOLS` that includes CID, MIME, and DATA protocols
+2. Modified the method to:
+   - First check if the value starts with any of the known CID/MIME/Data protocols
+   - If not, attempt to parse it as a URL and check if it matches any of the allowed protocols
+3. Removed the call to `absUrl()` for CID/MIME/Data values since those should remain as-is
+
+The key change is that we're no longer calling `el.absUrl(attr.getKey())` which would convert CID references to absolute URLs. Instead, we're directly using the original value from the attribute.
+
+For your specific case with CID references, you'd want to ensure that when you're processing attributes, you're checking if they start with "cid:" before trying to resolve them as URLs.
+
+Let me know if you'd like help integrating this into your existing codebase or implementing a custom filter for CID references.
+</think>
+
+To preserve `cid:` references during HTML sanitization while maintaining compatibility with `Jsoup`, we need to modify the `testValidProtocol` method in the `Whitelist` class. The issue arises because `absUrl()` incorrectly processes CID-based URLs as if they were standard URLs, which breaks their intended purpose in email contexts where they point to inline resources via MIME attachments.
+
+---
+
+### ✅ Key Solution Overview
+
+1. **Preserve CID Values**  
+   Avoid using `absUrl()` on CID values. These strings like `cid:image1.jpg` are identifiers and shouldn't be resolved.
+
+2. **Check Protocols Directly**  
+   Inspect the string manually to determine whether it starts with `"cid:"`, `"data:"`, or `"mimetype:"`. This allows you to skip the resolution step entirely for such cases.
+
+3. **URL Validation for Other Cases**  
+   For non-CID strings, safely validate them as URLs by parsing with `URI`.
+
+4. **Custom Protocols List**  
+   Add a set of accepted protocols that include `CID`, `MIME`, and `DATA` so they match correctly.
+
+---
+
+### ✅ Updated Java Code
+
+Below is the corrected implementation of the `testValidProtocol` function:
+
+```java
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.Arrays;
+
+import org.jsoup.nodes.Attribute;
+import org.jsoup.nodes.Element;
+import org.jsoup.safety.Protocol;
+
+public class Whitelist {
+
+    private static final Set<String> ALLOWED_PROTOCOLS = new HashSet<>(Arrays.asList(
+            "cid", "data", "http", "https", "ftp"
+    ));
+
+    public boolean testValidProtocol(Element el, Attribute attr, Set<Protocol> protocols) {
+        String value = attr.getValue();
+
+        // Check if the value starts with any of our allowed CID-style protocols
+        for (String protocol : ALLOWED_PROTOCOLS) {
+            if (value.toLowerCase().startsWith(protocol + ":")) {
+                return true;
+            }
+        }
+
+        // If not a known protocol, try parsing it as a full URL
+        try {
+            URI uri = new URI(value);
+            String scheme = uri.getScheme().toLowerCase();
+
+            for (Protocol p : protocols) {
+                if (p.toString().equalsIgnoreCase(scheme)) {
+                    return true;
+                }
+            }
+        } catch (URISyntaxException e) {
+            // Not a valid URL, ignore and let validation continue
+        }
+
+        return false;
+    }
+}
+```
+
+---
+
+### 📌 Notes
+
+- **Why not use `absUrl()`?**  
+  Because CID values like `cid:abc@def` are

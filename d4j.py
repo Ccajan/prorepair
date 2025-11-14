@@ -288,13 +288,13 @@ def set_file_limits():
 
 # 设置模型别名前缀对应的开头与结尾提示
 MODEL_PROMPT_FORMATS = {
-    'qwen': ('<|im_start|>user\n', '<|im_end|>\n<|im_start|>assistant\n'),
+    # 'qwen': ('<|im_start|>user\n', '<|im_end|>\n<|im_start|>assistant\n'),
     'codellama': ('[INST]', '[/INST]'),
     'llama': ('[INST]', '[/INST]'),
     'llama3': ('<|begin_of_text|><|start_header_id|>system<|end_header_id|>\nYou are a helpful assistant<|eot_id|><|start_header_id|>user<|end_header_id|>\n', '<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n'),
     'mistral': ('[INST]', '[/INST]'),
     'deepseek': ('You are an AI programming assistant, utilizing the DeepSeek Coder model, developed by DeepSeek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer.\n### Instruction:\n', '\n### Response:\n'),
-    'qwen2.5coder': ('<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\n', '<|im_end|>\n<|im_start|>assistant\n'),
+    'qwen': ('<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\n', '<|im_end|>\n<|im_start|>assistant\n'),
     'opencoder': ('<|im_start|>system\nYou are OpenCoder, created by OpenCoder Team.<|im_end|>\n<|im_start|>user\n', '<|im_end|>\n<|im_start|>assistant\n'),
     'starchat': ('<|system|>\n<|end|>\n<|user|>', '<|end|>\n<|assistant|>'),
 }
@@ -303,7 +303,7 @@ MODEL_PROMPT_FORMATS = {
 MODEL_CONFIGS = {
     # Qwen3 模型
     'qwen3-8b': {
-        'base_model': '/data1/czj/model/qwen3-8b',
+        'base_model': 'Qwen/Qwen3-8b',
         'adapter_path': None
     },
     'qwen3-8b-trained': {
@@ -318,12 +318,20 @@ MODEL_CONFIGS = {
         'base_model': 'merged_models/qwen2.5coder7b-paft',
         'adapter_path': None
     },
+    'qwen8b-paft': {
+        'base_model': 'merged_models/qwen8b-paft',
+        'adapter_path': None
+    },
     'opencoder8b': {
         'base_model': 'infly/OpenCoder-8B-Instruct',
         'adapter_path': None
     },
     'opencoder8b-paft': {
         'base_model': 'merged_models/opencoder8b-paft',
+        'adapter_path': None
+    },
+    'opencoder8b-sft': {
+        'base_model': 'merged_models/opencoder8b-sft',
         'adapter_path': None
     },
     # CodeLlama 模型

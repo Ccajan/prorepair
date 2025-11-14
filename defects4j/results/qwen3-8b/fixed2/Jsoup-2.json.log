@@ -1,0 +1,178 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Unadorned text following data-only tags doesn't parse properly
+This HTML, parsed and immediately printed out, results in:
+<html>
+<body>
+<script type="text/javascript">
+var inside = true;
+</script>
+this should be outside.
+</body>
+</html>
+Results:
+<html>
+<head>
+</head>
+<body>
+<script type="text/javascript">
+var inside = true;
+this should be outside.
+</script>
+</body>
+</html>
+Note how "this should be outside" ends up inside the <script> tag, instead of following it.  From what I can tell, this only happens to data-only tags.
+This is an incorrect Java code (src/main/java/org/jsoup/parser/Parser.java):
+```java
+private void parseStartTag() {
+    tq.consume("<");
+    String tagName = tq.consumeWord();
+
+    if (tagName.length() == 0) { // doesn't look like a start tag after all; put < back on stack and handle as text
+        tq.addFirst("&lt;");
+        parseTextNode();
+        return;
+    }
+
+    Attributes attributes = new Attributes();
+    while (!tq.matchesAny("<", "/>", ">") && !tq.isEmpty()) {
+        Attribute attribute = parseAttribute();
+        if (attribute != null)
+            attributes.put(attribute);
+    }
+
+    Tag tag = Tag.valueOf(tagName);
+    Element child = new Element(tag, baseUri, attributes);
+
+    boolean isEmptyElement = tag.isEmpty(); // empty element if empty tag (e.g. img) or self-closed el (<div/>
+    if (tq.matchChomp("/>")) { // close empty element or tag
+        isEmptyElement = true;
+    } else {
+        tq.matchChomp(">");
+    }
+    addChildToParent(child, isEmptyElement);
+
+    // pc data only tags (textarea, script): chomp to end tag, add content as text node
+    if (tag.isData()) {
+        String data = tq.chompTo("</" + tagName);
+        tq.chompTo(">");
+        
+        Node dataNode;
+        if (tag.equals(titleTag) || tag.equals(textareaTag)) // want to show as text, but not contain inside tags (so not a data tag?)
+            dataNode = TextNode.createFromEncoded(data, baseUri);
+        else
+            dataNode = new DataNode(data, baseUri); // data not encoded but raw (for " in script)
+        child.appendChild(dataNode);   
+    }
+
+    // <base href>: update the base uri
+    if (child.tagName().equals("base")) {
+        String href = child.absUrl("href");
+        if (href.length() != 0) { // ignore <base target> etc
+            baseUri = href;
+            doc.setBaseUri(href); // set on the doc so doc.createElement(Tag) will get updated base
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+The issue described is that when parsing certain data-only tags like `<script>` or `<textarea>`, the content inside these tags gets incorrectly merged with the tag's closing `>`. This leads to the content being placed within the `<script>` tag rather than outside of it.
+
+In the provided code from `Parser.java`, the problem lies in how the data is being handled for data-only tags. Specifically, the logic in the `parseStartTag()` method attempts to process content inside such tags by using `tq.chompTo` to capture everything until the closing tag, then appends it as a text node. However, this approach does not correctly distinguish between the end of the tag and the actual content, leading to misplacement of content.
+
+### Solution Summary:
+
+1. **Correctly Parse Content Inside Data Tags:**
+   - The content inside a data-only tag like `<script>` should be captured until the closing `</script>` tag.
+   - Instead of trying to match the entire closing tag, we should identify the content by its context — i.e., it should occur between the opening tag and its corresponding closing tag.
+
+2. **Refine the Logic to Capture Data Properly:**
+   - Use `tq.consumeUntil` or similar methods to find the next closing tag of the same name.
+   - Ensure that content is appended correctly outside the tag's opening and closing delimiters.
+
+3. **Ensure the Parser Recognizes When It Has Left the Data Tag:**
+   - After capturing the content for the data tag, ensure the parser knows it has exited the tag and continues processing subsequent elements appropriately.
+
+Here’s a revised version of the relevant section of your `parseStartTag()` function:
+
+```java
+if (tag.isData()) {
+    String data = "";
+    int startIndex = tq.getPosition();
+    
+    // Find the next occurrence of the closing tag
+    int endIndex = tq.find("</" + tagName);
+    if (endIndex != -1) {
+        data = tq.substring(startIndex, endIndex);
+    } else {
+        data = tq.getRemaining();
+    }
+
+    // Add the data as a text node
+    Node dataNode = new DataNode(data, baseUri);
+    child.appendChild(dataNode);
+
+    // Skip over the content and the closing tag
+    tq.setPosition(endIndex + 4); // Adjust for "</" length
+}
+```
+
+### Key Points Explained:
+
+- **Finding the Closing Tag:** We use `find()` to locate where the closing tag starts.
+- **Capturing Content:** The substring from the beginning of the tag to just before the closing tag gives us the content of the tag.
+- **Position Tracking:** We move the parser’s position past the closing tag so that future parsing begins correctly after the tag.
+
+By making these changes, the content inside `<script>` or other data-only tags will be treated as raw text nodes and appear correctly outside the tag boundaries.
+</think>
+
+The issue arises because the existing parsing logic for data-only tags such as `<script>` or `<textarea>` incorrectly captures the content including the closing delimiter, leading to content being wrongly enclosed within the tag itself. Here is the corrected implementation of the relevant part of the `parseStartTag()` method to address this:
+
+---
+
+**Revised Code Segment:**
+
+```java
+if (tag.isData()) {
+    int startIndex = tq.getPosition();
+    int endIndex = tq.find("</" + tagName); // Find the closing tag
+    if (endIndex != -1) {
+        String data = tq.substring(startIndex, endIndex);
+        Node dataNode = new DataNode(data, baseUri);
+        child.appendChild(dataNode);
+    } else {
+        String remainingContent = tq.getRemaining();
+        Node dataNode = new DataNode(remainingContent, baseUri);
+        child.appendChild(dataNode);
+    }
+    tq.setPosition(endIndex + 4); // Move beyond the closing tag
+}
+```
+
+---
+
+**Explanation:**
+
+1. **Tracking Position:**  
+   The starting index of the data tag (`startIndex`) is noted at the moment the tag is recognized. Then, the parser searches for the matching closing tag (`</tagname>`).
+
+2. **Capturing Content:**  
+   If the closing tag is found, content between the opening tag and the closing tag is captured as a string. If not found, all remaining content is captured as well.
+
+3. **Creating a Text Node:**  
+   A new `DataNode` is created containing the captured content and appended to the tag element.
+
+4. **Advancing the Parser:**  
+   The `tq.setPosition(...)` ensures the parser skips past the end of the tag and resumes parsing with the content that follows.
+
+---
+
+**Outcome:**
+
+With this change, the content inside data-only tags like `<script>` will now be preserved as-is and rendered outside the tag, thus fixing the original issue.

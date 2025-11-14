@@ -1,0 +1,213 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# StringIndexOutOfBoundsException when testing whether String content is valid HTML
+If I try to parse a tag with an equals sign (an empty attribute) but without any single or double quotes around an attribute value, then I get a StringIndexOutOfBoundsException.  The stack trace is pasted below.
+An example String would be "<a =a"
+The following JUnit test case should not throw a StringIndexOutOfBoundsException:
+import static org.junit.Assert.assertTrue;
+import org.jsoup.Jsoup;
+import org.jsoup.safety.Whitelist;
+import org.junit.Test;
+public class BadAttributeTest {
+@test
+public void aTagWithABadAttributeIsValid() throws Exception {
+assertTrue(Jsoup.isValid("<a =a", Whitelist.relaxed()));
+}
+}
+java.lang.StringIndexOutOfBoundsException: String index out of range: 13
+at java.lang.String.charAt(String.java:686)
+at org.jsoup.parser.TokenQueue.consume(TokenQueue.java:130)
+at org.jsoup.parser.Parser.parseAttribute(Parser.java:207)
+at org.jsoup.parser.Parser.parseStartTag(Parser.java:142)
+at org.jsoup.parser.Parser.parse(Parser.java:91)
+at org.jsoup.parser.Parser.parseBodyFragment(Parser.java:64)
+at org.jsoup.Jsoup.parseBodyFragment(Jsoup.java:99)
+at org.jsoup.Jsoup.isValid(Jsoup.java:155)
+This is an incorrect Java code (src/main/java/org/jsoup/parser/Parser.java):
+```java
+private Attribute parseAttribute() {
+    tq.consumeWhitespace();
+    String key = tq.consumeAttributeKey();
+    String value = "";
+    tq.consumeWhitespace();
+    if (tq.matchChomp("=")) {
+        tq.consumeWhitespace();
+
+        if (tq.matchChomp(SQ)) {
+            value = tq.chompTo(SQ);
+        } else if (tq.matchChomp(DQ)) {
+            value = tq.chompTo(DQ);
+        } else {
+            StringBuilder valueAccum = new StringBuilder();
+            // no ' or " to look for, so scan to end tag or space (or end of stream)
+            while (!tq.matchesAny("<", "/>", ">") && !tq.matchesWhitespace() && !tq.isEmpty()) {
+                valueAccum.append(tq.consume());
+            }
+            value = valueAccum.toString();
+        }
+        tq.consumeWhitespace();
+    }
+    if (key.length() != 0)
+        return Attribute.createFromEncoded(key, value);
+    else {
+        tq.consume();
+            
+        return null;
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import org.jsoup.parser.Attribute;
+import org.jsoup.parser.TokenQueue;
+
+public class Parser {
+    private final TokenQueue tq;
+
+    public Parser(TokenQueue tq) {
+        this.tq = tq;
+    }
+
+    private Attribute parseAttribute() {
+        tq.consumeWhitespace();
+        String key = tq.consumeAttributeKey();
+        String value = "";
+        tq.consumeWhitespace();
+        
+        if (tq.matchChomp("=")) {
+            tq.consumeWhitespace();
+            
+            if (tq.matchChomp('"')) {
+                value = tq.chompTo('"');
+            } else if (tq.matchChomp('\'')) {
+                value = tq.chompTo('\'');
+            } else {
+                StringBuilder valueAccum = new StringBuilder();
+                
+                // Check if there's any character left to read before attempting to consume
+                if (!tq.isEmpty()) {
+                    while (!tq.matchesAny("<", "/>", ">") && 
+                           !tq.matchesWhitespace() && 
+                           !tq.isEmpty()) {
+                        valueAccum.append(tq.consume());
+                    }
+                }
+                
+                value = valueAccum.toString();
+            }
+            tq.consumeWhitespace();
+        }
+        
+        if (key.length() != 0) {
+            return Attribute.createFromEncoded(key, value);
+        } else {
+            // Consume the '=' and possibly some other characters if needed
+            if (tq.matchChomp("=")) {
+                tq.consume(); // consume the '='
+            }
+            return null;
+        }
+    }
+}
+```
+
+### Explanation:
+
+- **Check for Empty TokenQueue**: Before entering the loop that consumes characters, check `if (!tq.isEmpty())` to ensure we don't attempt to process an empty queue.
+  
+- **Consume Equals Sign Correctly**: After matching '=', we call `tq.consume()` to remove it from the queue. This prevents cases where the parser might think there's content available after consuming an '=' that was already removed.
+
+- **Robustness in Edge Cases**: By checking if the token queue has content before starting to accumulate values, we avoid the exception caused by trying to access elements beyond the string length.
+
+These changes make the parser more robust against malformed inputs like `<a =a`, avoiding the `StringIndexOutOfBoundsException`.
+</think>
+
+When handling potentially malformed HTML input such as `<a =a`, the issue arises due to improper validation during parsing. Specifically, the problem manifests when `Jsoup` attempts to extract attributes, leading to a `StringIndexOutOfBoundsException`. This occurs because the logic fails to check for the presence of characters in the token stream before attempting to consume them.
+
+---
+
+### ✅ Problem Summary
+
+In `parseAttribute()` method within `jsoup.parser.Parser`, the code may encounter an invalid input structure—like an unquoted attribute without an explicit closing quote or delimiter. When this happens, the `TokenQueue` could be empty by the time it tries to extract data using methods such as `consume()` or `chompTo()`, resulting in the infamous `StringIndexOutOfBoundsException`.
+
+The problematic line:
+
+```java
+while (!tq.matchesAny("<", "/>", ">") && !tq.matchesWhitespace() && !tq.isEmpty()) {
+```
+
+does **not** include a guard condition at the top to confirm if the queue actually contains characters before processing them.
+
+---
+
+### 🛠️ Solution
+
+We need to adjust the method to safely handle edge cases where the token queue might have reached its end prematurely. Here’s how you can do it:
+
+#### ✅ Updated Code Snippet
+
+```java
+import org.jsoup.parser.Attribute;
+import org.jsoup.parser.TokenQueue;
+
+public class Parser {
+    private final TokenQueue tq;
+
+    public Parser(TokenQueue tq) {
+        this.tq = tq;
+    }
+
+    private Attribute parseAttribute() {
+        tq.consumeWhitespace();
+        String key = tq.consumeAttributeKey();
+        String value = "";
+        tq.consumeWhitespace();
+
+        if (tq.matchChomp("=")) {
+            tq.consumeWhitespace();
+
+            if (tq.matchChomp('"')) {
+                value = tq.chompTo('"');
+            } else if (tq.matchChomp('\'')) {
+                value = tq.chompTo('\'');
+            } else {
+                StringBuilder valueAccum = new StringBuilder();
+
+                // Only start processing if there are tokens left
+                if (!tq.isEmpty()) {
+                    while (!tq.matchesAny("<", "/>", ">") &&
+                           !tq.matchesWhitespace() &&
+                           !tq.isEmpty()) {
+                        valueAccum.append(tq.consume());
+                    }
+                }
+
+                value = valueAccum.toString();
+            }
+            tq.consumeWhitespace();
+        }
+
+        if (key.length() != 0) {
+            return Attribute.createFromEncoded(key, value);
+        } else {
+            // Consume the '=' character, if present
+            if (tq.matchChomp("=")) {
+                tq.consume(); // consume the '='
+            }
+            return null;
+        }
+    }
+}
+```
+
+---
+
+### 🔍 Key Fixes Applied
+
+1. **Pre-check for Token Existence**:
+

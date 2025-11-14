@@ -1,0 +1,158 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Problem with polymorphic types, losing properties from base type(s)
+(background, see: dropwizard/dropwizard#1449)
+Looks like sub-type resolution may be broken for one particular case: that of using defaultImpl. If so, appears like properties from super-types are not properly resolved; guessing this could be follow-up item for #1083 (even sooner than I thought...).
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/type/SimpleType.java):
+```java
+protected JavaType _narrow(Class<?> subclass)
+{
+    if (_class == subclass) {
+        return this;
+    }
+    // Should we check that there is a sub-class relationship?
+    // 15-Jan-2016, tatu: Almost yes, but there are some complications with
+    //    placeholder values (`Void`, `NoClass`), so can not quite do yet.
+    // TODO: fix in 2.8
+        /*
+        throw new IllegalArgumentException("Class "+subclass.getName()+" not sub-type of "
+                +_class.getName());
+                */
+        return new SimpleType(subclass, _bindings, this, _superInterfaces,
+                _valueHandler, _typeHandler, _asStatic);
+    // Otherwise, stitch together the hierarchy. First, super-class
+    // if not found, try a super-interface
+    // should not get here but...
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+protected JavaType _narrow(Class<?> subclass)
+{
+    if (_class == subclass) {
+        return this;
+    }
+
+    // Check if the subclass is indeed a subtype of the current class
+    if (!isSubtype(subclass, _class)) {
+        throw new IllegalArgumentException("Class " + subclass.getName() + " is not a sub-type of " + _class.getName());
+    }
+
+    // Create a new SimpleType instance with the subclass
+    return new SimpleType(subclass, _bindings, this, _superInterfaces,
+            _valueHandler, _typeHandler, _asStatic);
+}
+
+/**
+ * Checks if the given class is a subtype of the specified superclass.
+ *
+ * @param potentialSubclass The class to check.
+ * @param superClass The superclass to compare against.
+ * @return true if potentialSubclass is a subtype of superClass, false otherwise.
+ */
+private boolean isSubtype(Class<?> potentialSubclass, Class<?> superClass) {
+    // Handle special cases like Void and NoClass as mentioned in the comment
+    if (potentialSubclass == Void.class || potentialSubclass == NoClass.class) {
+        return false;
+    }
+
+    // Check if the class is directly or indirectly a subclass
+    Class<?> current = potentialSubclass;
+    while (current != null) {
+        if (current == superClass) {
+            return true;
+        }
+        current = current.getSuperclass();
+    }
+
+    // Check interfaces
+    for (Class<?> iface : potentialSubclass.getInterfaces()) {
+        if (isSubtype(iface, superClass)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+```
+
+I've modified the `_narrow` method to include proper subtype checking before creating a new SimpleType instance. The key changes are:
+
+1. Added a call to `isSubtype()` to verify the subclass relationship
+2. Implemented the `isSubtype()` helper method that:
+   - Handles special cases mentioned in the original comment
+   - Performs both direct inheritance checks (via superclass chain)
+   - Checks all implemented interfaces recursively
+
+The implementation follows standard Java type checking patterns, ensuring that the subclass relationship is validated correctly.
+
+Note that I've preserved the original structure of the method while adding these improvements. The commented-out exception handling has been replaced with actual validation that throws an appropriate exception when the subtype condition isn't met.
+</think>
+
+To resolve the issue with polymorphic typing and ensure correct type hierarchy resolution when using `defaultImpl`, we need to address how the `_narrow` method handles subclass relationships. The problem arises because the current logic fails to validate whether the provided `subclass` is actually a valid subtype of the current class — leading to improper type resolution and potentially missing properties inherited from superclasses or interfaces.
+
+---
+
+### 🔍 Understanding the Root Issue
+
+In the existing `SimpleType._narrow()` implementation, the method does **not** perform a thorough check to confirm that `subclass` is a true subtype of `_class`. This leads to potential issues such as:
+
+- Incorrectly resolving type hierarchies where the subclass might not be related through inheritance.
+- Missing propagation of properties or behavior from superclasses/traits due to invalid type assumptions.
+- Confusion during serialization/deserialization involving complex type hierarchies with interface-based or default method implementations.
+
+By adding a robust `isSubtype()` utility method and integrating it into the `_narrow()` logic, we can safely verify the validity of the subclass relationship before proceeding with any type creation or refinement.
+
+---
+
+### ✅ Solution Overview
+
+Here's a complete corrected version of the `_narrow` method along with a new utility function to perform type checking:
+
+```java
+protected JavaType _narrow(Class<?> subclass) {
+    if (_class == subclass) {
+        return this;
+    }
+
+    // Ensure the subclass is a true subtype of the current class
+    if (!isSubtype(subclass, _class)) {
+        throw new IllegalArgumentException(
+            String.format("Class %s is not a sub-type of %s", 
+                          subclass.getName(), _class.getName()));
+    }
+
+    return new SimpleType(
+        subclass,
+        _bindings,
+        this,
+        _superInterfaces,
+        _valueHandler,
+        _typeHandler,
+        _asStatic
+    );
+}
+
+/**
+ * Determines if one class is a sub-type of another class, including interface
+ * relationships, with support for special cases like Void.
+ *
+ * @param potentialSubclass The candidate class to check.
+ * @param superClass The target class to compare against.
+ * @return True if potentialSubclass is a sub-type of superClass.
+ */
+private boolean isSubtype(Class<?> potentialSubclass, Class<?> superClass) {
+    // Special case: avoid treating Void or other placeholder types as valid subtypes
+    if (potentialSubclass == Void.class || potentialSubclass == NoClass.class) {
+        return false;
+    }
+
+    // Direct inheritance check
+    Class<?> current = potentialSubclass;
+    while (current != null) {
+        if (current == superClass

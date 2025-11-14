@@ -1,0 +1,138 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Possibly wrong TokenBuffer delegate deserialization using @JsonCreator
+class Value {
+@JsonCreator
+public static Value from(TokenBuffer buffer) {
+...
+}
+Given JSON string is  { "a":1, "b":null }, it is expected that while deserializing using delegate buffer,
+current token will be start object {, and rest of the tokens will be available in buffer:
+[START_OBJECT, FIELD_NAME, VALUE_NUMBER_INT, FIELD_NAME, VALUE_NULL, END_OBJECT]
+
+But, buffers ends up being started with field name and then contains single attribute value
+[FIELD_NAME, VALUE_NUMBER_INT]
+
+It's due to how TokenBuffer#copyCurrentStructure works when we have current token as a FIELD_NAME, rather than START_OBJECT, because it's forced to move to next token BeanDeserializer.java:120
+Hope this helps to nail it down. Is it an intended behavior, or it's regression/bug?
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/util/TokenBuffer.java):
+```java
+public TokenBuffer deserialize(JsonParser jp, DeserializationContext ctxt) throws IOException
+{
+        copyCurrentStructure(jp);
+    /* 28-Oct-2014, tatu: As per #592, need to support a special case of starting from
+     *    FIELD_NAME, which is taken to mean that we are missing START_OBJECT, but need
+     *    to assume one did exist.
+     */
+    return this;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+if (jp.getCurrentToken() == JsonToken.START_OBJECT) {
+   copyCurrentStructure(jp);
+} else if (jp.getCurrentToken() == JsonToken.FIELD_NAME) {
+   // Handle the case where the current token is FIELD_NAME, which implies
+   // that the START_OBJECT was skipped. We need to create a new TokenBuffer 
+   // with the current structure, including the FIELD_NAME, and continue parsing.
+   TokenBuffer tb = new TokenBuffer(ctxt.getParser());
+   tb.copyCurrentStructure(jp);
+   return tb;
+}
+return this;
+```
+
+I believe there is a problem with the original code for `TokenBuffer.deserialize()` method.
+
+The issue appears to be that when deserializing a `TokenBuffer` delegate, the current token is at a FIELD_NAME instead of START_OBJECT. In this scenario, the `copyCurrentStructure()` method should be called to capture all tokens from the current position onward.
+
+In the original code, the method calls `copyCurrentStructure(jp)` regardless of the current token type, which leads to only the first field name and its value being captured, not the entire object structure.
+
+My fix would be to check the current token type before calling `copyCurrentStructure()`. If the token is START_OBJECT, we proceed as before. But if it's FIELD_NAME, we need to create a new `TokenBuffer` instance, call `copyCurrentStructure()` on it, and return that new buffer.
+
+This change ensures that when we're expecting a full object structure but find ourselves at a FIELD_NAME, we properly capture all tokens from that point forward, maintaining the correct sequence of [START_OBJECT, FIELD_NAME, ...] tokens.
+
+Let me know if you'd like me to provide the complete fixed implementation.
+</think>
+
+To address the described issue with the `TokenBuffer.deserialize()` method in Jackson, let’s break down the root cause and provide a clear solution.
+
+---
+
+### ✅ **Problem Summary**
+
+When trying to deserialize a JSON object `{ "a":1, "b":null }` using a custom `Value` class that uses `@JsonCreator` with a `TokenBuffer` delegate, the current token is `FIELD_NAME` instead of `START_OBJECT`. This leads to unexpected token sequences:
+
+| Incorrect Behavior | Expected Behavior |
+|-------------------|------------------|
+| `[FIELD_NAME, VALUE_NUMBER_INT]` | `[START_OBJECT, FIELD_NAME, VALUE_NUMBER_INT, FIELD_NAME, VALUE_NULL, END_OBJECT]` |
+
+The core issue lies in how the `TokenBuffer.deserialize()` function handles cases where the current token is `FIELD_NAME`, which does **not** match the expected `START_OBJECT`.
+
+In particular, the line:
+```java
+copyCurrentStructure(jp);
+```
+is executed unconditionally, causing incomplete token copying when the current token isn't `START_OBJECT`.
+
+---
+
+### 🛠️ **Solution Overview**
+
+We need to modify the `deserialize()` method to correctly handle two types of scenarios:
+
+1. When the current token is `START_OBJECT`: Copy the structure normally.
+2. When the current token is `FIELD_NAME`: Create a new `TokenBuffer`, and ensure it captures all subsequent tokens (including the `START_OBJECT`, if it exists).
+
+To achieve this, we can add conditional logic around `copyCurrentStructure()`.
+
+---
+
+### ✅ **Corrected Code Implementation**
+
+Here’s the updated version of the `TokenBuffer.deserialize()` method:
+
+```java
+@Override
+public TokenBuffer deserialize(JsonParser jp, DeserializationContext ctxt)
+        throws IOException {
+
+    // Check if the current token is START_OBJECT
+    if (jp.getCurrentToken() == JsonToken.START_OBJECT) {
+        copyCurrentStructure(jp);
+    }
+    // Otherwise, check if the current token is FIELD_NAME
+    else if (jp.getCurrentToken() == JsonToken.FIELD_NAME) {
+        // Create a new TokenBuffer and copy from the current state
+        TokenBuffer tb = new TokenBuffer(ctxt.getParser());
+        tb.copyCurrentStructure(jp);
+        return tb;
+    }
+
+    return this;
+}
+```
+
+---
+
+### 🔍 Explanation of Fix
+
+- **Case 1 (`START_OBJECT`):** The existing logic works fine—this matches the expected behavior where the parser has already consumed the `START_OBJECT`.
+  
+- **Case 2 (`FIELD_NAME`):**
+  - A new `TokenBuffer` is instantiated with the same context as the original parser.
+  - `copyCurrentStructure(jp)` is called on the new buffer, ensuring that the current `FIELD_NAME` and any following values are included in the buffer.
+  - By returning the new buffer, we avoid modifying the original one and maintain correctness.
+
+This change avoids regressing into partial token structures and allows accurate reconstruction of the full token stream starting from `FIELD_NAME`, even if the actual `START_OBJECT` was skipped.
+
+---
+
+### ✅ Final Thoughts
+
+This is not a regression—it is a bug in the original logic that incorrectly assumes `START_OBJECT` must always be present when `FIELD_NAME` is found.

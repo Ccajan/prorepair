@@ -1,0 +1,156 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# IOUtils.skip does not work as advertised
+I am trying to feed a TarInputStream from a CipherInputStream.
+It does not work, because IOUtils.skip() does not adhere to the contract it claims in javadoc:
+"     * <p>This method will only skip less than the requested number of
+
+bytes if the end of the input stream has been reached.</p>"
+
+However it does:
+            long skipped = input.skip(numToSkip);
+            if (skipped == 0) 
+{
+                break;
+            }
+
+And the input stream javadoc says:
+"     * This may result from any of a number of conditions; reaching end of file
+
+before <code>n</code> bytes have been skipped is only one possibility."
+
+In the case of CipherInputStream, it stops at the end of each byte buffer.
+If you check the IOUtils from colleagues at commons-io, they have considered this case in IOUtils.skip() where they use a read to skip through the stream.
+An optimized version could combine trying to skip, then read then trying to skip again.
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/utils/IOUtils.java):
+```java
+public static long skip(InputStream input, long numToSkip) throws IOException {
+    long available = numToSkip;
+    while (numToSkip > 0) {
+        long skipped = input.skip(numToSkip);
+        if (skipped == 0) {
+            break;
+        }
+        numToSkip -= skipped;
+    }
+        
+    return available - numToSkip;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import java.io.InputStream;
+
+public class ImprovedIOUtils {
+
+    /**
+     * Skips over the specified number of bytes in the given input stream.
+     * This implementation handles cases where the underlying stream may not support skipping efficiently,
+     * such as CipherInputStream or other buffered streams that behave differently when reading.
+     *
+     * @param input   The input stream to skip bytes from
+     * @param numToSkip The number of bytes to skip
+     * @return The number of bytes actually skipped
+     * @throws IOException If an I/O error occurs
+     */
+    public static long skip(InputStream input, long numToSkip) throws IOException {
+        if (numToSkip <= 0) {
+            return 0;
+        }
+
+        long totalSkipped = 0;
+        long remaining = numToSkip;
+
+        // Use a buffer to read and discard data for more reliable skipping
+        byte[] buffer = new byte[8192]; // A reasonable buffer size for skipping
+        int bytesRead;
+
+        while (remaining > 0) {
+            // Try to skip directly first
+            long skipped = input.skip(remaining);
+            if (skipped > 0) {
+                totalSkipped += skipped;
+                remaining -= skipped;
+                continue;
+            }
+
+            // If skip didn't progress, read into buffer to advance the stream position
+            bytesRead = input.read(buffer, 0, Math.min(buffer.length, (int) remaining));
+            if (bytesRead == -1) {
+                // End of stream reached before skipping all bytes
+                break;
+            }
+
+            totalSkipped += bytesRead;
+            remaining -= bytesRead;
+        }
+
+        return totalSkipped;
+    }
+}
+```
+
+### Explanation of the Fix:
+
+1. **Buffered Reading for Reliable Skipping**:
+   Instead of relying solely on `input.skip()`, which might not work reliably with certain streams like `CipherInputStream`, this implementation uses a buffer to read and discard bytes. This approach ensures we make progress even when direct skipping doesn't work.
+
+2. **Combined Skip and Read Strategy**:
+   - First, try to skip using `input.skip()` to leverage any native skipping capability.
+   - If no bytes are skipped (`skipped == 0`), fall back to reading into a buffer. Reading advances the stream position, allowing further skipping or reading operations.
+
+3. **Robustness for Complex Streams**:
+   - Handles streams that do not support efficient skipping, such as encrypted streams (`CipherInputStream`).
+   - Ensures consistent behavior across different types of streams by falling back to reading when necessary.
+
+4. **Efficiency Consideration**:
+   - Uses a fixed-size buffer (8KB) for reading, balancing performance and memory usage.
+   - Avoids unnecessary repeated calls to `skip()` when it's ineffective.
+
+5. **Edge Case Handling**:
+   - Returns the actual number of skipped bytes, even if fewer than requested.
+   - Correctly handles cases where the stream ends unexpectedly during skipping.
+
+### Example Usage:
+```java
+InputStream cipherInput = ...; // Your CipherInputStream
+long bytesToSkip = 1024 * 1024; // 1MB
+long skippedBytes = ImprovedIOUtils.skip(cipherInput, bytesToSkip);
+System.out.println("Skipped " + skippedBytes + " bytes");
+```
+
+### Why This Works for CipherInputStream:
+- `CipherInputStream` relies on the underlying stream's data being processed in chunks. Direct `skip()` may fail if it cannot move the stream position due to how encryption buffers work.
+- By using a buffer to read and discard bytes, we force the stream to process data, effectively moving its internal pointer forward so that subsequent skips or reads can proceed correctly.
+
+This improved `skip()` method adheres better to the intended behavior described in the `InputStream` Javadoc and provides robust handling for complex or non-standard input streams.
+</think>
+
+The issue with the original `IOUtils.skip()` implementation stems from its reliance solely on the `InputStream.skip()` method, which may not function reliably with certain types of streams—such as `CipherInputStream` or other custom streams that manage their internal state in ways that prevent effective skipping. These streams often require a combination of both `skip()` and `read()` operations to properly advance their internal buffer positions.
+
+---
+
+### ✅ Solution: Enhanced `skip()` Method
+
+Here's an updated and more robust version of the `skip()` method that accounts for these complexities:
+
+```java
+import java.io.InputStream;
+import java.io.IOException;
+
+public class CustomIOUtils {
+
+    /**
+     * Skips over the specified number of bytes in the input stream.
+     * This version combines both skip and read strategies to ensure proper progression
+     * across various kinds of input streams including those that do not support skip well.
+     *
+     * @param input      the input stream to skip bytes from
+     * @param numToSkip  the number of bytes to skip
+     * @return           the number of bytes actually skipped
+    

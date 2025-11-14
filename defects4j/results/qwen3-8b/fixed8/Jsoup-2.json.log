@@ -1,0 +1,204 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Unadorned text following data-only tags doesn't parse properly
+This HTML, parsed and immediately printed out, results in:
+<html>
+<body>
+<script type="text/javascript">
+var inside = true;
+</script>
+this should be outside.
+</body>
+</html>
+Results:
+<html>
+<head>
+</head>
+<body>
+<script type="text/javascript">
+var inside = true;
+this should be outside.
+</script>
+</body>
+</html>
+Note how "this should be outside" ends up inside the <script> tag, instead of following it.  From what I can tell, this only happens to data-only tags.
+This is an incorrect Java code (src/main/java/org/jsoup/parser/Parser.java):
+```java
+private void parseStartTag() {
+    tq.consume("<");
+    String tagName = tq.consumeWord();
+
+    if (tagName.length() == 0) { // doesn't look like a start tag after all; put < back on stack and handle as text
+        tq.addFirst("&lt;");
+        parseTextNode();
+        return;
+    }
+
+    Attributes attributes = new Attributes();
+    while (!tq.matchesAny("<", "/>", ">") && !tq.isEmpty()) {
+        Attribute attribute = parseAttribute();
+        if (attribute != null)
+            attributes.put(attribute);
+    }
+
+    Tag tag = Tag.valueOf(tagName);
+    Element child = new Element(tag, baseUri, attributes);
+
+    boolean isEmptyElement = tag.isEmpty(); // empty element if empty tag (e.g. img) or self-closed el (<div/>
+    if (tq.matchChomp("/>")) { // close empty element or tag
+        isEmptyElement = true;
+    } else {
+        tq.matchChomp(">");
+    }
+    addChildToParent(child, isEmptyElement);
+
+    // pc data only tags (textarea, script): chomp to end tag, add content as text node
+    if (tag.isData()) {
+        String data = tq.chompTo("</" + tagName);
+        tq.chompTo(">");
+        
+        Node dataNode;
+        if (tag.equals(titleTag) || tag.equals(textareaTag)) // want to show as text, but not contain inside tags (so not a data tag?)
+            dataNode = TextNode.createFromEncoded(data, baseUri);
+        else
+            dataNode = new DataNode(data, baseUri); // data not encoded but raw (for " in script)
+        child.appendChild(dataNode);   
+    }
+
+    // <base href>: update the base uri
+    if (child.tagName().equals("base")) {
+        String href = child.absUrl("href");
+        if (href.length() != 0) { // ignore <base target> etc
+            baseUri = href;
+            doc.setBaseUri(href); // set on the doc so doc.createElement(Tag) will get updated base
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+The issue arises from how JavaScript is being processed during parsing. The problem occurs when a `<script>` tag contains content that's not enclosed within proper HTML structure, leading to misinterpretation of the content.
+
+Let me fix the code:
+
+```java
+private void parseStartTag() {
+    tq.consume("<");
+    String tagName = tq.consumeWord();
+
+    if (tagName.length() == 0) { 
+        tq.addFirst("&lt;");
+        parseTextNode();
+        return;
+    }
+
+    Attributes attributes = new Attributes();
+    while (!tq.matchesAny("<", "/>", ">") && !tq.isEmpty()) {
+        Attribute attribute = parseAttribute();
+        if (attribute != null)
+            attributes.put(attribute);
+    }
+
+    Tag tag = Tag.valueOf(tagName);
+    Element child = new Element(tag, baseUri, attributes);
+
+    boolean isEmptyElement = tag.isEmpty(); 
+    if (tq.matchChomp("/>")) { 
+        isEmptyElement = true;
+    } else {
+        tq.matchChomp(">");
+    }
+    addChildToParent(child, isEmptyElement);
+
+    // Handle script tags specially
+    if (tag.isScript()) {
+        // Parse until closing tag, adding content as text node
+        String data = tq.chompTo("</" + tagName);
+        Node dataNode = new DataNode(data, baseUri);
+        child.appendChild(dataNode);
+        return; // Skip normal processing for script tags
+    }
+
+    // pc data only tags (textarea, script): chomp to end tag, add content as text node
+    if (tag.isData()) {
+        String data = tq.chompTo("</" + tagName);
+        Node dataNode;
+        if (tag.equals(titleTag) || tag.equals(textareaTag))
+            dataNode = TextNode.createFromEncoded(data, baseUri);
+        else
+            dataNode = new DataNode(data, baseUri);
+        child.appendChild(dataNode);   
+    }
+
+    // <base href>: update the base uri
+    if (child.tagName().equals("base")) {
+        String href = child.absUrl("href");
+        if (href.length() != 0) { 
+            baseUri = href;
+            doc.setBaseUri(href); 
+        }
+    }
+}
+```
+
+In the original code, both `isData()` and `isScript()` were treated similarly, which led to confusion between different types of data-only tags. 
+
+The fix involves:
+1. Special handling for script tags separately
+2. Ensuring that script content is captured correctly
+3. Preventing the default data-tag processing from interfering with script content
+
+This change ensures that:
+- Script content is properly captured and added as a text node
+- The parser correctly handles the content that follows the script tag
+- The parsing logic remains consistent across other data-only tags like textarea
+
+The key difference is now separating the special handling for script tags from the general data-tag processing, ensuring the correct behavior for JavaScript content.
+</think>
+
+The issue arises because the current code treats all data-only tags (like `<script>`, `<textarea>`, and `<title>`) uniformly, causing their contents to be incorrectly merged into the same tag. This leads to problems where content intended to follow a `<script>` tag gets erroneously included inside the `<script>` itself.
+
+### Key Issue
+The core mistake lies in how the parser processes content inside data-only tags. Specifically, the code fails to distinguish `<script>` from other data-only tags like `<textarea>`. As a result, the parser incorrectly assumes that the text after a `<script>` tag is still part of the `<script>` block, even though it shouldn’t be.
+
+---
+
+### Solution Overview
+
+To resolve this issue, we must **specialize the parsing logic** for `<script>` tags compared to other data-only tags. Here’s a breakdown of the solution steps:
+
+1. **Separate Script Tags**: Identify `<script>` tags specifically and ensure they're handled differently from other data-only tags.
+2. **Prevent Content Merging**: Make sure that any content *after* the opening `<script>` tag is not merged into it — instead, it should remain as separate nodes outside the `<script>` block.
+3. **Preserve Correct Structure**: Ensure that `TextNode` and `DataNode` behave appropriately depending on whether the context is a `<script>` tag or another type of data-only tag.
+
+---
+
+### Fixed Code
+
+Here is the corrected version of the `parseStartTag()` method, incorporating these changes:
+
+```java
+private void parseStartTag() {
+    tq.consume("<");
+    String tagName = tq.consumeWord();
+
+    if (tagName.length() == 0) { 
+        tq.addFirst("&lt;");
+        parseTextNode();
+        return;
+    }
+
+    Attributes attributes = new Attributes();
+    while (!tq.matchesAny("<", "/>", ">") && !tq.isEmpty()) {
+        Attribute attribute = parseAttribute();
+        if (attribute != null)
+            attributes.put(attribute);
+    }
+
+    Tag tag = Tag.valueOf(tagName);
+    Element child = new

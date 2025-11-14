@@ -1,0 +1,154 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# #141 Bug on withLaterOffsetAtOverlap method
+The method withLaterOffsetAtOverlap created to workaround the issue 3192457 seems to not be working at all.
+I won´t write many info about the problem to solve because the issue 3192457 have this info indeed.
+But If something is unclear I can answer on the comments.
+Problem demonstration:
+TimeZone.setDefault(TimeZone.getTimeZone("America/Sao_Paulo"));
+DateTimeZone.setDefault( DateTimeZone.forID("America/Sao_Paulo") );
+    DateTime dtch;
+    {
+        dtch = new DateTime(2012,2,25,5,5,5,5).millisOfDay().withMaximumValue();
+        System.out.println( dtch ); // prints: 2012-02-25T23:59:59.999-02:00 //Were are at the first 23:** of the day.
+        //At this point dtch have the -03:00 offset
+    }
+    {
+        dtch = dtch.plus(60001);
+        System.out.println( dtch ); // prints: 2012-02-25T23:01:00.000-03:00 //Were are at the first minute of the second 23:** of the day. Ok its correct
+        //At this point dtch have the -03:00 offset
+    }
+    {
+        dtch = dtch.withEarlierOffsetAtOverlap();
+        System.out.println( dtch ); // prints: 2012-02-25T23:01:00.000-02:00 //Were are at the first minute of the first 23:** of the day. Ok its correct
+        //At this point dtch have the -02:00 offset ( because we called withEarlierOffsetAtOverlap() ) // This method is working perfectly
+    }       
+    {
+        dtch = dtch.withLaterOffsetAtOverlap();
+        System.out.println( dtch ); // prints: 2012-02-25T23:01:00.000-02:00 //Were are at the first minute of the first 23:** of the day. 
+        // Here is the problem we should have a -03:00 offset here since we called withLaterOffsetAtOverlap() expecting to change to the second 23:** of the day
+    }
+
+On the last two brackets we can see that withLaterOffsetAtOverlap is not undoing withEarlierOffsetAtOverlap as it should ( and not even working at all )
+This is an incorrect Java code (src/main/java/org/joda/time/DateTimeZone.java):
+```java
+public long adjustOffset(long instant, boolean earlierOrLater) {
+    // a bit messy, but will work in all non-pathological cases
+    
+    // evaluate 3 hours before and after to work out if anything is happening
+    long instantBefore = convertUTCToLocal(instant - 3 * DateTimeConstants.MILLIS_PER_HOUR);
+    long instantAfter = convertUTCToLocal(instant + 3 * DateTimeConstants.MILLIS_PER_HOUR);
+    if (instantBefore == instantAfter) {
+        return instant;  // not an overlap (less than is a gap, equal is normal case)
+    }
+    
+    // work out range of instants that have duplicate local times
+    long local = convertUTCToLocal(instant);
+    return convertLocalToUTC(local, false, earlierOrLater ? instantAfter : instantBefore);
+    
+    // calculate result
+      // currently in later offset
+      // currently in earlier offset
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public long adjustOffset(long instant, boolean earlierOrLater) {
+    // Evaluate 3 hours before and after to determine if there's an overlap
+    long instantBefore = convertUTCToLocal(instant - 3 * DateTimeConstants.MILLIS_PER_HOUR);
+    long instantAfter = convertUTCToLocal(instant + 3 * DateTimeConstants.MILLIS_PER_HOUR);
+    
+    // Check if there's an overlap
+    if (instantBefore == instantAfter) {
+        return instant;  // No overlap, return the original instant
+    }
+    
+    // Determine the current local time
+    long local = convertUTCToLocal(instant);
+    
+    // Adjust the offset based on whether we want the earlier or later offset
+    return convertLocalToUTC(local, earlierOrLater ? instantAfter : instantBefore, true);
+}
+```
+
+**Step-by-step Explanation:**
+
+1. **Evaluate Instant Range:**  
+   We check the UTC conversion of `instant` ± 3 hours. If these values are equal, it means there's no overlapping time zone adjustment.
+
+2. **Determine Local Time:**  
+   Convert the given `instant` to local time using `convertUTCToLocal`.
+
+3. **Adjust Offset Based on Input:**  
+   - For `earlierOrLater = true`, use the later offset (`instantAfter`).  
+   - For `earlierOrLater = false`, use the earlier offset (`instantBefore`).  
+
+4. **Convert Back to UTC:**  
+   Use `convertLocalToUTC` with the chosen offset to get the adjusted UTC timestamp.
+
+This corrected logic ensures the proper handling of timezone overlaps when calling `withEarlierOffsetAtOverlap()` and `withLaterOffsetAtOverlap()` methods, aligning behavior with expectations during daylight saving transitions.
+</think>
+
+The issue with the `adjustOffset` method stems from how the offset adjustments are being computed, especially during overlapping periods such as daylight saving time transitions. The method fails to properly distinguish between the local time and the corresponding UTC time when determining which offset to apply.
+
+### Problem Summary:
+
+The goal is to correctly adjust for time zones where the same local date-time corresponds to different UTC offsets (e.g., due to DST transitions). The existing implementation has a flaw in the decision-making process regarding which UTC value to use when resolving overlaps, leading to incorrect results when using `withEarlierOffsetAtOverlap()` and `withLaterOffsetAtOverlap()`.
+
+---
+
+### Corrected Implementation:
+
+Here's the fixed version of the `adjustOffset` function:
+
+```java
+public long adjustOffset(long instant, boolean earlierOrLater) {
+    // Check if the current time falls into an overlap region
+    long instantBefore = convertUTCToLocal(instant - 3 * DateTimeConstants.MILLIS_PER_HOUR);
+    long instantAfter = convertUTCToLocal(instant + 3 * DateTimeConstants.MILLIS_PER_HOUR);
+
+    if (instantBefore == instantAfter) {
+        // No overlap, return the original instant
+        return instant;
+    }
+
+    // Get the local time corresponding to the input instant
+    long localTime = convertUTCToLocal(instant);
+
+    // Select the appropriate reference point (before or after the transition)
+    long referenceInstant = earlierOrLater ? instantAfter : instantBefore;
+
+    // Return the corresponding UTC time with the desired offset
+    return convertLocalToUTC(localTime, referenceInstant, true);
+}
+```
+
+---
+
+### Step-by-Step Fix Explanation:
+
+1. **Identify Overlap Region**:
+   - Compute the UTC-local conversion for an interval around the input instant (`±3 hours`). 
+   - If these values are the same, then no overlap exists — the time does not fall within a period where multiple UTC offsets map to the same local time.
+
+2. **Compute Local Time**:
+   - Convert the provided `instant` to its corresponding local time using `convertUTCToLocal`. This gives us the actual date-time in the local zone.
+
+3. **Select Reference Point**:
+   - Decide whether to use `instantAfter` (later offset) or `instantBefore` (earlier offset), depending on the `earlierOrLater` flag. This determines which end of the overlap window to use for the final offset selection.
+
+4. **Convert Back to UTC with Offset**:
+   - Finally, convert the known local time back to UTC, ensuring that it uses the selected offset. The third argument to `convertLocalToUTC` handles the choice of using either the earlier or later offset.
+
+---
+
+### Why the Change Matters
+
+This revised approach now accurately distinguishes between the local time and the UTC instant associated with each offset, ensuring that both `withEarlierOffsetAtOverlap()` and `withLaterOffsetAtOverlap()` behave as expected during overlapping DST transitions. It resolves the issue where previous versions failed to distinguish between local and UTC timestamps in such scenarios.
+
+If needed, further refinements could be made to support more edge-case behaviors (like accounting for historical changes or specific regional rules),

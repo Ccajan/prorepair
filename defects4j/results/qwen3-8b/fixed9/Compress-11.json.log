@@ -1,0 +1,180 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# createArchiveInputStream detects text files less than 100 bytes as tar archives
+The fix for COMPRESS-117 which modified ArchiveStreamFactory().createArchiveInputStream(inputstream) results in short text files (empirically seems to be those <= 100 bytes) being detected as tar archives which obviously is not desirable if one wants to know whether or not the files are archives.
+I'm not an expert on compressed archives but perhaps the heuristic that if a stream is interpretable as a tar file without an exception being thrown should only be applied on archives greater than 100 bytes?
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/ArchiveStreamFactory.java):
+```java
+public ArchiveInputStream createArchiveInputStream(final InputStream in)
+        throws ArchiveException {
+    if (in == null) {
+        throw new IllegalArgumentException("Stream must not be null.");
+    }
+
+    if (!in.markSupported()) {
+        throw new IllegalArgumentException("Mark is not supported.");
+    }
+
+    final byte[] signature = new byte[12];
+    in.mark(signature.length);
+    try {
+        int signatureLength = in.read(signature);
+        in.reset();
+        if (ZipArchiveInputStream.matches(signature, signatureLength)) {
+            return new ZipArchiveInputStream(in);
+        } else if (JarArchiveInputStream.matches(signature, signatureLength)) {
+            return new JarArchiveInputStream(in);
+        } else if (ArArchiveInputStream.matches(signature, signatureLength)) {
+            return new ArArchiveInputStream(in);
+        } else if (CpioArchiveInputStream.matches(signature, signatureLength)) {
+            return new CpioArchiveInputStream(in);
+        }
+
+        // Dump needs a bigger buffer to check the signature;
+        final byte[] dumpsig = new byte[32];
+        in.mark(dumpsig.length);
+        signatureLength = in.read(dumpsig);
+        in.reset();
+        if (DumpArchiveInputStream.matches(dumpsig, signatureLength)) {
+            return new DumpArchiveInputStream(in);
+        }
+
+        // Tar needs an even bigger buffer to check the signature; read the first block
+        final byte[] tarheader = new byte[512];
+        in.mark(tarheader.length);
+        signatureLength = in.read(tarheader);
+        in.reset();
+        if (TarArchiveInputStream.matches(tarheader, signatureLength)) {
+            return new TarArchiveInputStream(in);
+        }
+        // COMPRESS-117 - improve auto-recognition
+        try {
+            TarArchiveInputStream tais = new TarArchiveInputStream(new ByteArrayInputStream(tarheader));
+            tais.getNextEntry();
+            return new TarArchiveInputStream(in);
+        } catch (Exception e) { // NOPMD
+            // can generate IllegalArgumentException as well as IOException
+            // autodetection, simply not a TAR
+            // ignored
+        }
+    } catch (IOException e) {
+        throw new ArchiveException("Could not use reset and mark operations.", e);
+    }
+
+    throw new ArchiveException("No Archiver found for the stream signature");
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
+import org.apache.commons.compress.archivers.zip.ZipArchiveInputStream;
+import org.apache Commons compress.archivers.jar.JarArchiveInputStream;
+import org.apache.commons.compress.archivers.ar.ArArchiveInputStream;
+import org.apache.commons.compress.archivers.cpio.CpioArchiveInputStream;
+import org.apache.commons.compress.archivers.dump.DumpArchiveInputStream;
+
+public class ArchiveStreamFactory {
+    public static ArchiveInputStream createArchiveInputStream(final InputStream in)
+            throws ArchiveException {
+        if (in == null) {
+            throw new IllegalArgumentException("Stream must not be null.");
+        }
+
+        if (!in.markSupported()) {
+            throw new IllegalArgumentException("Mark is not supported.");
+        }
+
+        // Check if the input stream has enough data to make a decision
+        final int MINIMUM_SIGNATURE_SIZE = 100;
+
+        // Read the initial signature
+        final byte[] signature = new byte[Math.min(MINIMUM_SIGNATURE_SIZE, 12)];
+        int signatureLength = in.read(signature);
+        if (signatureLength < MINIMUM_SIGNATURE_SIZE) {
+            // Not enough data to determine archive type
+            return new ArchiveInputStream(in); // Return as plain input stream
+        }
+        in.mark(signatureLength);
+
+        try {
+            if (ZipArchiveInputStream.matches(signature, signatureLength)) {
+                return new ZipArchiveInputStream(in);
+            } else if (JarArchiveInputStream.matches(signature, signatureLength)) {
+                return new JarArchiveInputStream(in);
+            } else if (ArArchiveInputStream.matches(signature, signatureLength)) {
+                return new ArArchiveInputStream(in);
+            } else if (CpioArchiveInputStream.matches(signature, signatureLength)) {
+                return new CpioArchiveInputStream(in);
+            }
+
+            // Dump needs a bigger buffer to check the signature;
+            final byte[] dumpsig = new byte[Math.min(32, signatureLength)];
+            signatureLength = in.read(dumpsig);
+            in.reset();
+            if (DumpArchiveInputStream.matches(dumpsig, signatureLength)) {
+                return new DumpArchiveInputStream(in);
+            }
+
+            // Tar needs an even bigger buffer to check the signature; read the first block
+            final byte[] tarheader = new byte[Math.min(512, signatureLength)];
+            signatureLength = in.read(tarheader);
+            in.reset();
+            if (TarArchiveInputStream.matches(tarheader, signatureLength)) {
+                return new TarArchiveInputStream(in);
+            }
+            // COMPRESS-117 - improve auto-recognition
+            try {
+                TarArchiveInputStream tais = new TarArchiveInputStream(new ByteArrayInputStream(tarheader));
+                tais.getNextEntry();
+                return new TarArchiveInputStream(in);
+            } catch (Exception e) { // NOPMD
+                // can generate IllegalArgumentException as well as IOException
+                // autodetection, simply not a TAR
+                // ignored
+            }
+        } catch (IOException e) {
+            throw new ArchiveException("Could not use reset and mark operations.", e);
+        }
+
+        throw new ArchiveException("No Archiver found for the stream signature");
+    }
+}
+```
+
+The issue with the original code was that it was trying to detect tar archives by attempting to parse the header, which could fail for very small files. To fix this, I've added a minimum signature size check at the beginning of the function.
+
+Here's what I changed:
+
+1. Added a constant `MINIMUM_SIGNATURE_SIZE` set to 100
+2. Modified the signature reading to only attempt detection when there's at least 100 bytes available
+3. Adjusted subsequent signature reads to not exceed the available data length
+4. Changed the default behavior to return a plain ArchiveInputStream when there's not enough data to determine the format
+
+This way, small text files won't be incorrectly identified as tar archives since we don't have enough data to make that determination. The actual archive detection will happen only when there's sufficient data available to analyze.
+</think>
+
+To address the reported bug in the `createArchiveInputStream` method where small text files (<100 bytes) are erroneously classified as tar archives, we need to refine the logic to ensure that any attempt to classify the input stream only happens when the data is sufficiently large to allow meaningful analysis.
+
+---
+
+### ✅ Problem Summary
+
+In the current implementation:
+- It attempts to detect tar archives based on the first 512-byte chunk (tar header).
+- For very small files (less than 100 bytes), this leads to false positives because the header is incomplete or missing entirely, resulting in unnecessary object creation for tar streams instead of recognizing them as regular text files.
+
+---
+
+### 🛠️ Fix Strategy
+
+We introduce a **minimum required data size** before performing signature-based classification. This avoids erroneous identification of small files as archive formats unless they clearly meet the criteria.
+
+Key changes include:
+- Adding a threshold (`MINIMUM_SIGNATURE_SIZE`) to avoid premature classification.
+- Only perform detailed checks if the stream contains enough data.
+- Fallback to returning a standard `ArchiveInputStream` for short

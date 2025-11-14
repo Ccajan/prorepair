@@ -1,0 +1,183 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Cannot Read Winzip Archives With Unicode Extra Fields
+I have a zip file created with WinZip containing Unicode extra fields. Upon attempting to extract it with org.apache.commons.compress.archivers.zip.ZipFile, ZipFile.getInputStream() returns null for ZipArchiveEntries previously retrieved with ZipFile.getEntry() or even ZipFile.getEntries(). See UTF8ZipFilesTest.patch in the attachments for a test case exposing the bug. The original test case stopped short of trying to read the entries, that's why this wasn't flagged up before. 
+The problem lies in the fact that inside ZipFile.java entries are stored in a HashMap. However, at one point after populating the HashMap, the unicode extra fields are read, which leads to a change of the ZipArchiveEntry name, and therefore a change of its hash code. Because of this, subsequent gets on the HashMap fail to retrieve the original values.
+ZipFile.patch contains an (admittedly simple-minded) fix for this problem by reconstructing the entries HashMap after the Unicode extra fields have been parsed. The purpose of this patch is mainly to show that the problem is indeed what I think, rather than providing a well-designed solution.
+The patches have been tested against revision 1210416.
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/zip/ZipFile.java):
+```java
+private void resolveLocalFileHeaderData(Map<ZipArchiveEntry, NameAndComment>
+                                        entriesWithoutUTF8Flag)
+    throws IOException {
+    // changing the name of a ZipArchiveEntry is going to change
+    // the hashcode - see COMPRESS-164
+    // Map needs to be reconstructed in order to keep central
+    // directory order
+    for (ZipArchiveEntry ze : entries.keySet()) {
+        OffsetEntry offsetEntry = entries.get(ze);
+        long offset = offsetEntry.headerOffset;
+        archive.seek(offset + LFH_OFFSET_FOR_FILENAME_LENGTH);
+        byte[] b = new byte[SHORT];
+        archive.readFully(b);
+        int fileNameLen = ZipShort.getValue(b);
+        archive.readFully(b);
+        int extraFieldLen = ZipShort.getValue(b);
+        int lenToSkip = fileNameLen;
+        while (lenToSkip > 0) {
+            int skipped = archive.skipBytes(lenToSkip);
+            if (skipped <= 0) {
+                throw new RuntimeException("failed to skip file name in"
+                                           + " local file header");
+            }
+            lenToSkip -= skipped;
+        }
+        byte[] localExtraData = new byte[extraFieldLen];
+        archive.readFully(localExtraData);
+        ze.setExtra(localExtraData);
+        offsetEntry.dataOffset = offset + LFH_OFFSET_FOR_FILENAME_LENGTH
+            + SHORT + SHORT + fileNameLen + extraFieldLen;
+
+        if (entriesWithoutUTF8Flag.containsKey(ze)) {
+            String orig = ze.getName();
+            NameAndComment nc = entriesWithoutUTF8Flag.get(ze);
+            ZipUtil.setNameAndCommentFromExtraFields(ze, nc.name,
+                                                     nc.comment);
+            if (!orig.equals(ze.getName())) {
+                nameMap.remove(orig);
+                nameMap.put(ze.getName(), ze);
+            }
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+Yes, the issue you've identified stems from **race condition** behavior within `ZipFile.java` when handling **Unicode extra fields**. This causes the `nameMap` (a `HashMap`) used to map entry names to `ZipArchiveEntry` instances to become inconsistent because:
+
+1. `ZipArchiveEntry` has a mutable name field.
+2. After parsing Unicode extra data, the name may be updated using `setExtra(...)`.
+3. Since the hash code of an object depends on its state, modifying the `name` field changes the hash code of the `ZipArchiveEntry` instance.
+4. Thus, during future lookups via `nameMap`, the same `ZipArchiveEntry` is not found since the key (the old name) no longer maps to the value.
+
+---
+
+## ✅ Problem Summary
+
+When Unicode extra fields are processed:
+- They might update the name of the entry (`ze.setName(...)`).
+- This changes the hash code of the `ZipArchiveEntry` object.
+- This invalidates the mapping in the `HashMap` (`nameMap`), leading to lookup failures.
+
+---
+
+## ✅ Solution Overview
+
+To fix this, we need to ensure that the entries' names are fixed **before** they are added to the `nameMap`. Here's how to do it properly:
+
+### 🛠️ Fix Strategy:
+
+1. Parse the Unicode extra data and update the entry’s name **before** adding it to `nameMap`.
+2. Use the **final** name of the entry as the key in `nameMap`.
+
+Alternatively, if the Unicode fields *cannot* be resolved until later, then we must wait to insert into the `nameMap` until the name is finalized.
+
+---
+
+## ✅ Suggested Fix: Rebuild the Name Map
+
+A robust way to address this is to **reconstruct** the entire `nameMap` after all the Unicode extra data has been fully parsed and the names are final.
+
+Below is a revised version of your code with proper logic to avoid hash collisions due to dynamic name changes:
+
+```java
+private void resolveLocalFileHeaderData(Map<ZipArchiveEntry, NameAndComment>
+                                        entriesWithoutUTF8Flag)
+    throws IOException {
+    // Store original entries
+    List<ZipArchiveEntry> originalEntries = new ArrayList<>(entries.keySet());
+
+    // Process each entry
+    for (ZipArchiveEntry ze : originalEntries) {
+        OffsetEntry offsetEntry = entries.get(ze);
+        long offset = offsetEntry.headerOffset;
+        
+        try {
+            archive.seek(offset + LFH_OFFSET_FOR_FILENAME_LENGTH);
+            
+            byte[] b = new byte[SHORT];
+            archive.readFully(b);
+            int fileNameLen = ZipShort.getValue(b);
+
+            archive.readFully(b);
+            int extraFieldLen = ZipShort.getValue(b);
+
+            // Skip filename bytes
+            int lenToSkip = fileNameLen;
+            while (lenToSkip > 0) {
+                int skipped = archive.skipBytes(lenToSkip);
+                if (skipped <= 0) {
+                    throw new RuntimeException("Failed to skip file name in local file header");
+                }
+                lenToSkip -= skipped;
+            }
+
+            // Read the extra data
+            byte[] localExtraData = new byte[extraFieldLen];
+            archive.readFully(localExtraData);
+
+            // Set extra data
+            ze.setExtra(localExtraData);
+
+            // Determine data offset
+            offsetEntry.dataOffset = offset + LFH_OFFSET_FOR_FILENAME_LENGTH
+                + SHORT + SHORT + fileNameLen + extraFieldLen;
+
+            // If we had a previous name, handle it
+            if (entriesWithoutUTF8Flag.containsKey(ze)) {
+                String origName = ze.getName(); // Original name before parsing
+                NameAndComment nc = entriesWithoutUTF8Flag.get(ze);
+                
+                // Try to set name and comment based on extra fields
+                ZipUtil.setNameAndCommentFromExtraFields(ze, nc.name, nc.comment);
+
+                // Check if the name was modified
+                if (!origName.equals(ze.getName())) {
+                    // Handle the renamed entry here — use the final name
+                    nameMap.remove(origName);
+                    nameMap.put(ze.getName(), ze);
+                }
+            } else {
+                // No prior name — just add with current name
+                nameMap.put(ze.getName(), ze);
+            }
+        } catch (IOException e) {
+            // Log error or rethrow
+            throw new IOException("Error processing local file header for entry " + ze.getName(), e);
+        }
+    }
+}
+```
+
+---
+
+## ✅ Key Fixes & Improvements
+
+| Issue | Fix |
+|------|-----|
+| Mutable name field breaks hash | We check if the name changed and re-map accordingly |
+| Using unstable keys in HashMap | Names are only mapped once they're finalized |
+| Race conditions between reads and updates | Avoid concurrent modification of entries |
+
+---
+
+## ✅ Alternative: Recreate `nameMap` Entirely
+
+If you want a more defensive approach, consider clearing and rebuilding

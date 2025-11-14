@@ -1,0 +1,137 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# AsPropertyTypeDeserializer ignores DeserializationFeature.ACCEPT_EMPTY_STRING_AS_NULL_OBJECT
+The AsPropertyTypeDeserializer  implementation does not respect the DeserializationFeature.ACCEPT_EMPTY_STRING_AS_NULL_OBJECT feature. When deserializing an empty String it throws DeserializationFeature.ACCEPT_EMPTY_STRING_AS_NULL_OBJECT instead of creating a null Object.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/jsontype/impl/AsPropertyTypeDeserializer.java):
+```java
+protected Object _deserializeTypedUsingDefaultImpl(JsonParser p, DeserializationContext ctxt,
+        TokenBuffer tb) throws IOException
+{
+    // As per [JACKSON-614], may have default implementation to use
+    JsonDeserializer<Object> deser = _findDefaultImplDeserializer(ctxt);
+    if (deser != null) {
+        if (tb != null) {
+            tb.writeEndObject();
+            p = tb.asParser(p);
+            // must move to point to the first token:
+            p.nextToken();
+        }
+        return deser.deserialize(p, ctxt);
+    }
+    // or, perhaps we just bumped into a "natural" value (boolean/int/double/String)?
+    Object result = TypeDeserializer.deserializeIfNatural(p, ctxt, _baseType);
+    if (result != null) {
+        return result;
+    }
+    // or, something for which "as-property" won't work, changed into "wrapper-array" type:
+    if (p.getCurrentToken() == JsonToken.START_ARRAY) {
+        return super.deserializeTypedFromAny(p, ctxt);
+    }
+    ctxt.reportWrongTokenException(p, JsonToken.FIELD_NAME,
+            "missing property '"+_typePropertyName+"' that is to contain type id  (for class "+baseTypeName()+")");
+    return null;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+package com.fasterxml.jackson.databind.jsontype.impl;
+
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.databind.DeserializationContext;
+import com.fasterxml.jackson.databind.JavaType;
+import com.fasterxml.jackson.databind.JsonDeserializer;
+import com.fasterxml.jackson.databind.PropertyName;
+import com.fasterxml.jackson.databind.deser.std.StdDeserializer;
+
+public class AsPropertyTypeDeserializer extends TypeDeserializer {
+
+    private static final long serialVersionUID = 1L;
+
+    protected final PropertyName _typePropertyName;
+    protected final StdDeserializer<?> _defaultImpl; // as per [JACKSON-614]
+
+    public AsPropertyTypeDeserializer(JavaType baseType, PropertyName tp, JsonDeserializer<?> impl)
+    {
+        super(baseType);
+        _typePropertyName = tp;
+        _defaultImpl = (StdDeserializer<?>) impl;
+    }
+
+    @Override
+    public Object deserializeTypedFromArray(JsonParser p, DeserializationContext ctxt) throws IOException {
+        if (p.getCurrentToken() == JsonToken.START_ARRAY && p.nextToken() == JsonToken.VALUE_STRING) {
+            String typeName = p.getText();
+            if (_baseType.isEnumType()) {
+                JsonDeserializer<?> deser = ctxt.findEnumDeserializer(_baseType, p, this);
+                if (deser != null) {
+                    return deser.deserialize(p, ctxt);
+                }
+            } else {
+                JsonDeserializer<?> deser = ctxt.getDeserializerResolver().findEnumDeserializer(_baseType, p, this);
+                if (deser != null) {
+                    return deser.deserialize(p, ctxt);
+                }
+            }
+            JavaType type = ctxt.getTypeFactory().constructFromCanonical(typeName);
+            if (!type.isAssignableFrom(_baseType)) {
+                ctxt.reportMappingException("Illegal type id found: %s.%s (expected: %s)",
+                        type.getRawClass(), typeName, _baseType.getRawClass());
+            }
+        }
+        p = ctxt.getParser();
+        return deserializeTypedInternal(p, ctxt);
+    }
+
+    @Override
+    public Object deserializeTypedFromObject(JsonParser p, DeserializationContext ctxt) throws IOException {
+        p = ctxt.getParser();
+        return deserializeTypedInternal(p, ctxt);
+    }
+
+    private Object deserializeTypedInternal(JsonParser p, DeserializationContext ctxt) throws IOException {
+        JsonDeserializer<Object> deser = _defaultImpl;
+        if (deser != null) {
+            p.nextToken(); // skip FIELD_NAME
+            TokenBuffer tb = new TokenBuffer(p, ctxt);
+            tb.copyCurrentStructure(p);
+            tb.writeEndObject();
+            p = tb.asParser(null);
+            p.nextToken(); // skip START_OBJECT
+            return deser.deserialize(p, ctxt);
+        }
+        // or, perhaps we just bumped into a "natural" value (boolean/int/double/String)?
+        Object result = TypeDeserializer.deserializeIfNatural(p, ctxt, _baseType);
+        if (result != null) {
+            return result;
+        }
+        // or, something for which "as-property" won't work, changed into "wrapper-array" type:
+        if (p.getCurrentToken() == JsonToken.START_ARRAY) {
+            return super.deserializeTypedFromAny(p, ctxt);
+        }
+        ctxt.reportWrongTokenException(p, JsonToken.FIELD_NAME,
+                "Missing property '" + _typePropertyName.toString() + "' that is to contain type information (for class "
+                        + _baseType.getRawClass().getName() + ")");
+        return null;
+    }
+
+    @Override
+    public Object deserializeTypedFromString(String value, DeserializationContext ctxt) throws IOException {
+        JavaType t = ctxt.getTypeFactory().constructFromCanonical(value);
+        JsonDeserializer<Object> deser = _defaultImpl;
+        if (deser != null || !t.isAssignableFrom(_baseType)) {
+            if (ctxt.isEnabled(DeserializationFeature.ACCEPT_EMPTY_STRING_AS_NULL_OBJECT) && "".equals(value.trim())) {
+                return null;
+            }
+            ctxt.reportMappingException("Illegal type id '%s' (expected %s): can not instantiate polymorphic type %s",
+                    value, _baseType.getRawClass().getName(),
+                    t.getRawClass().getName());
+        }
+        return deserializeTypedInternal(new JsonParser(null), ctxt);
+    }
+}
+```

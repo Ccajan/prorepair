@@ -1,0 +1,170 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Block two more gadgets to exploit default typing issue (c3p0, CVE-2018-7489)
+From an email report there are 2 other c3p0 classes (above and beyond ones listed in #1737) need to be blocked.
+
+EDIT 21-Jun-2021: Fix included in:
+
+* `2.9.5`
+* `2.8.11.1`
+* `2.7.9.3`
+* `2.6.7.5`
+
+
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/jsontype/impl/SubTypeValidator.java):
+```java
+public void validateSubType(DeserializationContext ctxt, JavaType type) throws JsonMappingException
+    {
+        // There are certain nasty classes that could cause problems, mostly
+        // via default typing -- catch them here.
+        final Class<?> raw = type.getRawClass();
+        String full = raw.getName();
+
+        main_check:
+        do {
+            if (_cfgIllegalClassNames.contains(full)) {
+                break;
+            }
+
+            // 18-Dec-2017, tatu: As per [databind#1855], need bit more sophisticated handling
+            //    for some Spring framework types
+            // 05-Jan-2017, tatu: ... also, only applies to classes, not interfaces
+            if (raw.isInterface()) {
+                ;
+            } else if (full.startsWith(PREFIX_SPRING)) {
+                for (Class<?> cls = raw; (cls != null) && (cls != Object.class); cls = cls.getSuperclass()){
+                    String name = cls.getSimpleName();
+                    // looking for "AbstractBeanFactoryPointcutAdvisor" but no point to allow any is there?
+                    if ("AbstractPointcutAdvisor".equals(name)
+                            // ditto  for "FileSystemXmlApplicationContext": block all ApplicationContexts
+                            || "AbstractApplicationContext".equals(name)) {
+                        break main_check;
+                    }
+                // [databind#1737]; more 3rd party
+                // s.add("com.mchange.v2.c3p0.JndiRefForwardingDataSource");
+                // s.add("com.mchange.v2.c3p0.WrapperConnectionPoolDataSource");
+                // [databind#1931]; more 3rd party
+                // com.mchange.v2.c3p0.ComboPooledDataSource
+                // com.mchange.v2.c3p0.debug.AfterCloseLoggingComboPooledDataSource 
+                }
+            }
+            return;
+        } while (false);
+
+        throw JsonMappingException.from(ctxt,
+                String.format("Illegal type (%s) to deserialize: prevented for security reasons", full));
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public void validateSubType(DeserializationContext ctxt, JavaType type) throws JsonMappingException
+{
+    // There are certain nasty classes that could cause problems, mostly
+    // via default typing -- catch them here.
+    final Class<?> raw = type.getRawClass();
+    String full = raw.getName();
+
+    main_check:
+    do {
+        if (_cfgIllegalClassNames.contains(full)) {
+            break;
+        }
+
+        // 18-Dec-2017, tatu: As per [databind#1855], need bit more sophisticated handling
+        //    for some Spring framework types
+        // 05-Jan-2017, tatu: ... also, only applies to classes, not interfaces
+        if (raw.isInterface()) {
+            ; // No action needed for interfaces
+        } else if (full.startsWith(PREFIX_SPRING)) {
+            for (Class<?> cls = raw; (cls != null) && (cls != Object.class); cls = cls.getSuperclass()){
+                String name = cls.getSimpleName();
+                // looking for "AbstractBeanFactoryPointcutAdvisor" but no point to allow any is there?
+                if ("AbstractPointcutAdvisor".equals(name)
+                        // ditto  for "FileSystemXmlApplicationContext": block all ApplicationContexts
+                        || "AbstractApplicationContext".equals(name)) {
+                    break main_check;
+                }
+            }
+            // Add additional checks for known vulnerable C3P0 classes
+            if (full.equals("com.mchange.v2.c3p0.JndiRefForwardingDataSource") ||
+                full.equals("com.mchange.v2.c3p0.WrapperConnectionPoolDataSource") ||
+                full.equals("com.mchange.v2.c3p0.ComboPooledDataSource") ||
+                full.equals("com.mchange.v2.c3p0.debug.AfterCloseLoggingComboPooledDataSource")) {
+                break main_check;
+            }
+        }
+        return;
+    } while (false);
+
+    throw JsonMappingException.from(ctxt,
+            String.format("Illegal type (%s) to deserialize: prevented for security reasons", full));
+}
+```
+
+The original code had several issues:
+
+1. **Incomplete Protection**: The original code didn't properly handle all the vulnerable C3P0 classes mentioned in the report.
+
+2. **Missing Logic**: The code didn't have proper logic to check for these additional C3P0 classes after checking Spring-related classes.
+
+3. **Incorrect Flow Control**: The `break main_check` statement wasn't sufficient to prevent deserialization of the problematic C3P0 classes.
+
+4. **Missing Return Statement**: The code would return without checking the additional C3P0 classes, which were supposed to be checked.
+
+The fixed code addresses these issues by:
+
+1. Adding explicit checks for all the vulnerable C3P0 classes.
+2. Ensuring that the code correctly breaks out of the loop when a vulnerable class is detected.
+3. Properly handling the flow control to ensure all checks are performed before allowing deserialization.
+</think>
+
+To fix the vulnerability introduced by improper validation of deserializable types in Jackson Databind's `validateSubType()` method, we need to address several key issues:
+
+---
+
+### ✅ Problem Summary
+
+The current implementation of `validateSubType()` fails to fully protect against certain malicious deserialization attacks involving the **C3P0** library, specifically due to a **default typing configuration** misuse that allows untrusted inputs to create dangerous objects (like JNDI references or arbitrary classes).
+
+In particular, this method needs to **block specific classes from being deserialized** using default typing due to their potential to introduce **Remote Code Execution (RCE)** or similar exploits.
+
+There were *two additional C3P0 classes* (beyond those already in issue #1737) missing from the list of illegal classes being validated. These missing validations allowed exploitation via default typing, potentially enabling **CVE-2018-7489** or similar vulnerabilities depending on how they're misused.
+
+---
+
+### 🛠️ Fix Overview
+
+The key steps taken to address this are:
+
+1. **Added explicit checks for C3P0 classes** that should never be deserialized through default typing.
+
+2. **Ensured that all relevant blocking checks are performed** — especially for the new C3P0 classes.
+
+3. **Corrected the conditional flow** so that it clearly identifies the blocked classes and stops processing accordingly.
+
+---
+
+### 🔧 Fixed Code
+
+Here is the corrected version of the `validateSubType()` method:
+
+```java
+public void validateSubType(DeserializationContext ctxt, JavaType type) throws JsonMappingException {
+    final Class<?> raw = type.getRawClass();
+    String full = raw.getName();
+
+    main_check:
+    do {
+        if (_cfgIllegalClassNames.contains(full)) {
+            break;
+        }
+
+        // Only apply checks to concrete classes, not interfaces
+        if (raw.isInterface()) {
+            ; // No action required for interfaces
+

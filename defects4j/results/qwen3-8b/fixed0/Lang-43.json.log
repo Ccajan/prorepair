@@ -1,0 +1,133 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# ExtendedMessageFormat: OutOfMemory with custom format registry and a pattern containing single quotes
+When using ExtendedMessageFormat with a custom format registry and a pattern conatining single quotes, an OutOfMemoryError will occur.
+Example that will cause error:
+ExtendedMessageFormatTest.java
+
+private static Map<String, Object> formatRegistry = new HashMap<String, Object>();    
+    static {
+        formatRegistry.put(DummyFormatFactory.DUMMY_FORMAT, new DummyFormatFactory());
+    }
+
+    public static void main(String[] args) {
+        ExtendedMessageFormat mf = new ExtendedMessageFormat("it''s a {dummy} 'test'!", formatRegistry);
+        String formattedPattern = mf.format(new String[] {"great"});
+        System.out.println(formattedPattern);
+    }
+}
+
+The following change starting at line 421 on the 2.4 release seems to fix the problem:
+ExtendedMessageFormat.java
+CURRENT (Broken):
+if (escapingOn && c[start] == QUOTE) {
+        return appendTo == null ? null : appendTo.append(QUOTE);
+}
+
+WORKING:
+if (escapingOn && c[start] == QUOTE) {
+        next(pos);
+        return appendTo == null ? null : appendTo.append(QUOTE);
+}
+This is an incorrect Java code (src/java/org/apache/commons/lang/text/ExtendedMessageFormat.java):
+```java
+private StringBuffer appendQuotedString(String pattern, ParsePosition pos,
+        StringBuffer appendTo, boolean escapingOn) {
+    int start = pos.getIndex();
+    char[] c = pattern.toCharArray();
+    if (escapingOn && c[start] == QUOTE) {
+        return appendTo == null ? null : appendTo.append(QUOTE);
+    }
+    int lastHold = start;
+    for (int i = pos.getIndex(); i < pattern.length(); i++) {
+        if (escapingOn && pattern.substring(i).startsWith(ESCAPED_QUOTE)) {
+            appendTo.append(c, lastHold, pos.getIndex() - lastHold).append(
+                    QUOTE);
+            pos.setIndex(i + ESCAPED_QUOTE.length());
+            lastHold = pos.getIndex();
+            continue;
+        }
+        switch (c[pos.getIndex()]) {
+        case QUOTE:
+            next(pos);
+            return appendTo == null ? null : appendTo.append(c, lastHold,
+                    pos.getIndex() - lastHold);
+        default:
+            next(pos);
+        }
+    }
+    throw new IllegalArgumentException(
+            "Unterminated quoted string at position " + start);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+<think>
+Okay, let's try to figure out why this OutOfMemoryError is happening when using ExtendedMessageFormat with a custom registry and a pattern containing single quotes. The user provided a test case where the pattern is "it''s a {dummy} 'test'!" and mentioned that modifying the code in the appendQuotedString method fixes it.
+
+Looking at the current broken code in appendQuotedString:
+
+The method checks if escaping is on and the first character is a quote. If so, it appends a quote and returns immediately. But wait, in the example, there are two single quotes in a row like '' which is used to escape a quote in the pattern. So maybe the original code isn't handling escaped quotes properly.
+
+In the broken code, when escaping is enabled and the current character is a quote, it just appends a quote and returns. That doesn't account for the escaped quote scenario. For instance, in the pattern "it''s...", the second single quote is meant to be an escaped quote. However, the current code might not process this correctly, leading to infinite loops or excessive memory usage.
+
+The working version adds a call to next(pos) before returning. Wait, next(pos) increments the position. Let me check what next(pos) does. It probably advances the pos index by one. So in the broken code, when escaping is on and the first character is a quote, it just appends a quote and returns, but without moving the position forward. This would mean that the next iteration of the loop would still check the same position again, causing an infinite loop. 
+
+Wait, no. Let me think again. The code starts by checking if escaping is on and the current character is a quote. Then it appends a quote and returns. But in the case of an escaped quote (like in the pattern), the code should handle the escaped quote as part of the quoted string. The original code might have a flaw here where it's not processing the escaped quotes correctly, leading to an infinite loop because the position never advances beyond the initial quote.
+
+In the original code, after checking the first character is a quote and escaping is on, it appends a quote and returns. But perhaps this is supposed to handle cases where a quote is escaped. However, the way it's written might not advance the position, leading to the same character being processed repeatedly, thus causing an infinite loop or excessive memory allocation as it keeps trying to parse without making progress.
+
+The fixed code adds next(pos); which moves the position forward, allowing the parsing to proceed. This ensures that the position is updated even when a quote is encountered during escaping, preventing the loop from running indefinitely. 
+
+So the key issue is that the original code didn't increment the position index when encountering a quote during escaping. By adding next(pos), the position is advanced, allowing the loop to process the rest of the pattern properly. This prevents the infinite loop that could lead to an OutOfMemoryError due to continuous processing of the same character.
+
+Therefore, the correct approach is to ensure that when a quote is encountered while escaping is active, the position is moved forward to avoid looping indefinitely. The fix in the working code addresses this by calling next(pos), which increments the pos variable, allowing the loop to proceed and eventually terminate once the quoted string is fully processed.
+</think>
+
+To address the `OutOfMemoryError` caused by an infinite loop in the `appendQuotedString` method of `ExtendedMessageFormat`, we need to understand the behavior of how quoted strings are parsed when **escaping** is enabled.
+
+---
+
+### 🔍 Problem Analysis
+
+In the problematic code:
+
+```java
+if (escapingOn && c[start] == QUOTE) {
+    return appendTo == null ? null : appendTo.append(QUOTE);
+}
+```
+
+- When escaping is enabled and the first character is a **quote (`'`)**, the code immediately appends a quote and **returns**.
+- Crucially, **it does NOT advance the `pos` pointer**, which means the next time through the loop, it will re-check the *same* character again — resulting in an **infinite loop**.
+
+This leads to memory exhaustion as the parser tries to consume the same token over and over, eventually exhausting available heap space.
+
+---
+
+### ✅ Fix Overview
+
+We fix the issue by ensuring the `pos` pointer **advances** even when we encounter a quote while escaping is active.
+
+Here’s the corrected implementation of `appendQuotedString`:
+
+```java
+private StringBuffer appendQuotedString(String pattern, ParsePosition pos,
+        StringBuffer appendTo, boolean escapingOn) {
+    int start = pos.getIndex();
+    char[] c = pattern.toCharArray();
+
+    // Handle escaped quote at the beginning of a quoted string
+    if (escapingOn && c[start] == QUOTE) {
+        next(pos);   // Advance the position
+        return appendTo == null ? null : appendTo.append(QUOTE);
+    }
+
+    int lastHold = start;
+
+    for (int

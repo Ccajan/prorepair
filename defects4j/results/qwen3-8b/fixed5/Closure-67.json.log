@@ -1,0 +1,227 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Advanced compilations renames a function and then deletes it, leaving a reference to a renamed but non-existent function
+If we provide the below code to advanced:
+
+function A() {
+this._x = 1;
+}
+
+A.prototype['func1'] = // done to save public reference to func1
+A.prototype.func1 = function() {
+  this._x = 2;
+  this.func2();
+}
+
+A.prototype.func2 = function() {
+  this._x = 3;
+  this.func3();
+}
+
+window['A'] = A;
+
+We get the output:
+
+function a() {
+  this.a = 1
+}
+a.prototype.func1 = a.prototype.b = function() {
+  this.a = 2;
+  this.c() // Problem!
+};
+window.A = a;
+
+So the compiler emits no errors, and renames 'func2' to 'c' but ends up throwing away the definition of that function!
+
+The problem arises when I use:
+
+A.prototype['func1'] = // done to save public reference to func1
+A.prototype.func1 = function() {
+...
+}
+
+The ['func1'] line is apparently enough to save the reference correctly, but also has the side effect of causing the function innards to do the wrong thing.
+
+I can of course instead write it as:
+
+A.prototype['func1'] = A.prototype.func1;
+A.prototype.func1 = function() {
+  this._x = 2;
+  this.func2();
+}
+
+In which case Advanced will compile correctly and the results will also be valid.
+
+function a() {
+  this.a = 1
+}
+a.prototype.func1 = a.prototype.b;
+a.prototype.b = function() {
+  this.a = 2;
+  this.a = 3 // func2, correctly minified
+};
+window.A = a;
+
+For now I can just use the expected way of declaring that func1 export, but since the compiler returns with no errors or warnings and creates a function with no definition, it seems worth reporting.
+This is an incorrect Java code (src/com/google/javascript/jscomp/AnalyzePrototypeProperties.java):
+```java
+private boolean isPrototypePropertyAssign(Node assign) {
+  Node n = assign.getFirstChild();
+  if (n != null && NodeUtil.isVarOrSimpleAssignLhs(n, assign)
+      && n.getType() == Token.GETPROP
+      ) {
+    // We want to exclude the assignment itself from the usage list
+    boolean isChainedProperty =
+        n.getFirstChild().getType() == Token.GETPROP;
+
+    if (isChainedProperty) {
+      Node child = n.getFirstChild().getFirstChild().getNext();
+
+      if (child.getType() == Token.STRING &&
+          child.getString().equals("prototype")) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+private boolean isPrototypePropertyAssign(Node assign) {
+  Node lhs = assign.getExpression(); // Get the left-hand side of the assignment
+  if (lhs == null) {
+    return false;
+  }
+
+  // Check if the left-hand side is a property access on 'prototype'
+  if (NodeUtil.isGetProp(lhs)) {
+    Node object = lhs.getFirstChild();
+    Node prop = lhs.getLastChild();
+
+    // Ensure the object is 'prototype' and the property name matches
+    if (object != null && prop != null && NodeUtil.isQualifiedName(object)) {
+      String propertyName = prop.getString();
+      Node objName = object.getFirstChild();
+      String objNameStr = objName.getString();
+      
+      if ("prototype".equals(objNameStr) && 
+          "func1".equals(propertyName)) { // This should probably be dynamic
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+```
+
+Wait, the above fix isn't addressing the original issue properly. Let me revise.
+
+The problem in the code was not properly identifying assignments to prototype properties, leading to incorrect renaming of functions like `func2` to `c` while losing its definition. The core issue is how the code checks for assignments targeting prototype properties.
+
+Here's a more accurate repair:
+
+```java
+private boolean isPrototypePropertyAssign(Node assign) {
+  Node lhs = assign.getExpression(); // Get the left-hand side of the assignment
+  if (lhs == null) {
+    return false;
+  }
+
+  // Check if the left-hand side is a property access on 'prototype'
+  if (NodeUtil.isGetProp(lhs)) {
+    Node object = lhs.getFirstChild();
+    Node prop = lhs.getLastChild();
+
+    // Ensure the object is 'prototype' and the property name is a variable
+    if (object != null && prop != null && NodeUtil.isQualifiedName(object)) {
+      String propertyName = prop.getString();
+      Node objName = object.getFirstChild();
+      String objNameStr = objName.getString();
+      
+      if ("prototype".equals(objNameStr) && 
+          !propertyName.equals("prototype")) { // Exclude the prototype itself
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+```
+
+The original code had issues in checking if the assignment targets a property of the prototype. It was incorrectly assuming the property name would always be "prototype" (which it wouldn't), and didn't dynamically check the property names. The corrected version identifies any assignment to a property of the prototype, excluding the prototype itself.
+
+But wait - there's more going on here. The main goal is to recognize assignments to properties of the prototype so that renaming doesn't destroy necessary references.
+
+Let me present a better approach based on analyzing what the code was trying to accomplish:
+</think>
+
+To address the core issue described — namely, that **the JavaScript minifier/renamer misidentifies property assignments to `prototype`**, resulting in undefined behavior such as orphaned function references — we need to revisit the logic within the `isPrototypePropertyAssign` method.
+
+---
+
+### 🔍 **Understanding the Problem**
+
+- The existing implementation only checks whether the **left-hand side** (`lhs`) is a property access on `"prototype"` **and** that the **property name** equals `"prototype"`.
+- That’s clearly incorrect, because it treats `"prototype"` itself as a candidate for renaming (e.g., renaming `A.prototype` to something else).
+- But in real cases, users are assigning values to **properties** on `prototype`, e.g., `A.prototype.func1`.
+
+---
+
+### ✅ **Correct Behavior Required**
+The intended logic is:
+> Identify assignments to properties **of** `prototype`, regardless of their name, *except* the actual `prototype` property itself.
+
+That includes things like:
+```js
+A.prototype.func1 = ...;
+A.prototype.x = ...;
+A.prototype.yz = ...;
+```
+These are all valid and **should not be renamed**, especially when they're used via references elsewhere.
+
+---
+
+### ✅ **Fixed Implementation**
+
+Here's a correct, clean implementation of `isPrototypePropertyAssign`:
+
+```java
+private boolean isPrototypePropertyAssign(Node assign) {
+  Node lhs = assign.getExpression();
+  if (lhs == null || !NodeUtil.isGetProp(lhs)) {
+    return false;
+  }
+
+  Node object = lhs.getFirstChild();
+  Node propertyName = lhs.getLastChild();
+
+  if (object == null || propertyName == null) {
+    return false;
+  }
+
+  // Check if the property name is not 'prototype' itself
+  if (!propertyName.isString()) {
+    return false;
+  }
+
+  String propName = propertyName.getString();
+  if ("prototype".equals(propName)) {
+    return false; // Skip renaming the 'prototype' property itself
+  }
+
+  // Now verify if the object is the qualified name 'A.prototype'
+  if (!NodeUtil.isQualifiedName(object)) {
+    return false;
+  }
+
+  Node objName = object.getFirstChild();
+  String className =

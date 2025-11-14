@@ -1,0 +1,138 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Problem with bogus conflict between single-arg-String vs CharSequence constructor
+Although it is good idea to allow recognizing CharSequence as almost like an alias for String, this can cause problems for classes like StringBuilder that have separate constructors for both.
+This actually throws a bogus exception for 2.5.0, due to introduction of ability to recognize CharSequence.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/deser/impl/CreatorCollector.java):
+```java
+protected void verifyNonDup(AnnotatedWithParams newOne, int typeIndex, boolean explicit)
+{
+    final int mask = (1 << typeIndex);
+    _hasNonDefaultCreator = true;
+    AnnotatedWithParams oldOne = _creators[typeIndex];
+    // already had an explicitly marked one?
+    if (oldOne != null) {
+
+        if ((_explicitCreators & mask) != 0) { // already had explicitly annotated, leave as-is
+            // but skip, if new one not annotated
+            if (!explicit) {
+                return;
+            }
+            // both explicit: verify
+            // otherwise only verify if neither explicitly annotated.
+        }
+
+        // one more thing: ok to override in sub-class
+        if (oldOne.getClass() == newOne.getClass()) {
+            // [databind#667]: avoid one particular class of bogus problems
+
+                throw new IllegalArgumentException("Conflicting "+TYPE_DESCS[typeIndex]
+                        +" creators: already had explicitly marked "+oldOne+", encountered "+newOne);
+            // otherwise, which one to choose?
+                // new type more generic, use old
+            // new type more specific, use it
+        }
+    }
+    if (explicit) {
+        _explicitCreators |= mask;
+    }
+    _creators[typeIndex] = _fixAccess(newOne);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+if (oldOne.getClass() == newOne.getClass()) {
+    // [databind#667]: avoid one particular class of bogus problems
+
+    throw new IllegalArgumentException("Conflicting "+TYPE_DESCS[typeIndex]
+            +" creators: already had explicitly marked "+oldOne+", encountered "+newOne);
+    // otherwise, which one to choose?
+    // new type more generic, use old
+    // new type more specific, use it
+}
+```
+
+The problem here seems to be that when trying to compare two instances of `AnnotatedWithParams`, their classes might be the same even though they represent different types (e.g., a `String` and a `CharSequence`). This causes a false positive conflict.
+
+To fix this, we need to check whether the actual underlying types are the same instead of just comparing the classes directly. We could do something like:
+
+```java
+// Check if the actual underlying types match
+boolean sameType = oldOne.getType().equals(newOne.getType());
+if (!sameType && oldOne.getClass() == newOne.getClass()) {
+    // This is a case where the classes are the same, but the types differ
+    // So we should report a conflict
+    throw new IllegalArgumentException("...");
+}
+```
+
+However, I'm not sure about how exactly the `getType()` method works in your context. If it's not available or doesn't provide the necessary information, perhaps there's another way to determine if the types are the same.
+
+Another approach could be to consider the hierarchy of the classes. For example, if `String` is a subclass of `CharSequence`, then a constructor accepting `CharSequence` might be considered as applicable for `String`. In such cases, we would want to prefer the more specific type (`String`) over the more general one (`CharSequence`).
+
+So, perhaps the fix involves checking the inheritance hierarchy between the two types. However, without knowing more about the implementation of `AnnotatedWithParams` and its methods, it's hard to say for certain.
+
+In any case, the key issue is that the current comparison of classes is too restrictive and may lead to unnecessary conflicts when dealing with class hierarchies like `String` and `CharSequence`.
+</think>
+
+To address the **bogus conflict** caused by the `AnnotatedWithParams` type comparison logic—specifically the line:
+
+```java
+if (oldOne.getClass() == newOne.getClass())
+```
+
+we must understand that **this comparison is overly strict** and leads to false positives when `CharSequence` (or similar supertypes) are used in place of `String`.
+
+---
+
+### ✅ Root Cause:
+Java allows autoboxing/conversion from `String` to `CharSequence`, but **the `getClass()` check ignores type relationships**, resulting in **false conflict reports** during creator resolution (e.g., for Jackson’s `CreatorCollector`).
+
+Example:
+- One creator expects `String`
+- Another accepts `CharSequence`
+- Both are valid, but the checker wrongly deems them incompatible.
+
+---
+
+### 🛠️ Solution
+
+We should **compare based on the underlying type definitions** rather than raw class equality. That means using a method that determines whether the **types are equivalent or compatible**.
+
+Here’s the corrected version of the problematic block:
+
+```java
+// Check if the underlying types are the same
+boolean sameType = oldOne.getType().equals(newOne.getType());
+
+// Only throw if the types are *not* equal AND the classes are the same
+if (!sameType && oldOne.getClass() == newOne.getClass()) {
+    throw new IllegalArgumentException(
+        "Conflicting " + TYPE_DESCS[typeIndex] +
+        " creators: already had explicitly marked " + oldOne +
+        ", encountered " + newOne
+    );
+}
+```
+
+---
+
+### 🔍 Notes
+
+- Replace `.getType()` with whatever mechanism identifies the **actual parameterized type** or **type definition** used in the constructor.
+- If `.getType()` isn’t available or accurate enough, consider using reflection to inspect the full generic type signature instead.
+
+---
+
+### 🧠 Additional Tip
+
+If this is part of a framework like **Jackson**, ensure that all relevant `AnnotatedWithParams` instances properly expose their **underlying type representation** via a meaningful `getType()` method. Otherwise, **you’ll always face ambiguity** in creator comparisons.
+
+---
+
+By comparing **type semantics** rather than raw class identity, you eliminate the bogus conflicts caused by overlapping type compatibility chains like `String` → `CharSequence`.

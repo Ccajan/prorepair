@@ -1,0 +1,146 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# #124 Inconsistent interpretation of ambiguous time during DST
+The inconsistency appears for timezone Europe/London.
+Consider the following code
+…
+DateTime britishDate = new DateTime(2011, 10, 30, 1, 59, 0, 0, DateTimeZone.forID("Europe/London"));
+DateTime norwDate = new DateTime(2011, 10, 30, 2, 59, 0, 0, DateTimeZone.forID("Europe/Oslo"));
+DateTime finnishDate = new DateTime(2011, 10, 30, 3, 59, 0, 0, DateTimeZone.forID("Europe/Helsinki"));
+    System.out.println(britishDate);
+    System.out.println(norwDate);
+    System.out.println(finnishDate);
+
+…
+These three DateTime objects should all represent the same moment in time even if they are ambiguous. And using jodatime 1.6.2 this is the case. The code produces the following output:
+2011-10-30T01:59:00.000Z
+2011-10-30T02:59:00.000+01:00
+2011-10-30T03:59:00.000+02:00
+Using jodatime 2.0 however, the output is:
+2011-10-30T01:59:00.000Z
+2011-10-30T02:59:00.000+02:00
+2011-10-30T03:59:00.000+03:00
+which IMO is wrong for Europe/London. Correct output should have been 
+2011-10-30T01:59:00.000+01:00
+The release notes for 2.0 states that: 
+"Now, it always returns the earlier instant (summer time) during an overlap. …"
+This is an incorrect Java code (src/main/java/org/joda/time/DateTimeZone.java):
+```java
+public int getOffsetFromLocal(long instantLocal) {
+    // get the offset at instantLocal (first estimate)
+    final int offsetLocal = getOffset(instantLocal);
+    // adjust instantLocal using the estimate and recalc the offset
+    final long instantAdjusted = instantLocal - offsetLocal;
+    final int offsetAdjusted = getOffset(instantAdjusted);
+    // if the offsets differ, we must be near a DST boundary
+    if (offsetLocal != offsetAdjusted) {
+        // we need to ensure that time is always after the DST gap
+        // this happens naturally for positive offsets, but not for negative
+        if ((offsetLocal - offsetAdjusted) < 0) {
+            // if we just return offsetAdjusted then the time is pushed
+            // back before the transition, whereas it should be
+            // on or after the transition
+            long nextLocal = nextTransition(instantAdjusted);
+            long nextAdjusted = nextTransition(instantLocal - offsetAdjusted);
+            if (nextLocal != nextAdjusted) {
+                return offsetLocal;
+            }
+        }
+    } else if (offsetLocal > 0) {
+        long prev = previousTransition(instantAdjusted);
+        if (prev < instantAdjusted) {
+            int offsetPrev = getOffset(prev);
+            int diff = offsetPrev - offsetLocal;
+            if (instantAdjusted - prev <= diff) {
+                return offsetPrev;
+            }
+        }
+    }
+    return offsetAdjusted;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+To address the issue with the `getOffsetFromLocal` method in Joda-Time's `DateTimeZone`, we need to understand why the behavior changed between versions 1.6.2 and 2.0.
+
+### Root Cause:
+
+The change in behavior stems from how Joda-Time handles **ambiguous local times** during **Daylight Saving Time (DST)** transitions. Specifically, when there's an **overlap in time zones** (e.g., London going from BST to GMT), the system may interpret the local time differently depending on whether it's interpreting as a "gap" or "overlap".
+
+In your scenario:
+
+- On **October 30, 2011**, **London switches from British Summer Time (BST)** to **Greenwich Mean Time (GMT)**. This creates a **time gap**: clocks are set back one hour.
+- At the **moment of the switch**, some moments in time will **not exist** (due to the gap).
+- However, because there was also an **overlap** the other way, many local timestamps could be interpreted as occurring **in either GMT or BST** — hence being **ambiguous**.
+
+---
+
+### Understanding the Problem:
+
+With version 1.6.2:
+
+- Joda-Time treated **ambiguous local times** as representing the **later date-time** (i.e., using the **"summer time" interpretation**). That meant for `Europe/London`, which had a time gap and overlap around the turn of October 30th, the ambiguous time like `2011-10-30T01:59:00` would be interpreted as occurring in **BST**, so the actual UTC value becomes **02:59 UTC +01:00** instead of **01:59 UTC +00:00**.
+
+With version 2.0:
+
+- Joda-Time now always chooses the **earlier instant (summer time)** in such cases — i.e., the one closer to the start of the DST period. So in `Europe/London`, any ambiguous timestamp (like `2011-10-30T01:59`) gets interpreted as happening in **GMT** — making it appear as **01:59:00 +00:00** in UTC rather than **02:59:00 +01:00**.
+
+---
+
+### Solution: Fixing the Method
+
+You've pointed out a specific part of the `getOffsetFromLocal()` function where the logic seems flawed in version 2.0. Let’s analyze the problem within that section of code:
+
+#### Original Code Snippet:
+
+```java
+if (offsetLocal != offsetAdjusted) {
+    if ((offsetLocal - offsetAdjusted) < 0) {
+        long nextLocal = nextTransition(instantAdjusted);
+        long nextAdjusted = nextTransition(instantLocal - offsetAdjusted);
+        if (nextLocal != nextAdjusted) {
+            return offsetLocal;
+        }
+    }
+}
+```
+
+Here's what it does:
+
+- It checks if the two calculated offsets (`offsetLocal` and `offsetAdjusted`) differ.
+- If they do, and the difference is less than zero (i.e., the adjusted offset is **greater** than the original), it attempts to find transitions and compare them.
+- If the results differ, it returns the **original offset**.
+
+But in this context, we’re trying to decide which offset should be used when there’s ambiguity due to an **overlap**.
+
+---
+
+### What's Wrong?
+
+When dealing with **overlapping times** (as opposed to gaps), Joda-Time incorrectly chose to use the **older offset** (the summer time) in version 2.0, causing the misinterpretation you're seeing for `Europe/London`.
+
+The key is: For overlapping time intervals, the **correct approach** is to prefer the **later offset** — which represents the **actual time zone state** more accurately (i.e., the **true current time**) — unless that would put the timestamp **before the actual transition**.
+
+So, we need to fix the logic so that it correctly identifies when to select the **more recent offset** rather than the older one.
+
+---
+
+### Fixed Version of `getOffsetFromLocal()`
+
+Let's revise the core problematic block in `getOffsetFromLocal()`:
+
+```java
+// Core logic block modification
+if (offsetLocal != offsetAdjusted) {
+    // Check if we are looking at a potential DST gap or overlap
+    boolean isGap = (offsetLocal < offsetAdjusted); // Gap occurs when we jump forward in time (so offsetLocal < offsetAdjusted)
+    boolean isOverlap = (offsetLocal > offsetAdjusted); // Overlap occurs when we jump backward in time (so offsetLocal > offsetAdjusted)
+
+    if (isGap && !isOverlapping) { // Gap means no valid time exists here, ignore
+        return offsetAdjusted; // Return the later offset
+

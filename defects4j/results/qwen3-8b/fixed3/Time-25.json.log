@@ -1,0 +1,129 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# #90 DateTimeZone.getOffsetFromLocal error during DST transition
+This may be a failure of my understanding, but the comments in DateTimeZone.getOffsetFromLocal lead me to believe that if an ambiguous local time is given, the offset corresponding to the later of the two possible UTC instants will be returned - i.e. the greater offset.
+This doesn't appear to tally with my experience. In fall 2009, America/Los_Angeles changed from -7 to -8 at 2am wall time on November 11. Thus 2am became 1am - so 1:30am is ambiguous. I would therefore expect that constructing a DateTime for November 11th, 1:30am would give an instant corresponding with the later value (i.e. 9:30am UTC). This appears not to be the case:
+import org.joda.time.DateTime;
+import org.joda.time.DateTimeZone;
+public class TzTest {
+public static void main(String[] args) throws Exception {
+DateTimeZone zone = DateTimeZone.forID("America/Los_Angeles");
+DateTime when1 = new DateTime(2009, 11, 1, 0, 30, 0, 0, zone);
+DateTime when2 = new DateTime(2009, 11, 1, 1, 30, 0, 0, zone);
+DateTime when3 = new DateTime(2009, 11, 1, 2, 30, 0, 0, zone);
+System.out.println(when1);
+System.out.println(when2);
+System.out.println(when3);
+}
+}
+Results:
+2009-11-01T00:30:00.000-07:00 // Correct
+2009-11-01T01:30:00.000-07:00 // Should be -08:00
+2009-11-01T02:30:00.000-08:00 // Correct
+This is an incorrect Java code (src/main/java/org/joda/time/DateTimeZone.java):
+```java
+public int getOffsetFromLocal(long instantLocal) {
+    // get the offset at instantLocal (first estimate)
+    final int offsetLocal = getOffset(instantLocal);
+    // adjust instantLocal using the estimate and recalc the offset
+    final long instantAdjusted = instantLocal - offsetLocal;
+    final int offsetAdjusted = getOffset(instantAdjusted);
+    // if the offsets differ, we must be near a DST boundary
+    if (offsetLocal != offsetAdjusted) {
+        // we need to ensure that time is always after the DST gap
+        // this happens naturally for positive offsets, but not for negative
+        if ((offsetLocal - offsetAdjusted) < 0) {
+            // if we just return offsetAdjusted then the time is pushed
+            // back before the transition, whereas it should be
+            // on or after the transition
+            long nextLocal = nextTransition(instantAdjusted);
+            long nextAdjusted = nextTransition(instantLocal - offsetAdjusted);
+            if (nextLocal != nextAdjusted) {
+                return offsetLocal;
+            }
+        }
+    }
+    return offsetAdjusted;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public int getOffsetFromLocal(long instantLocal) {
+    // get the offset at instantLocal (first estimate)
+    final int offsetLocal = getOffset(instantLocal);
+    // adjust instantLocal using the estimate and recalc the offset
+    final long instantAdjusted = instantLocal - offsetLocal;
+    final int offsetAdjusted = getOffset(instantAdjusted);
+    // if the offsets differ, we must be near a DST boundary
+    if (offsetLocal != offsetAdjusted) {
+        // Check if we're in a DST gap (ambiguous time)
+        boolean isDSTGap = false;
+        // Determine whether we are in a DST gap based on the current offset
+        // If the offset adjusted is less than the local offset, it indicates 
+        // we might have crossed into a DST gap. For instance, in a fall DST change,
+        // when the clock moves back, there's a one-hour gap where times could match 
+        // both the previous and new offset. In such cases, the Joda-Time library 
+        // needs to determine which offset applies during ambiguous time.
+        //
+        // The logic here assumes that in the context of a DST gap (e.g., during autumn),
+        // the correct choice is to apply the larger offset (i.e., -07 instead of -08).
+        // So if the calculated offset is smaller than the original, we adjust to use the 
+        // larger offset (which corresponds to the earlier timezone moment).
+        if (offsetAdjusted < offsetLocal) {
+            isDSTGap = true;
+        }
+
+        if (isDSTGap) {
+            // In DST gaps (ambiguous times), the method should select the offset corresponding
+            // to the later UTC time. That means we choose the larger offset.
+            return offsetLocal; // Larger offset corresponds to the earlier zone time
+        } else {
+            // For other transitions like spring forward, the method returns the adjusted offset.
+            return offsetAdjusted;
+        }
+    }
+    return offsetAdjusted;
+}
+```
+
+The issue lies within the `getOffsetFromLocal` function in Joda-Time. When handling daylight saving time (DST) transitions, especially during the fall backward shift, the ambiguity in local time can cause unexpected behavior.
+
+In the example provided, the time "2009-11-11T01:30" falls into an ambiguous period because it was skipped due to the time going back from 2:00 AM to 1:00 AM. In such situations, it's important to decide which offset to use.
+
+The original implementation had a flawed logic path to determine which offset to return during DST transitions. It didn't properly differentiate between the offset adjustments and how they relate to DST gap times.
+
+The fix above addresses this by explicitly checking whether we are in a DST gap. If so, it chooses the larger offset (corresponding to the earlier UTC time), which aligns with your expectations.
+
+Thus, when creating a `DateTime` object for an ambiguous local time, it should correctly associate it with the appropriate UTC time based on the logic provided.
+</think>
+
+To address the inconsistency observed in the `DateTimeZone.getOffsetFromLocal()` method when dealing with Daylight Saving Time (DST) transitions—specifically during the **fall** backward shift—we need to clarify the underlying logic used to resolve ambiguities in local time.
+
+---
+
+### ✅ Problem Summary
+
+During **fall DST transitions**, such as in **Los Angeles** on **November 11, 2009**, the clock **moves back** from **2:00 AM to 1:00 AM**, causing an **hour-long gap** in local time where **some local times (like 1:30 AM)** map to **two different UTC timestamps**:
+
+- One that maps to `-07:00` (standard time)
+- Another that maps to `-08:00` (daylight savings time)
+
+When these ambiguous times occur, the goal is to **resolve them consistently**: choosing the **later UTC timestamp**, which corresponds to the **larger offset** (`-07:00` > `-08:00`) **if both are valid**.
+
+However, Joda-Time’s existing `getOffsetFromLocal()` fails to do this accurately when encountering such ambiguous local times.
+
+---
+
+### 🔧 Fix Strategy
+
+We need to:
+
+1. **Detect** if the local time corresponds to a **DST gap** (i.e., the same local time occurs twice in the span of a single day).
+2. **Resolve ambiguity** by selecting the **correct offset** according to the rules:
+   - During **fall DST transitions**, if the offset becomes smaller, it implies the **UTC time is shifted earlier**, suggesting **the older offset** (`-07:00`) should be used.
+   - Therefore, the **correct approach** is to **return the previously known offset** (`offsetLocal`) rather than

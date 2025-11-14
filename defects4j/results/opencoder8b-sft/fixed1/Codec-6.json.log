@@ -1,0 +1,125 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Base64InputStream#read(byte[]) incorrectly returns 0 at end of any stream which is multiple of 3 bytes long
+Using new InputStreamReader(new Base64InputStream(in, true)) sometimes fails with "java.io.IOException: Underlying input stream returned zero bytes".
+This is been tracked down that Base64InputStream#read(byte[]) incorrectly returns 0 at end of any stream which is multiple of 3 bytes long.
+This is an incorrect Java code (src/java/org/apache/commons/codec/binary/Base64InputStream.java):
+```java
+public int read(byte b[], int offset, int len) throws IOException {
+    if (b == null) {
+        throw new NullPointerException();
+    } else if (offset < 0 || len < 0) {
+        throw new IndexOutOfBoundsException();
+    } else if (offset > b.length || offset + len > b.length) {
+        throw new IndexOutOfBoundsException();
+    } else if (len == 0) {
+        return 0;
+    } else {
+        /*
+         Rationale for while-loop on (readLen == 0):
+         -----
+         Base64.readResults() usually returns > 0 or EOF (-1).  In the
+         rare case where it returns 0, we just keep trying.
+
+         This is essentially an undocumented contract for InputStream
+         implementors that want their code to work properly with
+         java.io.InputStreamReader, since the latter hates it when
+         InputStream.read(byte[]) returns a zero.  Unfortunately our
+         readResults() call must return 0 if a large amount of the data
+         being decoded was non-base64, so this while-loop enables proper
+         interop with InputStreamReader for that scenario.
+         -----
+         This is a fix for CODEC-101
+        */
+            if (!base64.hasData()) {
+                byte[] buf = new byte[doEncode ? 4096 : 8192];
+                int c = in.read(buf);
+                // A little optimization to avoid System.arraycopy()
+                // when possible.
+                if (c > 0 && b.length == len) {
+                    base64.setInitialBuffer(b, offset, len);
+                }
+                if (doEncode) {
+                    base64.encode(buf, 0, c);
+                } else {
+                    base64.decode(buf, 0, c);
+                }
+            }
+        return base64.readResults(b, offset, len);
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+package org.apache.commons.codec.binary;
+
+import java.io.FilterInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import javax.xml.bind.DatatypeConverter;
+import org.apache.commons.codec.DecoderException;
+import org.apache.commons.codec.StringDecoder;
+import org.apache.commons.codec.net.URLCodec;
+
+public final class Base64InputStream extends FilterInputStream {
+
+    private final StringDecoder decoder;
+    private final boolean doUrlDecode;
+    private final byte[] buffer = new byte[3];
+    private int count = 0;
+
+    public Base64InputStream(InputStream in) {
+        this(in, false);
+    }
+
+    public Base64InputStream(InputStream in, boolean urlDecode) {
+        super(in);
+        decoder = DatatypeConverter.getDecoder();
+        doUrlDecode = urlDecode;
+    }
+
+    public int read(byte[] b, int off, int len) throws IOException {
+        if (b == null) {
+            throw new NullPointerException("Byte array cannot be null");
+        }
+        if (off < 0 || len < 0 || off > b.length - len) {
+            throw new IndexOutOfBoundsException("Invalid offsets or lengths provided");
+        }
+        if (len == 0) {
+            return 0;
+        }
+        while (true) {
+            if (count == 0) {
+                int c = in.read(buffer);
+                if (c <= 0) {
+                    return c; // EOF
+                }
+                try {
+                    if (doUrlDecode) {
+                        decoder.decodeURLSafe(Base64.isWhiteSpace(c), buffer, 0, c);
+                    } else {
+                        decoder.decode(Base64.isWhiteSpace(c), buffer, 0, c);
+                    }
+                } catch (DecoderException e) {
+                    throw new IOException("Error decoding Base64 content", e);
+                }
+                count = 4; // We have 4 bytes in our buffer now
+            }
+            int n = Math.min(len, 3); // We can only write up to 3 bytes into the user's buffer
+            System.arraycopy(buffer, 4 - count, b, off, n);
+            count -= n;
+            off += n;
+            len -= n;
+            if (len <= 0) {
+                return off - len; // Return the number of bytes read
+            }
+        }
+    }
+}
+
+```

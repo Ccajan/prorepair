@@ -1,0 +1,122 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# @JacksonXmlRootElement malfunction when using it with multiple XmlMappers and disabling annotations
+Found this in version 2.9.4 running some tests that go back and forth serializing with an XML mapper that uses annotations, and another one that ignores them. May be related to issue #171 and the cache of class annotations.
+When running this code, the second print statement should use the annotation's localName but it instead uses the class name.
+@JacksonXmlRootElement(localName = "myname")
+public class XMLTest {
+
+    public static void main(String[] s) throws Exception {
+
+        final ObjectMapper xmlMapper = new XmlMapper();
+        final ObjectMapper noAnnotationsXmlMapper = xmlMapper.copy()
+                .configure(MapperFeature.USE_ANNOTATIONS, false)
+                .configure(SerializationFeature.FAIL_ON_EMPTY_BEANS, false);
+
+        System.out.println(noAnnotationsXmlMapper.writeValueAsString(new XMLTest()));
+        System.out.println(xmlMapper.writeValueAsString(new XMLTest()));
+
+    }
+
+}
+
+Output:
+<XMLTest/>
+<XMLTest/>
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/dataformat/xml/ser/XmlSerializerProvider.java):
+```java
+protected XmlSerializerProvider(XmlSerializerProvider src) {
+    super(src);
+    // 21-May-2018, tatu: As per [dataformat-xml#282], should NOT really copy
+    //    root name lookup as that may link back to diff version, configuration
+    _rootNameLookup = src._rootNameLookup;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+The issue seems to be related to how `XmlSerializerProvider` handles the copying of its parent object, especially when dealing with multiple `ObjectMapper` instances configured differently. Specifically, the `_rootNameLookup` field is being copied directly from the source provider, which might not account for differing configurations such as whether annotations are used or not.
+
+To address this problem, we need to make sure that the `_rootNameLookup` is either reinitialized or properly reset based on the current configuration of the `XmlSerializerProvider`. This would prevent the cached value from interfering with the correct behavior of the `ObjectMapper` instances that have different settings regarding annotations.
+
+Here's a possible fix:
+
+Instead of directly copying the `_rootNameLookup`, we should create a new instance of it or set it to null so that it will be recalculated based on the current configuration when needed. Here’s how the corrected constructor could look:
+
+```java
+protected XmlSerializerProvider(XmlSerializerProvider src) {
+    super(src);
+    // 21-May-2018, taru: As per [dataformat-xml#282], should NOT really copy
+    //    root name lookup as that may link back to diff version, configuration
+    _rootNameLookup = null; // Or new RootNameLookup() depending on implementation
+}
+```
+
+By setting `_rootNameLookup` to `null`, the next time it's accessed, it will be reconstructed according to the current state of the `XmlSerializerProvider`, taking into account any changes in configuration like the disablement of annotations.
+
+In your test case, after applying this change, the second call to `writeValueAsString` using the `xmlMapper` (which includes annotations) should now correctly reflect the `localName` specified in the `@JacksonXmlRootElement` annotation, rather than defaulting to the class name.
+
+It's important to ensure that the `RootNameLookup` mechanism within Jackson's XML module is designed to respect the current mapper configuration at the time of serialization. If necessary, further modifications might be required to how the root name is determined based on the active features, particularly `USE_ANNOTATIONS`.
+
+For more details about the internal workings of `XmlSerializerProvider` and related classes, reviewing the Jackson source code or documentation on XML serialization would provide deeper insight.
+</think>
+
+The issue described involves a bug in the `XmlSerializerProvider` class within the Jackson XML module, where the `_rootNameLookup` is improperly shared between different `ObjectMapper` instances, leading to inconsistent behavior when annotations are disabled. The key is to ensure that each `XmlSerializerProvider` instance correctly reflects its own configuration, especially when annotations are involved.
+
+### Problem Summary
+The original code:
+```java
+protected XmlSerializerProvider(XmlSerializerProvider src) {
+    super(src);
+    _rootNameLookup = src._rootNameLookup;
+}
+```
+copies the `_rootNameLookup` directly from the source, which leads to interference between different configurations. When annotations are disabled, the `@JacksonXmlRootElement` annotation should not affect the serialized output, yet the result still reflects the annotation due to improper handling of the root name.
+
+---
+
+### Solution
+
+To resolve this, we must **reset** the `_rootNameLookup` instead of sharing it between providers. This allows the `XmlSerializerProvider` to construct a fresh lookup based on its current configuration. This ensures correctness when both annotated and non-annotated serializers are used side-by-side.
+
+#### Corrected Code
+```java
+protected XmlSerializerProvider(XmlSerializerProvider src) {
+    super(src);
+    // Reset rootNameLookup to ensure it respects current configuration (annotations, etc.)
+    _rootNameLookup = null; // Or initialize appropriately based on implementation
+}
+```
+
+---
+
+### Explanation
+
+- **Resetting `_rootNameLookup`**: By explicitly setting `_rootNameLookup = null`, the subsequent access to this property during serialization will recreate it dynamically based on the current settings of the `ObjectMapper`, including whether annotations are enabled.
+  
+- **Avoiding Shared State**: Ensuring that each `XmlSerializerProvider` maintains its own independent root name lookup guarantees consistent and predictable behavior across all mappers, even those with conflicting configurations.
+
+---
+
+### Result
+
+After implementing the above fix, your test code should produce the following expected output:
+
+```text
+<myname/>
+<myname/>
+```
+
+This confirms that the `@JacksonXmlRootElement(localName = "myname")` annotation is properly respected by the `xmlMapper` while the other mapper, which disables annotations, correctly omits the annotation and defaults to the class name, if applicable. 
+
+If you're encountering issues with the default class name, double-check that you're calling `.setClassTag()` on your `ObjectMapper` or ensure your JAXB annotations are applied correctly.
+
+---
+
+### Additional Considerations
+
+- **Upgrade Recommendation**: While this fix addresses the specific issue, consider upgrading to a newer version of Jackson (e.g., 2.15+), as many such bugs have been resolved in later releases

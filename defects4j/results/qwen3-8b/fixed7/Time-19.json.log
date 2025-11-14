@@ -1,0 +1,149 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# #124 Inconsistent interpretation of ambiguous time during DST
+The inconsistency appears for timezone Europe/London.
+Consider the following code
+…
+DateTime britishDate = new DateTime(2011, 10, 30, 1, 59, 0, 0, DateTimeZone.forID("Europe/London"));
+DateTime norwDate = new DateTime(2011, 10, 30, 2, 59, 0, 0, DateTimeZone.forID("Europe/Oslo"));
+DateTime finnishDate = new DateTime(2011, 10, 30, 3, 59, 0, 0, DateTimeZone.forID("Europe/Helsinki"));
+    System.out.println(britishDate);
+    System.out.println(norwDate);
+    System.out.println(finnishDate);
+
+…
+These three DateTime objects should all represent the same moment in time even if they are ambiguous. And using jodatime 1.6.2 this is the case. The code produces the following output:
+2011-10-30T01:59:00.000Z
+2011-10-30T02:59:00.000+01:00
+2011-10-30T03:59:00.000+02:00
+Using jodatime 2.0 however, the output is:
+2011-10-30T01:59:00.000Z
+2011-10-30T02:59:00.000+02:00
+2011-10-30T03:59:00.000+03:00
+which IMO is wrong for Europe/London. Correct output should have been 
+2011-10-30T01:59:00.000+01:00
+The release notes for 2.0 states that: 
+"Now, it always returns the earlier instant (summer time) during an overlap. …"
+This is an incorrect Java code (src/main/java/org/joda/time/DateTimeZone.java):
+```java
+public int getOffsetFromLocal(long instantLocal) {
+    // get the offset at instantLocal (first estimate)
+    final int offsetLocal = getOffset(instantLocal);
+    // adjust instantLocal using the estimate and recalc the offset
+    final long instantAdjusted = instantLocal - offsetLocal;
+    final int offsetAdjusted = getOffset(instantAdjusted);
+    // if the offsets differ, we must be near a DST boundary
+    if (offsetLocal != offsetAdjusted) {
+        // we need to ensure that time is always after the DST gap
+        // this happens naturally for positive offsets, but not for negative
+        if ((offsetLocal - offsetAdjusted) < 0) {
+            // if we just return offsetAdjusted then the time is pushed
+            // back before the transition, whereas it should be
+            // on or after the transition
+            long nextLocal = nextTransition(instantAdjusted);
+            long nextAdjusted = nextTransition(instantLocal - offsetAdjusted);
+            if (nextLocal != nextAdjusted) {
+                return offsetLocal;
+            }
+        }
+    } else if (offsetLocal > 0) {
+        long prev = previousTransition(instantAdjusted);
+        if (prev < instantAdjusted) {
+            int offsetPrev = getOffset(prev);
+            int diff = offsetPrev - offsetLocal;
+            if (instantAdjusted - prev <= diff) {
+                return offsetPrev;
+            }
+        }
+    }
+    return offsetAdjusted;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public int getOffsetFromLocal(long instantLocal) {
+    // get the offset at instantLocal (first estimate)
+    final int offsetLocal = getOffset(instantLocal);
+    // adjust instantLocal using the estimate and recalc the offset
+    final long instantAdjusted = instantLocal - offsetLocal;
+    final int offsetAdjusted = getOffset(instantAdjusted);
+    // if the offsets differ, we need to handle DST boundaries
+    if (offsetLocal != offsetAdjusted) {
+        // Check if we're in a DST gap (transition from summer to winter time)
+        if ((offsetLocal - offsetAdjusted) < 0) {
+            // This suggests a potential DST gap, so check if the transition points align
+            long nextLocal = nextTransition(instantAdjusted); // Next transition using the estimated local time
+            long nextAdjusted = nextTransition(instantLocal - offsetAdjusted); // Next transition using adjusted time
+            
+            // If transitions do not match, choose the original offset (summer time)
+            if (nextLocal != nextAdjusted) {
+                return offsetLocal; // Return the original offset which represents the summer time
+            }
+        } else {
+            // Handle overlapping time zone cases where two offsets exist for the same local time
+            // This block checks for overlapping times when both offsetLocal and offsetAdjusted are valid
+            // For example, when transitioning from winter to summer time
+            long prevLocal = previousTransition(instantAdjusted); // Previous transition point using adjusted time
+            long prevAdjusted = previousTransition(instantLocal - offsetAdjusted); // Previous transition using the original local time
+            
+            // If there's a discrepancy between the transition points, prefer the adjusted offset
+            if (prevLocal != prevAdjusted) {
+                return offsetAdjusted; // Use the adjusted offset which might represent the winter time
+            }
+        }
+    } else if (offsetLocal > 0) {
+        // When no DST change is detected, check for possible transitions around the current time
+        long prev = previousTransition(instantAdjusted);
+        if (prev < instantAdjusted) {
+            int offsetPrev = getOffset(prev);
+            int diff = offsetPrev - offsetLocal;
+            if (instantAdjusted - prev <= diff) {
+                return offsetPrev; // Prefer the previous transition's offset if relevant
+            }
+        }
+    }
+    return offsetAdjusted;
+}
+```
+
+The key fix is handling the DST overlaps correctly by checking for discrepancies in the transition points and choosing the appropriate offset based on whether it's a gap or overlap.
+
+**Explanation of Changes:**
+
+1. **Handling DST Gaps:**  
+   The code now properly distinguishes between DST gaps (when clocks go back) and overlaps (when clocks stay the same). It ensures that when a gap occurs, the `offsetLocal` (summer time) is returned because the transition has already happened, and the time is "pushed back." When an overlap occurs, the `offsetAdjusted` (winter time) is returned to avoid ambiguous times.
+
+2. **Correct Transition Logic:**  
+   By comparing `nextLocal` and `nextAdjusted`, the method determines whether the transitions align. If they don't, it indicates a DST boundary and selects the appropriate offset accordingly.
+
+3. **Ensuring Consistent Offset Selection:**  
+   For overlaps, comparing `prevLocal` and `prevAdjusted` ensures the correct offset is chosen. If these values differ, it implies an overlap, and the `offsetAdjusted` (winter time) is selected.
+
+These changes align with the behavior described in the release notes, ensuring that during ambiguities like DST overlaps, the earlier (summer) time is preferred as stated in Joda-Time 2.0.
+</think>
+
+To address the issue of inconsistent interpretation of ambiguous time during Daylight Saving Time (DST) in the `getOffsetFromLocal()` method within Joda-Time's `DateTimeZone` class, we need to focus on how it handles overlapping and gap transitions in time zones like **Europe/London**, where the clock goes backward (gap) or stays the same (overlap).
+
+---
+
+### 🔍 Problem Summary
+
+In the scenario you've outlined:
+
+- Three `DateTime` objects (`britishDate`, `norwDate`, `finnishDate`) are constructed using different time zones (`Europe/London`, `Europe/Oslo`, `Europe/Helsinki`) at specific local times.
+- All three should represent the same *moment in time*.
+- However, in Joda-Time **version 2.0**, the method of selecting the correct offset caused `Europe/London` to return an incorrect UTC offset (e.g., +01:00 instead of +00:00), leading to inconsistent interpretations.
+
+---
+
+### 📌 Key Concepts
+
+| Scenario              | Description                                                                 |
+|----------------------|-----------------------------------------------------------------------------|
+| **DST Gap**          | Clocks go **back**, creating a time interval that does not exist.         |
+| **DST Overlap**      | Clocks stay the same, causing a time period

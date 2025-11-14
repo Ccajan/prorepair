@@ -1,0 +1,189 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Resetting the default namespace causes a serious endless loop when requesting .asPath() on a node.
+sample smaller case:
+
+<...>
+ <b:foo xmlns:b="bla" xmlns="test111">    <!--  No nodes are placed in the tree within ns "test111" but the attribute is still there.-->
+  <b:bar>a</b:bar>                         <!-- is in ns 'bla' -->
+  <test xmlns=""></test>                   <!-- does not have a namespace -->
+ </b:foo>
+</...>
+
+when requesting .asPath() on the 'test' node, it loops in org.apache.commons.jxpath.ri.NamespaceResolver.getPrefix(NodePointer, String), 
+and if it didn't loop it would create a wrong xpath '//b:fo/null:test' DOMNodePointer.asPath().
+So I think that the fix should be in org.apache.commons.jxpath.ri.model.dom.DOMNodePointer.asPath()
+
+....
+                    String ln = DOMNodePointer.getLocalName(node);
+                    String nsURI = getNamespaceURI();
+                    if (nsURI == null) {
+                        buffer.append(ln);
+                        buffer.append('[');
+                        buffer.append(getRelativePositionByName()).append(']');
+                    }
+                    else {
+                        String prefix = getNamespaceResolver().getPrefix(nsURI);
+                        if (prefix != null) {
+...
+
+should become
+
+...
+                    String ln = DOMNodePointer.getLocalName(node);
+                    String nsURI = getNamespaceURI();
+                    if (nsURI == null || nsURI.length() == 0) { // check for empty string which means that the node doesn't have a namespace.
+                        buffer.append(ln);
+                        buffer.append('[');
+                        buffer.append(getRelativePositionByName()).append(']');
+                    }
+                    else {
+                        String prefix = getNamespaceResolver().getPrefix(nsURI);
+                        if (prefix != null) {
+...
+This is an incorrect Java code (src/java/org/apache/commons/jxpath/ri/model/dom/DOMNodePointer.java):
+```java
+public static String getNamespaceURI(Node node) {
+    if (node instanceof Document) {
+        node = ((Document) node).getDocumentElement();
+    }
+
+    Element element = (Element) node;
+
+    String uri = element.getNamespaceURI();
+    if (uri == null) {
+        String prefix = getPrefix(node);
+        String qname = prefix == null ? "xmlns" : "xmlns:" + prefix;
+
+        Node aNode = node;
+        while (aNode != null) {
+            if (aNode.getNodeType() == Node.ELEMENT_NODE) {
+                Attr attr = ((Element) aNode).getAttributeNode(qname);
+                if (attr != null) {
+                    return attr.getValue();
+                }
+            }
+            aNode = aNode.getParentNode();
+        }
+        return null;
+    }
+    return uri;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public static String getNamespaceURI(Node node) {
+    if (node instanceof Document) {
+        node = ((Document) node).getDocumentElement();
+    }
+
+    if (node.getNodeType() != Node.ELEMENT_NODE) {
+        return null; // Or handle as per your requirement
+    }
+
+    Element element = (Element) node;
+
+    String uri = element.getNamespaceURI();
+    if (uri == null) {
+        String prefix = getPrefix(node);
+        String qname = prefix == null ? "xmlns" : "xmlns:" + prefix;
+
+        Node aNode = node;
+        while (aNode != null) {
+            if (aNode.getNodeType() == Node.ELEMENT_NODE) {
+                Attr attr = ((Element) aNode).getAttributeNode(qname);
+                if (attr != null) {
+                    return attr.getValue();
+                }
+            }
+            aNode = aNode.getParentNode();
+        }
+        return null;
+    }
+    return uri;
+}
+```
+
+The original issue might be that the method didn't properly check if the node was an element before trying to cast it. I've added a check to ensure we only proceed with elements.
+
+But wait, the main problem in the initial code might be the way namespaces are being handled, particularly with the default namespace declaration. The infinite loop issue seems to stem from the interaction between the default namespace and how the `NamespaceResolver` tries to find a prefix for a URI. 
+
+In the scenario described, the root element has a default namespace set (`xmlns="test111"`), but no actual elements are in that namespace. When attempting to generate the XPath path for a node without a namespace, the resolver might keep looking for prefixes associated with the default namespace, leading to an infinite loop.
+
+The key change needed isn't necessarily in the `getNamespaceURI()` method itself but rather in how the `DOMNodePointer.asPath()` method handles the namespace URI. Specifically, it needs to recognize when the namespace URI is an empty string or when the namespace is not actually defined, thereby avoiding the lookup that leads to the loop.
+
+Let me revise the solution focusing more on the correct handling of the namespace in the `asPath()` method:
+</think>
+
+To resolve the **infinite loop** caused by calling `.asPath()` on a node that resides in a namespace where **the default namespace is declared but not used**, the core issue lies in the **interaction between the `NamespaceResolver`, the `DOMXPathContext`, and the logic in `DOMNodePointer.asPath()`**.
+
+### Root Cause
+
+- A **default namespace** is declared at the root level (`xmlns="test111"`) but **no elements** in that namespace exist.
+- There’s also a non-namespaced node (`<test xmlns="">`) inside the document.
+- When `.asPath()` is called on this node, `DOMNodePointer.getNamespaceURI()` returns `"test111"` due to the inherited default namespace.
+- The resolver then attempts to map `"test111"` to a prefix using `getNamespaceResolver().getPrefix("test111")`.
+- However, because the actual use of `"test111"` is invalid (no nodes are under that namespace), `getPrefix(...)` may fail repeatedly, creating an infinite loop during resolution.
+
+---
+
+### Fix Strategy
+
+We need to modify **how `DOMNodePointer.asPath()` handles namespace URIs** so that:
+1. It detects **empty or undefined** namespace strings correctly.
+2. It avoids attempting to map such cases back to prefixes, which can lead to infinite loops.
+
+Instead of checking just `nsURI == null`, we must also detect **empty namespace strings (`""`)**.
+
+---
+
+### Solution: Fix `DOMNodePointer.asPath()`
+
+Here's the corrected implementation of `DOMNodePointer.asPath()`:
+
+```java
+@Override
+public String asPath(String expression) {
+    StringBuffer buffer = new StringBuffer();
+
+    int pos = 0;
+    char[] chars = expression.toCharArray();
+    int length = chars.length;
+
+    while (pos < length) {
+        char c = chars[pos++];
+        if (c == '/') {
+            buffer.append('/');
+        } else if (c == '[') {
+            int endBracket = expression.indexOf(']', pos);
+            if (endBracket > -1) {
+                buffer.append(expression.substring(pos, endBracket));
+                pos = endBracket + 1;
+            } else {
+                buffer.append(c);
+            }
+        } else {
+            buffer.append(c);
+        }
+    }
+
+    return buffer.toString();
+}
+
+// Now, focus on `asPath()` method directly affected by the namespace
+protected void appendLocalNameWithNs(StringBuffer buffer) {
+    String ln = getLocalName(node);
+    String nsURI = getNamespaceURI();
+    
+    if (nsURI == null || nsURI.isEmpty()) {
+        buffer.append(ln);
+        buffer.append('[');
+        buffer.append(getRelativePositionByName());
+        buffer.append(']');
+    } else {
+        String prefix = getNamespaceResolver().getPrefix

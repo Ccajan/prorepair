@@ -1,0 +1,202 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# StringEscapeUtils.escapeXML() can't process UTF-16 supplementary characters
+Supplementary characters in UTF-16 are those whose code points are above 0xffff, that is, require more than 1 Java char to be encoded, as explained here: http://java.sun.com/developer/technicalArticles/Intl/Supplementary/
+Currently, StringEscapeUtils.escapeXML() isn't aware of this coding scheme and treats each char as one character, which is not always right.
+A possible solution in class Entities would be:
+    public void escape(Writer writer, String str) throws IOException {
+        int len = str.length();
+        for (int i = 0; i < len; i++) {
+            int code = str.codePointAt;
+            String entityName = this.entityName(code);
+            if (entityName != null) 
+{
+                writer.write('&');
+                writer.write(entityName);
+                writer.write(';');
+            }
+ else if (code > 0x7F) 
+{
+                    writer.write("&#");
+                    writer.write(code);
+                    writer.write(';');
+            }
+ else 
+{
+                    writer.write((char) code);
+            }
+
+            if (code > 0xffff) 
+{
+                    i++;
+            }
+        }
+    }
+Besides fixing escapeXML(), this will also affect HTML escaping functions. I guess that's a good thing, but please remember I have only tested escapeXML().
+This is an incorrect Java code (src/main/java/org/apache/commons/lang3/text/translate/NumericEntityUnescaper.java):
+```java
+public int translate(CharSequence input, int index, Writer out) throws IOException {
+    // TODO: Protect from ArrayIndexOutOfBounds
+    if(input.charAt(index) == '&' && input.charAt(index + 1) == '#') {
+        int start = index + 2;
+        boolean isHex = false;
+
+        char firstChar = input.charAt(start);
+        if(firstChar == 'x' || firstChar == 'X') {
+            start++;
+            isHex = true;
+        }
+
+        int end = start;
+        while(input.charAt(end) != ';') {
+            end++;
+        }
+
+        int entityValue;
+        try {
+            if(isHex) {
+                entityValue = Integer.parseInt(input.subSequence(start, end).toString(), 16);
+            } else {
+                entityValue = Integer.parseInt(input.subSequence(start, end).toString(), 10);
+            }
+        } catch(NumberFormatException nfe) {
+            return 0;
+        }
+
+            out.write(entityValue);
+        return 2 + (end - start) + (isHex ? 1 : 0) + 1;
+    }
+    return 0;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+package org.apache.commons.lang3.text.translate;
+
+import java.io.IOException;
+import java.util.Map;
+
+import org.apache.commons.codec.net.URLCodec;
+import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang.Validate;
+
+/**
+ * Translates numeric entities (decimal &amp; hexadecimal) into their corresponding character and writes them to a {@link Writer}.
+ *
+ */
+public final class NumericEntityUnescaper extends CharSequenceTranslator {
+
+    private static final String HEX_PREFIX = "x";
+    private static final String DECIMAL_PREFIX = "#";
+    
+    private URLCodec urlCodec = new URLCodec();
+
+    @Override
+    protected int[] table() {
+        return TranslateUtil.NUMERIC_ENTITY_TRANSLATION_TABLE;
+    }
+   
+   /**
+     * Unescape sequence
+     *
+     * @param input source string
+     * @return result after unescaping
+     */
+    public String unescape(String input){
+        if (input == null) {
+            return null;
+        }
+        
+        StringBuffer sb = new StringBuffer();
+        
+        for(int i=0;i<input.length();i++){
+            char c = input.charAt(i);            
+            if(c == '&'){
+               c = input.charAt(i+1);            
+               if(c == '#'){
+                  i += 2;
+                  
+                  boolean isHex = false;
+                  c = input.charAt(i);
+                  if(c == 'x' || c=='X'){
+                     isHex=true;
+                     i++;
+                  }
+                  
+                 StringBuffer numStr = new StringBuffer();
+                  while(input.charAt(i)!=';'&&i<input.length()){
+                   numStr.append(input.charAt(i));
+                   i++;
+                 }
+                  i++;         
+                 
+               try {
+                  int decNum = StringUtils.isNumeric(numStr.toString())?Integer.parseInt(numStr.toString()):Integer.decode(numStr.toString());
+                  String originalText = Character.toString((char)decNum);
+                   
+                    Map<String,String> escapedCharsMap = urlCodec.getEscapedCharacters();
+                    for(Map.Entry<String,String> entry:escapedCharsMap.entrySet()){
+                      originalText = originalText.replace(entry.getValue(),entry.getKey());
+                    }
+               
+                   sb.append(originalText);
+               }catch(Exception e){
+                 sb.append(c);  
+               }
+                
+             }else{
+              sb.append(c);     
+           }
+            
+          }else{
+           sb.append(c);
+         }
+       }
+      
+      return sb.toString();
+    }
+
+
+    @Override
+    public final int translate(final CharSequence input, final int index, final Writer out)
+            throws IOException {
+        Validate.notNull(out);
+
+        int length = input.length();
+        if (length <= index) {
+            return 0;
+        }
+
+        char c = input.charAt(index);
+        if (c == '&') {
+            // Check if it is a numeric entity
+            int semicolonIndex = input.indexOf(';', index + 1);
+            if (semicolonIndex == -1 || semicolonIndex == length - 1) {
+                return 0;
+            }
+
+            String sequence = input.subSequence(index, semicolonIndex + 1).toString();
+            int entityValue;
+            try {
+                entityValue = Integer.parseInt(sequence.substring(1 + DECIMAL_PREFIX.length(), semicolonIndex), 10);
+            } catch (NumberFormatException nfe) {
+                try {
+                    entityValue = Integer.parseInt(sequence.substring(1 + HEX_PREFIX.length(), semicolonIndex), 16);
+                } catch (NumberFormatException ex) {
+                    return 0;
+                }
+            }
+
+            out.write(entityValue);
+            return semicolonIndex - index + 1;
+        }
+        return 0;
+    }
+}
+```
+

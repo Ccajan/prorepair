@@ -1,0 +1,188 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Missing type-checks for var_args notation
+What steps will reproduce the problem?
+1. Compile this:
+//-------------------------------------
+// ==ClosureCompiler==
+// @compilation_level SIMPLE_OPTIMIZATIONS
+// @warning_level VERBOSE
+// @output_file_name default.js
+// @formatting pretty_print
+// ==/ClosureCompiler==
+
+/**
+* @param {...string} var_args
+*/
+function foo(var_args) {
+    return arguments.length;
+}
+
+foo('hello'); // no warning - ok
+foo(123); // warning - ok
+foo('hello', 123); // no warning! error.
+//-------------------------------------
+
+What is the expected output? What do you see instead?
+Should get a type-mismatch warning for the second parameter in the third foo() call.
+
+What version of the product are you using? On what operating system?
+Both online compiler and the 20100616 release.
+
+Please provide any additional information below.
+Seems like the type-checker treats 'var_args' as a single param and thus fails to type check the subsequent parameters.
+
+// Fredrik
+This is an incorrect Java code (src/com/google/javascript/jscomp/TypeCheck.java):
+```java
+private void visitParameterList(NodeTraversal t, Node call,
+    FunctionType functionType) {
+  Iterator<Node> arguments = call.children().iterator();
+  arguments.next(); // skip the function name
+
+  Iterator<Node> parameters = functionType.getParameters().iterator();
+  int ordinal = 0;
+  Node parameter = null;
+  Node argument = null;
+  while (arguments.hasNext() &&
+         parameters.hasNext()) {
+    // If there are no parameters left in the list, then the while loop
+    // above implies that this must be a var_args function.
+      parameter = parameters.next();
+    argument = arguments.next();
+    ordinal++;
+
+    validator.expectArgumentMatchesParameter(t, argument,
+        getJSType(argument), getJSType(parameter), call, ordinal);
+  }
+
+  int numArgs = call.getChildCount() - 1;
+  int minArgs = functionType.getMinArguments();
+  int maxArgs = functionType.getMaxArguments();
+  if (minArgs > numArgs || maxArgs < numArgs) {
+    report(t, call, WRONG_ARGUMENT_COUNT,
+            validator.getReadableJSTypeName(call.getFirstChild(), false),
+            String.valueOf(numArgs), String.valueOf(minArgs),
+            maxArgs != Integer.MAX_VALUE ?
+            " and no more than " + maxArgs + " argument(s)" : "");
+  }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+I'll analyze the issue and propose a fix for the Closure Compiler's type checking logic related to var_args.
+
+The core problem is that when a function has a var_args parameter (like the function foo in the example), the current implementation incorrectly assumes all subsequent arguments are part of the var_args parameter, leading to missed type checks on those arguments.
+
+Let me break down the key issues and provide a solution:
+
+1. **Misunderstanding of var_args**: The current code doesn't properly differentiate between regular parameters and the var_args parameter. It should treat the var_args parameter as a special case where it can accept multiple arguments, but still needs to validate each individual argument against its own type.
+
+2. **Loop logic flaw**: The existing loop processes parameters and arguments in pairs, which works for functions with fixed parameters but fails when a var_args parameter is present.
+
+Here's my proposed fix:
+
+```java
+private void visitParameterList(NodeTraversal t, Node call,
+    FunctionType functionType) {
+  Iterator<Node> arguments = call.children().iterator();
+  arguments.next(); // skip the function name
+
+  List<Node> parameters = new ArrayList<>(functionType.getParameters());
+  int ordinal = 0;
+  Node parameter = null;
+  Node argument = null;
+  
+  // First pass: match regular parameters with their corresponding arguments
+  while (arguments.hasNext() && !parameters.isEmpty()) {
+    parameter = parameters.remove(0);
+    argument = arguments.next();
+    
+    // Check if this parameter is a var_args parameter
+    if (isVarArgsParameter(parameter)) {
+      // Special handling for var_args parameters
+      handleVarArgsParameter(t, call, parameter, argument, ordinal++);
+      break; // After handling var_args, we don't need to process other parameters
+    } else {
+      // Regular parameter matching
+      validator.expectArgumentMatchesParameter(t, argument,
+          getJSType(argument), getJSType(parameter), call, ordinal++);
+    }
+  }
+  
+  // Second pass: handle remaining arguments after the var_args parameter
+  while (arguments.hasNext()) {
+    argument = arguments.next();
+    // We assume that the last parameter was a var_args parameter, so these are
+    // considered part of the var_args
+    validator.expectArgumentMatchesParameter(t, argument,
+        getJSType(argument), getJSType(parameters.get(parameters.size() - 1)),
+        call, ordinal++);
+  }
+  
+  int numArgs = call.getChildCount() - 1;
+  int minArgs = functionType.getMinArguments();
+  int maxArgs = functionType.getMaxArguments();
+  if (minArgs > numArgs || maxArgs < numArgs) {
+    report(t, call, WRONG_ARGUMENT_COUNT,
+            validator.getReadableJSTypeName(call.getFirstChild(), false),
+            String.valueOf(numArgs), String.valueOf(minArgs),
+            maxArgs != Integer.MAX_VALUE ?
+            " and no more than " + maxArgs + " argument(s)" : "");
+  }
+}
+
+/**
+ * Check if a parameter is a var_args parameter.
+ */
+private boolean isVarArgsParameter(Node parameter) {
+  // This would depend on how var_args parameters are represented in the AST
+  // For example, looking for a specific annotation or property
+  return parameter.hasAnnotation("varargs");
+}
+
+/**
+ * Handle validation for var_args parameters.
+ */
+private void handleVarArgsParameter(NodeTraversal t, Node call,
+    Node parameter, Node argument, int ordinal) {
+  // Get the type of the var_args parameter (which is an array type)
+  JSType varArgsType = getJSType(parameter);
+  
+  // Check if the argument is an array type
+  if (!varArgsType.isArray() || 
+      !varArgsType.getComponentType().isSubtypeOf(getJSType(argument))) {
+    report(t, argument, TYPE_MISMATCH,
+           "Expected var_args parameter to be of type " + varArgsType +
+           ", but got " + getJSType(argument));
+  }
+}
+```
+
+Key improvements in this solution:
+
+1. **Two-pass processing**:
+   - First pass handles regular parameters and identifies the var_args parameter
+   - Second pass handles all remaining arguments as part of the var_args parameter
+
+2. **Special handling for var_args**:
+   - Checks if each argument passed to the var_args parameter matches its element type
+   - Ensures proper type validation for the array-like nature of var_args parameters
+
+3. **Improved parameter matching**:
+   - Correctly distinguishes between regular parameters and var_args
+   - Provides appropriate type checking for both cases
+
+4. **Clear separation of concerns**:
+   - Dedicated methods for checking var_args parameters
+   - Clear logic for determining if a parameter is a var_args
+
+To implement this correctly, you'd also need to ensure that:
+- The AST correctly represents var_args parameters (with appropriate annotations or properties)
+- The JSType system properly supports array types and component type checking
+- The type checking system can distinguish between object types and array

@@ -1,0 +1,222 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# anonymous object type inference behavior is different when calling constructors
+The following compiles fine with:
+java -jar build/compiler.jar --compilation_level=ADVANCED_OPTIMIZATIONS --jscomp_error=accessControls --jscomp_error=checkTypes --jscomp_error=checkVars --js ~/Desktop/reverse.js
+
+reverse.js:
+/**
+ * @param {{prop1: string, prop2: (number|undefined)}} parry
+ */
+function callz(parry) {
+  if (parry.prop2 && parry.prop2 < 5) alert('alright!');
+  alert(parry.prop1);
+}
+
+callz({prop1: 'hi'});
+
+However, the following does not:
+/**
+ * @param {{prop1: string, prop2: (number|undefined)}} parry
+ * @constructor
+ */
+function callz(parry) {
+  if (parry.prop2 && parry.prop2 < 5) alert('alright!');
+  alert(parry.prop1);
+}
+
+new callz({prop1: 'hi'});
+
+/Users/dolapo/Desktop/reverse.js:10: ERROR - actual parameter 1 of callz does not match formal parameter
+found   : {prop1: string}
+required: {prop1: string, prop2: (number|undefined)}
+new callz({prop1: 'hi'});
+
+Thanks!
+This is an incorrect Java code (src/com/google/javascript/jscomp/TypeInference.java):
+```java
+private FlowScope traverseNew(Node n, FlowScope scope) {
+
+  Node constructor = n.getFirstChild();
+  scope = traverse(constructor, scope);
+  JSType constructorType = constructor.getJSType();
+  JSType type = null;
+  if (constructorType != null) {
+    constructorType = constructorType.restrictByNotNullOrUndefined();
+    if (constructorType.isUnknownType()) {
+      type = getNativeType(UNKNOWN_TYPE);
+    } else {
+      FunctionType ct = constructorType.toMaybeFunctionType();
+      if (ct == null && constructorType instanceof FunctionType) {
+        // If constructorType is a NoObjectType, then toMaybeFunctionType will
+        // return null. But NoObjectType implements the FunctionType
+        // interface, precisely because it can validly construct objects.
+        ct = (FunctionType) constructorType;
+      }
+      if (ct != null && ct.isConstructor()) {
+        type = ct.getInstanceType();
+      }
+    }
+  }
+  n.setJSType(type);
+  for (Node arg = constructor.getNext(); arg != null; arg = arg.getNext()) {
+    scope = traverse(arg, scope);
+  }
+  return scope;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+Certainly! The issue you're encountering stems from how TypeScript (or in this case, Closure Compiler's type inference system) infers types when dealing with **constructors** versus **functions**.
+
+---
+
+### 🔍 Understanding the Problem
+
+In your first example:
+
+```javascript
+function callz(parry) { ... }
+callz({prop1: 'hi'});
+```
+
+- `callz` is treated as a regular function.
+- The object `{prop1: 'hi'}` is passed, and since `prop2` is optional (`number | undefined`), the compiler allows this without error.
+
+But in the second example where you use the `@constructor` annotation:
+
+```javascript
+/**
+ * @param {{prop1: string, prop2: (number|undefined)}} parry
+ * @constructor
+ */
+function callz(parry) { ... }
+new callz({prop1: 'hi'});
+```
+
+- Now, `callz` is treated as a **constructor function**.
+- When you create an instance via `new callz(...)`, the Closure Compiler expects that the argument must match the **constructor's parameters exactly**, including all required properties.
+
+Thus, even though `prop2` is optional in the JSDoc, the compiler now requires both `prop1` and `prop2`.
+
+---
+
+### ✅ Correct Behavior
+
+If `prop2` is optional, you should explicitly mark it as such in the JSDoc:
+
+```javascript
+/**
+ * @param {{prop1: string, prop2?: number}} parry
+ * @constructor
+ */
+function callz(parry) { ... }
+```
+
+This tells the compiler that `prop2` is optional. Then the code should compile successfully.
+
+---
+
+### 🛠️ Repairing the Java Code
+
+Let’s analyze the problematic part of your `TypeInference.java` snippet:
+
+```java
+if (constructorType.isUnknownType()) {
+  type = getNativeType(UNKNOWN_TYPE);
+} else {
+  FunctionType ct = constructorType.toMaybeFunctionType();
+  ...
+}
+```
+
+The issue is that the current logic only checks whether the constructor type is known or unknown. It doesn't consider whether the constructor has any parameters, or what those parameters look like.
+
+#### ✅ Here’s how we can fix the logic to better handle cases involving constructor arguments:
+
+We want to:
+1. Recognize the constructor and extract its **parameter type signature**.
+2. Ensure that when the constructor is used with `new`, the actual parameters match the expected ones.
+
+So, the key parts of the fix would be:
+
+#### 🔧 Fix #1: Consider the Function Type and Parameters
+Ensure we properly retrieve the `FunctionType` and check for constructor annotations and parameter types.
+
+#### 🔧 Fix #2: Handle Missing Parameters Gracefully
+Allow for optional parameters (marked with `?`) in the function declaration so they don’t require explicit assignment in usage.
+
+Here's a **simplified** version of the corrected method:
+
+```java
+private FlowScope traverseNew(Node n, FlowScope scope) {
+  Node constructor = n.getFirstChild();
+  scope = traverse(constructor, scope);
+
+  JSType constructorType = constructor.getJSType();
+
+  // Only proceed if the constructor type is a function
+  if (constructorType instanceof FunctionType) {
+    FunctionType ct = (FunctionType) constructorType;
+
+    // Check if it's a constructor function
+    if (ct.isConstructor()) {
+      JSType returnType = ct.getInstanceType();
+
+      // Use the function type directly for parameter checking
+      n.setJSType(returnType);
+
+      // Traverse each argument
+      for (Node arg = constructor.getNext(); arg != null; arg = arg.getNext()) {
+        scope = traverse(arg, scope);
+      }
+
+      return scope;
+    }
+  }
+
+  // Default fallback: if no clear type could be determined,
+  // assign some generic type
+  n.setJSType(getNativeType(UNKNOWN_TYPE));
+  return scope;
+}
+```
+
+> This assumes that you already have proper parsing of JSDoc annotations and function signatures.
+
+---
+
+### 🚀 Summary
+
+To summarize:
+
+| Issue | Solution |
+|-------|----------|
+| Constructor uses invalid parameter types | Add `?` to optional parameters |
+| Type inference fails in constructor context | Enhance logic to respect optional parameters |
+| Incorrect handling in Java type inference | Fix to recognize function types, optional params, and constructor semantics |
+
+---
+
+### ✅ Final Recommendation
+
+Update your JSDoc annotations:
+
+```javascript
+/**
+ * @param {{prop1: string, prop2?: number}} parry
+ * @constructor
+ */
+function callz(parry) { ... }
+```
+
+And ensure your Closure Compiler or TypeScript setup understands optional parameters correctly.
+
+If you’d like me to provide a full refactored version of the `traverseNew()` method with detailed comments, I'd be happy to help!

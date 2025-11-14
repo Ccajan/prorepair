@@ -1,0 +1,162 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Jackson not continue to parse after DeserializationFeature.FAIL_ON_INVALID_SUBTYPE error
+After FAIL_ON_INVALID_SUBTYPE error, jackson should continue to parse, but seems jackson doesn't.
+The output:
+CallRecord [version=0.0, application=123, ] // doesn't read item2 which is valid
+CallRecord [version=0.0, application=123, ]
+CallRecord [version=0.0, ] // doesn't read application after invalid item.
+
+@JsonInclude(Include.NON_NULL)
+public class CallRecord {
+    public float version;
+    public String application;
+    public Item item;
+    public Item item2;
+    public CallRecord() {}
+
+    public static void main(final String[] args) throws IOException {
+        final ObjectMapper objectMapper = new ObjectMapper().disable(DeserializationFeature.FAIL_ON_INVALID_SUBTYPE,
+                DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, DeserializationFeature.FAIL_ON_IGNORED_PROPERTIES);
+        final CallRecord call = new CallRecord();
+
+        final Event event = new Event();
+        event.location = "location1";
+        call.item = event;
+        call.item2 = event;
+        call.application = "123";
+        // System.out.println(objectMapper.writeValueAsString(call));
+        String json =
+                "{\"version\":0.0,\"application\":\"123\",\"item\":{\"type\":\"xevent\",\"location\":\"location1\"},\"item2\":{\"type\":\"event\",\"location\":\"location1\"}}";
+        // can't read item2 - which is valid
+        System.out.println(objectMapper.readValue(json, CallRecord.class));
+
+        json = "{\"version\":0.0,\"application\":\"123\"},{\"item\":{\"type\":\"xevent\",\"location\":\"location1\"}";
+        System.out.println(objectMapper.readValue(json, CallRecord.class));
+
+        json = "{\"item\":{\"type\":\"xevent\",\"location\":\"location1\"}, \"version\":0.0,\"application\":\"123\"}";
+        // order matters: move item to the fornt, now it can't read application property
+        System.out.println(objectMapper.readValue(json, CallRecord.class));
+    }
+    @Override
+    public String toString() {
+        final StringBuilder builder = new StringBuilder();
+        builder.append("CallRecord [version=").append(version).append(", ");
+        if (application != null) {
+            builder.append("application=").append(application).append(", ");
+        }
+        if (item != null) {
+            builder.append("item=").append(item);
+        }
+        builder.append("]");
+        return builder.toString();
+    }
+}
+
+@JsonTypeInfo(use = JsonTypeInfo.Id.NAME, include = JsonTypeInfo.As.PROPERTY, property = "type", visible = true)
+@JsonSubTypes({@Type(value = Event.class, name = Event.TYPE)})
+public interface Item {
+}
+
+public final class Event implements Item {
+    public String location;
+    public static final String TYPE = "event";
+    public Event() {}
+}
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/deser/std/NullifyingDeserializer.java):
+```java
+public Object deserialize(JsonParser p, DeserializationContext ctxt) throws IOException
+{
+    // 29-Jan-2016, tatu: Simple skipping for all other tokens, but FIELD_NAME bit
+    //    special unfortunately
+        p.skipChildren();
+    return null;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+// 548173d8-09df-4cb9-ba8e-d3abf6c57c4d
+public Object deserialize(JsonParser p, DeserializationContext ctxt) throws IOException
+{
+    // 29-Jan-2016, tatu: Simple skipping for all other tokens, but FIELD_NAME bit
+    //    special unfortunately
+    switch (p.getCurrentTokenId()) {
+    case JsonTokenIds.START_OBJECT:
+    case JsonTokenIds.VALUE_NULL:
+    case JsonTokenIds.VALUE_NUMBER_FLOAT:
+    case JsonTokenIds.VALUE_STRING:
+    case JsonTokenIds.VALUE_TRUE:
+    case JsonTokenIds.VALUE_FALSE:
+        break; // no children, skip them
+    default:
+        p.skipChildren();
+    }
+    return null;
+}
+```
+
+Okay, let me try to figure out what's going on here. The user mentioned that when using Jackson with the `FAIL_ON_INVALID_SUBTYPE` feature disabled, the parser isn't continuing to process the JSON after encountering an error. They provided some example code and a specific part of the deserializer that they think is incorrect.
+
+First, I need to understand the problem scenario. In their test cases, the JSON has multiple fields, some of which might be invalid subtypes. When Jackson encounters an invalid subtype during deserialization, it normally throws an exception unless `FAIL_ON_INVALID_SUBTYPE` is disabled. But in this case, even though that feature is disabled, the parsing stops, which is unexpected.
+
+Looking at their code, there's an `Item` interface with a `JsonTypeInfo` annotation, and a concrete class `Event` that implements `Item`. There's also another class `xevent` which isn't shown, but perhaps that's causing the issue. The user's main issue is that when one of the items is invalid (like `xevent` instead of `event`), the rest of the JSON isn't being parsed correctly.
+
+In the provided `NullifyingDeserializer`, the current implementation skips children if the token is not a start object, number, etc. However, maybe this approach isn't handling cases where the JSON structure is different, like when an invalid subtype is present, leading to premature termination.
+
+The key point here is that when deserializing a field that's supposed to be a type that doesn't match, Jackson should ideally handle it gracefully without stopping the entire parsing process. The existing code might be incorrectly assuming that certain tokens don't have children, thus skipping them, which could cause the parser to exit early if it hits those tokens.
+
+The solution proposed involves modifying the `deserialize` method to check the current token ID more carefully. By using a switch statement that covers various token types, the code ensures that only when the token is something like START_OBJECT does it skip children. For other tokens, it just breaks out of the switch, allowing the parser to continue processing the rest of the JSON. This would prevent the parser from prematurely exiting when an invalid subtype is encountered, thereby allowing the remaining fields to be processed as expected.
+
+I should verify that this change allows Jackson to correctly skip over invalid subtypes without stopping the parsing of subsequent fields. Testing with the provided examples would help confirm whether the modified deserializer resolves the issue by ensuring that each token is handled appropriately, allowing the deserialization to proceed even if some parts are invalid.
+</think>
+
+To resolve the issue where **Jackson halts parsing** after encountering an invalid subtype despite disabling `FAIL_ON_INVALID_SUBTYPE`, we need to fix the custom deserializer logic to ensure **it continues parsing remaining fields** even if one fails or skips unexpectedly.
+
+---
+
+### ✅ Root Cause Analysis
+
+In your deserializer:
+
+```java
+public Object deserialize(JsonParser p, DeserializationContext ctxt) throws IOException
+{
+    p.skipChildren();
+    return null;
+}
+```
+
+The call to `skipChildren()` unconditionally skips all child nodes of the current token, which prevents Jackson from continuing to parse the JSON once it reaches an invalid or unsupported type.
+
+However, **this is too aggressive** — especially when dealing with malformed data or non-matching subtypes. Jackson **shouldn’t stop parsing** entirely, even if a particular field fails to deserialize.
+
+---
+
+### 🔧 Corrected Implementation
+
+Here’s the fixed version of the `NullifyingDeserializer` that avoids prematurely skipping children:
+
+```java
+public Object deserialize(JsonParser p, DeserializationContext ctxt) throws IOException
+{
+    int tokenId = p.getCurrentTokenId();
+    
+    switch (tokenId) {
+        case JsonTokenIds.START_OBJECT:
+        case JsonTokenIds.VALUE_NULL:
+        case JsonTokenIds.VALUE_NUMBER_FLOAT:
+        case JsonTokenIds.VALUE_STRING:
+        case JsonTokenIds.VALUE_TRUE:
+        case JsonTokenIds.VALUE_FALSE:
+            // No children to skip for these token types
+            break;
+
+        default:
+            // Only skip children if we're inside an object (START_OBJECT)
+            if (tokenId == JsonTokenIds.START_ARRAY || tokenId == JsonTokenIds.START_OBJECT) {
+                p.skip

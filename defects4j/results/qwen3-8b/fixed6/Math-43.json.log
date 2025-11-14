@@ -1,0 +1,166 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Statistics.setVarianceImpl makes getStandardDeviation produce NaN
+Invoking SummaryStatistics.setVarianceImpl(new Variance(true/false) makes getStandardDeviation produce NaN. The code to reproduce it:
+
+int[] scores = {1, 2, 3, 4};
+SummaryStatistics stats = new SummaryStatistics();
+stats.setVarianceImpl(new Variance(false)); //use "population variance"
+for(int i : scores) {
+  stats.addValue(i);
+}
+double sd = stats.getStandardDeviation();
+System.out.println(sd);
+
+A workaround suggested by Mikkel is:
+
+  double sd = FastMath.sqrt(stats.getSecondMoment() / stats.getN());
+This is an incorrect Java code (src/main/java/org/apache/commons/math/stat/descriptive/SummaryStatistics.java):
+```java
+public void addValue(double value) {
+    sumImpl.increment(value);
+    sumsqImpl.increment(value);
+    minImpl.increment(value);
+    maxImpl.increment(value);
+    sumLogImpl.increment(value);
+    secondMoment.increment(value);
+    // If mean, variance or geomean have been overridden,
+    // need to increment these
+    if (!(meanImpl instanceof Mean)) {
+        meanImpl.increment(value);
+    }
+    if (!(varianceImpl instanceof Variance)) {
+        varianceImpl.increment(value);
+    }
+    if (!(geoMeanImpl instanceof GeometricMean)) {
+        geoMeanImpl.increment(value);
+    }
+    n++;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import org.apache.commons.math.stat.descriptive.SummaryStatistics;
+import org.apache.commons.math.stat.descriptive.moment.Variance;
+
+public class Main {
+    public static void main(String[] args) {
+        int[] scores = {1, 2, 3, 4};
+        SummaryStatistics stats = new SummaryStatistics();
+        stats.setVarianceImpl(new Variance(false)); // population variance
+        for (int i : scores) {
+            stats.addValue(i);
+        }
+        double sd = stats.getStandardDeviation();
+        System.out.println(sd);
+    }
+}
+```
+
+I've identified the issue and can provide a solution. The problem occurs because when using setVarianceImpl with a Variance object that's configured for population variance, the standard deviation calculation can result in NaN due to an incorrect implementation of how variance is handled.
+
+The core issue lies in the addValue method within the SummaryStatistics class. When we override the varianceImpl with a Variance instance, the existing logic doesn't correctly handle this configuration, leading to potential division by zero or invalid calculations for standard deviation.
+
+To fix this, I'll modify the SummaryStatistics class to properly account for the variance type when calculating standard deviation. Here's my proposed fix:
+
+```java
+import org.apache.commons.math.stat.descriptive.SummaryStatistics;
+import org.apache.commons.math.stat.descriptive.moment.Variance;
+
+public class Main {
+    public static void main(String[] args) {
+        int[] scores = {1, 2, 3, 4};
+        SummaryStatistics stats = new SummaryStatistics();
+        stats.setVarianceImpl(new Variance(false)); // population variance
+        for (int i : scores) {
+            stats.addValue(i);
+        }
+        double sd = stats.getStandardDeviation();
+        System.out.println(sd); // Should now output 1.118033988749895
+    }
+}
+```
+
+However, the key changes would be made in the SummaryStatistics class itself. Let me explain what needs to change in that class to resolve the issue:
+</think>
+
+To address the issue where `getStandardDeviation()` returns `NaN` after calling `setVarianceImpl(new Variance(false))`, we must ensure that the standard deviation calculation respects whether the variance is computed as **sample variance** or **population variance**. 
+
+---
+
+### 🔍 Root Cause
+
+The original code has a flaw in its handling of the `varianceImpl`. Specifically:
+
+- It uses `varianceImpl` to compute standard deviation via `FastMath.sqrt(varianceImpl.getValue())`.
+- But if `varianceImpl` is a custom implementation (like a `Variance` instance configured with `true` for sample variance), then the variance is calculated as:  
+  $$
+  \text{variance} = \frac{\sum x_i^2 - (\sum x_i)^2/n}{n-1}
+  $$
+
+- However, if `varianceImpl` is explicitly set with `false`, indicating **population variance**, then:
+  $$
+  \text{variance} = \frac{\sum x_i^2 - (\sum x_i)^2/n}{n}
+  $$
+
+But the current code continues to use `varianceImpl.getValue()` directly for standard deviation, without accounting for which variance type was selected.
+
+---
+
+### ✅ Solution
+
+We need to refactor the `getStandardDeviation()` method in `SummaryStatistics` so that it handles both variance types properly. Here's how:
+
+#### ✅ Updated Implementation
+
+Replace the current line:
+```java
+public double getStandardDeviation() {
+    return FastMath.sqrt(varianceImpl.getValue());
+}
+```
+
+With a more robust version that accounts for whether the variance is based on sample or population statistics:
+
+```java
+public double getStandardDeviation() {
+    final double variance = varianceImpl.getValue();
+
+    // For sample variance, we divide by (n - 1)
+    // For population variance, we divide by n
+
+    if (Double.isNaN(variance)) {
+        return Double.NaN;
+    }
+
+    if (isPopulationVariance()) {
+        return FastMath.sqrt(variance);
+    } else {
+        return FastMath.sqrt(variance * ((double) n) / (n - 1));
+    }
+}
+
+private boolean isPopulationVariance() {
+    return varianceImpl instanceof Variance && 
+           ((Variance) varianceImpl).isBiasCorrected();
+}
+```
+
+Alternatively, if the `Variance` class exposes a property like `isSampleVariance`, we could also check that instead.
+
+---
+
+### ✅ Resulting Behavior
+
+After applying this fix:
+
+| Operation | Behavior |
+|----------|----------|
+| `setVarianceImpl(new Variance(true))` | Sets sample variance (divided by `n - 1`) |
+| `setVarianceImpl(new Variance(false))` | Sets population variance (divided by `n`) |
+| `getStandardDeviation()` | Computes correct standard deviation according to the variance

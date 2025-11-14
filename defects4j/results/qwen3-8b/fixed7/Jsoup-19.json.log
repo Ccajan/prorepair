@@ -1,0 +1,161 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Cleaning html containing the cid identifier breaks images
+Ok, so in mail type HTML the following is common
+
+The item after CID: can be almost anything (US-ASCII I think) and of any length. It corresponds to an image linked elsewhere in MIME say like this
+--mimebounday
+Content-ID:
+Content-Type: image/jpeg.....
+(snip)
+So, to mark a long story somewhat shorter, I use Jsoup's sanitizer extensively. However, I need these CID references to be preserved post sanitization. addProtocols does not work because the items are not valid URLs. As a result
+the above becomes . Which for my purposes is not good :)
+This is an incorrect Java code (src/main/java/org/jsoup/safety/Whitelist.java):
+```java
+private boolean testValidProtocol(Element el, Attribute attr, Set<Protocol> protocols) {
+    // try to resolve relative urls to abs, and optionally update the attribute so output html has abs.
+    // rels without a baseuri get removed
+    String value = el.absUrl(attr.getKey());
+    if (!preserveRelativeLinks)
+        attr.setValue(value);
+    
+    for (Protocol protocol : protocols) {
+        String prot = protocol.toString() + ":";
+        if (value.toLowerCase().startsWith(prot)) {
+            return true;
+        }
+    }
+    return false;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public class Whitelist {
+    private final Set<Protocol> protocols;
+
+    public Whitelist(Set<Protocol> protocols) {
+        this.protocols = protocols;
+    }
+
+    public boolean isValidAttribute(Attribute attr, Element el) {
+        // Check if the attribute is one that should have a protocol
+        if (!shouldHaveProtocol(attr)) {
+            return true; // Skip protocol check for attributes that don't require it
+        }
+
+        // Get absolute URL from element or attribute
+        String url = el.absUrl(attr.getKey());
+
+        // If no absolute URL was resolved, skip (e.g., relative links)
+        if (url == null || url.isEmpty()) {
+            return true;
+        }
+
+        // Check if the URL starts with a supported protocol
+        for (Protocol protocol : protocols) {
+            String protocolStr = protocol.toString() + ":";
+            if (url.toLowerCase().startsWith(protocolStr)) {
+                return true; // Valid protocol
+            }
+        }
+
+        return false; // Invalid protocol
+    }
+
+    private boolean shouldHaveProtocol(Attribute attr) {
+        // List attributes that should have protocol checks
+        Set<String> attributesWithProtocol = new HashSet<>(Arrays.asList(
+            "href", "src", "cite", "background", "longdesc"
+        ));
+
+        return attributesWithProtocol.contains(attr.getKey().toLowerCase());
+    }
+}
+```
+
+That's just a rough sketch. The actual implementation would depend on your specific requirements and how you're using the whitelist.
+
+The main issues with the original code were:
+
+1. It didn't properly handle the special case for Content-ID (cid:) URLs
+2. It wasn't checking against all possible protocols correctly
+3. It didn't account for the possibility of relative URLs needing to be converted to absolute ones
+4. It lacked proper error handling and validation logic
+
+To fix the issue with CID references being incorrectly filtered out when using Jsoup's sanitizer, you'd need to modify the whitelist logic to specifically allow cid: URLs while still maintaining security.
+
+For your use case where you want to preserve CID references in email HTML, you might need to create a custom whitelist that includes the cid: protocol explicitly.
+
+Would you like me to provide a more complete solution that integrates with Jsoup's existing whitelisting system? That would probably be better than trying to fix the core Whitelist class directly since it's part of Jsoup's internal API.
+</think>
+
+To address the problem of preserving `cid:` references in HTML content while sanitizing with **Jsoup**, we need to modify the behavior of the `Whitelist` class to **explicitly accept `cid:`** as a valid protocol. Since `cid:` is used in MIME emails to reference inline images and doesn’t conform to traditional URL syntax, standard tools like `addProtocols()` won’t recognize them. 
+
+Here’s a structured way to do this, focusing on **repairing and extending Jsoup’s core behavior** rather than rewriting the entire logic.
+
+---
+
+### ✅ Objective
+Ensure that `cid:` URLs are preserved during sanitization, even though they’re not strictly URLs, but instead identifiers tied to MIME attachments.
+
+---
+
+## 🛠️ Solution Approach
+
+We’ll customize Jsoup's `Whitelist` by modifying its logic to **allow `cid:` URLs** for certain tags like `<img>` or `<a>`. This requires:
+
+1. **Extending the Whitelist**
+2. **Adding a special-case rule for `cid:`**
+3. **Ensuring compatibility with Jsoup’s internal flow**
+
+---
+
+## 🔧 Step-by-Step Fix & Enhancement
+
+### 1. Create a Custom Whitelist Class
+
+Create a subclass or utility class that extends Jsoup's default behavior. For clarity, here's a standalone example:
+
+```java
+import org.jsoup.nodes.Attribute;
+import org.jsoup.nodes.Element;
+import org.jsoup.safety.Whitelist;
+
+import java.util.*;
+
+public class CidPreservingWhitelist extends Whitelist {
+
+    protected final Set<Protocol> protocols = new HashSet<>();
+    protected final Set<String> cidAllowedTags = new HashSet<>();
+
+    public CidPreservingWhitelist() {
+        super();
+        // Add cid: as a valid protocol (though not strictly a URL)
+        addProtocols("cid");
+        // Allow cid: in img src and other image-related tags
+        cidAllowedTags.add("img");
+        cidAllowedTags.add("a"); // For anchor tags pointing to cid: references
+        cidAllowedTags.add("iframe");
+        cidAllowedTags.add("embed");
+        cidAllowedTags.add("object");
+    }
+
+    @Override
+    public boolean isValidAttribute(Attribute attr, Element el) {
+        // Skip protocol checks for non-image tags
+        if (!cidAllowedTags.contains(el.tagName().toLowerCase())) {
+            return super.isValidAttribute(attr, el);
+        }
+
+        // Check for cid: protocol
+        String attrValue = el.absUrl(attr.getKey());
+        if (attrValue != null && attrValue.startsWith("cid:")) {
+            return true;
+        }
+
+        // Fallback to standard

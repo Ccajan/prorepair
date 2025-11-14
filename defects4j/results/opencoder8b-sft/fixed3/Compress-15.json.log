@@ -1,0 +1,188 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# ZipArchiveInputStream and ZipFile don't produce equals ZipArchiveEntry instances
+I'm trying to use a ZipArchiveEntry coming from ZipArchiveInputStream that I stored somwhere for later with a ZipFile and it does not work.
+The reason is that it can't find the ZipArchiveEntry in the ZipFile entries map. It is exactly the same zip file but both entries are not equals so the Map#get fail.
+As far as I can see the main difference is that comment is null in ZipArchiveInputStream while it's en empty string in ZipFile. I looked at ZipArchiveInputStream and it looks like the comment (whatever it is) is simply not parsed while I can find some code related to the comment at the end of ZIipFile#readCentralDirectoryEntry.
+Note that java.util.zip does not have this issue. Did not checked what they do but the zip entries are equals.
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/zip/ZipArchiveEntry.java):
+```java
+public boolean equals(Object obj) {
+    if (this == obj) {
+        return true;
+    }
+    if (obj == null || getClass() != obj.getClass()) {
+        return false;
+    }
+    ZipArchiveEntry other = (ZipArchiveEntry) obj;
+    String myName = getName();
+    String otherName = other.getName();
+    if (myName == null) {
+        if (otherName != null) {
+            return false;
+        }
+    } else if (!myName.equals(otherName)) {
+        return false;
+    }
+    String myComment = getComment();
+    String otherComment = other.getComment();
+    if (myComment == null) {
+        if (otherComment != null) {
+            return false;
+        }
+    } else if (!myComment.equals(otherComment)) {
+        return false;
+    }
+    return getTime() == other.getTime()
+        && getInternalAttributes() == other.getInternalAttributes()
+        && getPlatform() == other.getPlatform()
+        && getExternalAttributes() == other.getExternalAttributes()
+        && getMethod() == other.getMethod()
+        && getSize() == other.getSize()
+        && getCrc() == other.getCrc()
+        && getCompressedSize() == other.getCompressedSize()
+        && Arrays.equals(getCentralDirectoryExtra(),
+                         other.getCentralDirectoryExtra())
+        && Arrays.equals(getLocalFileDataExtra(),
+                         other.getLocalFileDataExtra())
+        && gpb.equals(other.gpb);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+package org.apache.commons.compress.archivers.zip;
+
+import static com.google.common.base.Preconditions.checkNotNull;
+
+import java.io.IOException;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.Objects;
+
+// ... (Other parts of the code)
+
+public final class ZipArchiveEntry implements ArchiveEntry {
+
+    private long crc;
+    private int compressedSize;
+    private long size;
+    private int method;
+    private final CentralDirectoryHeader cdir; // New field
+    private int[] centralDirectoryExtra;
+    private int[] localFileDataExtra;
+    private byte[] generalPurposeBitFlags;
+
+    public ZipArchiveEntry(CentralDirectoryHeader cdir) throws IOException {
+        this.cdir = checkNotNull(cdir);
+
+        setName(checkNotNull(this.cdir.getName()));
+        setComment(readComment());
+        setTime(toUnixEpoch(this.cdir.getLastModFileDate(), this.cdir.getLastModFileTime()));
+        setMode(this.cdir.getExternalFileAttributes());
+
+        switch (method = this.cdir.getGeneralPurposeBit().getMethod()) {
+            case STORED:
+                crc = this.cdir.getGeneralPurposeBit().getCrc32();
+                compressedSize = this.cdir.getCompressedSize();
+                size = this.cdir.getUncompressedSize();
+                break;
+            case DEFLATED:
+                crc = 0L;
+                size = 0L;
+                compressedSize = this.cdir.getCompressedSize();
+                break;
+            default:
+                throw new UnsupportedOperationException("Unsupported compression method: " + method);
+        }
+
+        setMethod(method);
+        localFileDataExtra = this.cdir.getLocalFileDataHeaderExtra();
+        centralDirectoryExtra = this.cdir.getCentralDirectoryExtra();
+        generalPurposeBitFlags = this.cdir.getGeneralPurposeBit().getBytes();
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+        if (this == obj) {
+            return true;
+        }
+        if (obj == null || getClass() != obj.getClass()) {
+            return false;
+        }
+        ZipArchiveEntry other = (ZipArchiveEntry) obj;
+        String myName = getName();
+        String otherName = other.getName();
+        if (myName == null) {
+            if (otherName != null) {
+                return false;
+            }
+        } else if (!myName.equals(otherName)) {
+            return false;
+        }
+        String myComment = getComment();
+        String otherComment = other.getComment();
+        if (myComment == null) {
+            if (otherComment != null) {
+                return false;
+            }
+        } else if (!myComment.equals(otherComment)) {
+            return false;
+        }
+        return getTime() == other.getTime()
+            && getInternalAttributes() == other.getInternalAttributes()
+            && getPlatform() == other.getPlatform()
+            && getExternalAttributes() == other.getExternalAttributes()
+            && getMethod() == other.getMethod()
+            && getSize() == other.getSize()
+            && getCrc() == other.getCrc()
+            && getCompressedSize() == other.getCompressedSize()
+            && Arrays.equals(getCentralDirectoryExtra(),
+                             other.getCentralDirectoryExtra())
+            && Arrays.equals(getLocalFileDataExtra(),
+                             other.getLocalFileDataExtra())
+            && Objects.deepEquals(generalPurposeBitFlags,
+                                  other.generalPurposeBitFlags)
+            && cdir.equals(other.cdir); // Include the full comparison of cdir
+    }
+
+    // ... (Other methods)
+
+    private String readComment() {
+        return this.cdir.getGeneralPurposeBit().hasUTF8Flag()
+            ? readUtf8Comment() : readAsciiComment();
+    }
+
+    private String readUtf8Comment() {
+        int utf8Size = this.cdir.getGeneralPurposeBit().getUtf8EFSFlagSize();
+        byte[] data = new byte[utf8Size];
+        try {
+            System.arraycopy(localFileDataExtra, 22, data, 0, utf8Size);
+        } catch (Exception e) {
+            throw new IllegalArgumentException(e);
+        }
+        return new String(data, StandardCharsets.UTF_8).trim();
+    }
+
+    private String readAsciiComment() {
+        Charset charset = Charset.forName("CP437");
+        int asciiSize = this.cdir.getGeneralPurposeBit().getAsciiEFSFlagSize();
+        byte[] data = new byte[asciiSize];
+        try {
+            System.arraycopy(localFileDataExtra, 20, data, 0, asciiSize);
+        } catch (Exception e) {
+            throw new IllegalArgumentException(e);
+        }
+        return new String(data, charset).trim();
+    }
+
+    private int toUnixEpoch(int fileDate, int fileTime) {
+        return ((fileDate & 0xFF00) >> 8) * 512 + (fileTime >> 5) * 2;
+    }
+}
+```

@@ -1,0 +1,197 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# HeaderMap is inconsistent when it is parsed from an input with duplicate columns names
+Given a parser format for csv files with a header line:
+{code}
+CSVFormat myFormat = CSVFormat.RFC4180.withDelimiter(",").withQuoteChar('"').withQuotePolicy(Quote.MINIMAL)
+				.withIgnoreSurroundingSpaces(true).withHeader().withSkipHeaderRecord(true);
+{code}
+
+And given a file with duplicate header names:
+ 
+Col1,Col2,Col2,Col3,Col4
+1,2,3,4,5
+4,5,6,7,8 
+
+The HeaderMap returned by the parser misses an entry because of the Column name being used as a key, leading to wrong behavior when we rely on it.
+
+If this is not supposed to happen in the file regarding the CSV format, at least this should raise an error. If not we should come up with a more clever way to store and access the headers.
+
+This is an incorrect Java code (src/main/java/org/apache/commons/csv/CSVParser.java):
+```java
+private Map<String, Integer> initializeHeader() throws IOException {
+        Map<String, Integer> hdrMap = null;
+        final String[] formatHeader = this.format.getHeader();
+        if (formatHeader != null) {
+            hdrMap = new LinkedHashMap<String, Integer>();
+
+            String[] header = null;
+            if (formatHeader.length == 0) {
+                // read the header from the first line of the file
+                final CSVRecord nextRecord = this.nextRecord();
+                if (nextRecord != null) {
+                    header = nextRecord.values();
+                }
+            } else {
+                if (this.format.getSkipHeaderRecord()) {
+                    this.nextRecord();
+                }
+                header = formatHeader;
+            }
+
+            // build the name to index mappings
+            if (header != null) {
+                for (int i = 0; i < header.length; i++) {
+                    hdrMap.put(header[i], Integer.valueOf(i));
+                }
+            }
+        }
+        return hdrMap;
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import java.util.*;
+
+public class CSVParser {
+
+    private static class HeaderEntry {
+        public final int index;
+        public final boolean isDuplicate;
+
+        public HeaderEntry(int index, boolean isDuplicate) {
+            this.index = index;
+            this.isDuplicate = isDuplicate;
+        }
+    }
+
+    private Map<String, List<HeaderEntry>> headerMap;
+    private final CSVFormat format;
+
+    public CSVParser(CSVFormat format) {
+        this.format = format;
+        this.headerMap = new HashMap<>();
+    }
+
+    public void parseHeaders(String[] header) {
+        if (header == null || header.length == 0) {
+            return;
+        }
+
+        for (int i = 0; i < header.length; i++) {
+            String headerName = header[i];
+            HeaderEntry entry = new HeaderEntry(i, false);
+
+            if (headerMap.containsKey(headerName)) {
+                // Handle duplicate header name
+                List<HeaderEntry> existingEntries = headerMap.get(headerName);
+                existingEntries.add(entry);
+                entry = new HeaderEntry(i, true); // Mark as duplicate
+            }
+
+            headerMap.put(headerName, Collections.singletonList(entry));
+        }
+    }
+
+    // Other methods...
+}
+```
+
+In the original code, the problem was that the `initializeHeader()` method would overwrite entries in the map when there were duplicate column names, resulting in only the last occurrence being retained. The solution involves:
+
+1. Changing the data structure from a simple `Map<String, Integer>` to a `Map<String, List<HeaderEntry>>` where each header name maps to a list of its occurrences.
+2. Creating a `HeaderEntry` class to track both the index and whether a header is duplicated.
+3. Modifying the parsing logic to handle duplicates by adding them to the list instead of overwriting.
+
+This approach preserves all header information while clearly indicating which ones are duplicates. It allows applications to check for duplicates and handle them appropriately, rather than simply losing data due to naming conflicts.
+</think>
+
+To resolve the issue of **duplicate column names** in a CSV file causing the loss of mapping information in the `HeaderMap`, we need to improve the design of how header metadata is stored and accessed. The core challenge is handling cases where duplicate headers may exist—either explicitly defined or imported from a file—and ensuring these are preserved without overwriting valuable data.
+
+---
+
+## ✅ Problem Summary
+
+The original implementation has a flaw: it uses a `Map<String, Integer>` to associate header names with their column indices. This leads to **overwriting values** when multiple headers share the same name, effectively losing information about the *second* instance of the header.
+
+For example:
+
+| Col1 | Col2 | Col2 | Col3 | Col4 |
+|------|------|------|------|------|
+| 1    | 2    | 3    | 4    | 5    |
+
+In this case, two "Col2" headers will result in the second one being overwritten, so only one `Col2` index remains. That's incorrect and can lead to unexpected behavior downstream.
+
+---
+
+## 🛠️ Solution Approach
+
+We introduce a more robust mechanism using a `Map<String, List<Integer>>` where:
+
+- Each unique header maps to a **list of indices** it appears at.
+- For a header like `"Col2"` appearing at positions `1` and `2`, we record `[1, 2]`.
+- We also provide optional indicators to identify **duplicates**.
+
+### ✅ Key Improvements
+
+- **Preserves all header instances**
+- **Clearly marks duplicates**
+- **Provides clear interface for querying**
+
+---
+
+## 📦 Improved Code Implementation
+
+Below is a clean and structured version of the modified class. This includes helper classes, setup methods, and usage patterns.
+
+### ✅ Updated Class Definition
+
+```java
+import java.util.*;
+import java.io.IOException;
+
+/**
+ * CSV Parser Class
+ */
+public class CSVParser {
+    // Helper class to store column indices and tracking of duplicates
+    private static class HeaderInfo {
+        final int index;
+        final boolean isDuplicate;
+
+        HeaderInfo(int index, boolean isDuplicate) {
+            this.index = index;
+            this.isDuplicate = isDuplicate;
+        }
+    }
+
+    // Maps header names to a list of column positions
+    private final Map<String, List<HeaderInfo>> headerMap = new HashMap<>();
+
+    // CSV Format definition
+    private final CSVFormat format;
+
+    // Constructor with formatting options
+    public CSVParser(CSVFormat format) {
+        this.format = format;
+    }
+
+    /**
+     * Initialize header map based on provided header row
+     *
+     * @param header Row containing header names
+     */
+    public void initHeaderMap(String[] header) {
+        if (header == null || header.length == 0) {
+            return;
+        }
+
+        for (int i = 0; i < header.length; i++) {
+            String headerName = header[i];
+
+            // Check if the

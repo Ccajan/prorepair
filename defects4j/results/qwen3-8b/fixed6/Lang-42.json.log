@@ -1,0 +1,151 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# StringEscapeUtils.escapeHtml incorrectly converts unicode characters above U+00FFFF into 2 characters
+Characters that are represented as a 2 characters internaly by java are incorrectly converted by the function. The following test displays the problem quite nicely:
+import org.apache.commons.lang.*;
+public class J2 {
+    public static void main(String[] args) throws Exception {
+        // this is the utf8 representation of the character:
+        // COUNTING ROD UNIT DIGIT THREE
+        // in unicode
+        // codepoint: U+1D362
+        byte[] data = new byte[] 
+{ (byte)0xF0, (byte)0x9D, (byte)0x8D, (byte)0xA2 }
+;
+        //output is: &#55348;&#57186;
+        // should be: &#119650;
+        System.out.println("'" + StringEscapeUtils.escapeHtml(new String(data, "UTF8")) + "'");
+    }
+}
+Should be very quick to fix, feel free to drop me an email if you want a patch.
+This is an incorrect Java code (src/java/org/apache/commons/lang/Entities.java):
+```java
+public void escape(Writer writer, String str) throws IOException {
+    int len = str.length();
+    for (int i = 0; i < len; i++) {
+        char c = str.charAt(i);
+        String entityName = this.entityName(c);
+        if (entityName == null) {
+            if (c > 0x7F) {
+                writer.write("&#");
+                writer.write(Integer.toString(c, 10));
+                writer.write(';');
+            } else {
+                writer.write(c);
+            }
+        } else {
+            writer.write('&');
+            writer.write(entityName);
+            writer.write(';');
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public void escape(Writer writer, String str) throws IOException {
+    int len = str.length();
+    for (int i = 0; i < len; i++) {
+        char c = str.charAt(i);
+        String entityName = this.entityName(c);
+        if (entityName == null) {
+            if (c > 0x7F) {
+                // For characters beyond ASCII, use decimal numeric entity with correct value
+                writer.write("&#");
+                writer.write(Integer.toString(c)); // No base specified, defaults to decimal
+                writer.write(';');
+            } else {
+                writer.write(c);
+            }
+        } else {
+            writer.write('&');
+            writer.write(entityName);
+            writer.write(';');
+        }
+    }
+}
+```
+
+The issue lies in how the numeric entity is being written. Previously, `Integer.toString(c, 10)` was used, but it's not necessary to specify the radix since the default is already decimal.
+
+However, there's another issue with this approach. When we're dealing with Unicode characters beyond the Basic Multilingual Plane (BMP), which includes characters like U+1D362, they cannot be represented as a single `char` in Java. Instead, they're represented using surrogate pairs. 
+
+So, the method should iterate over the actual Unicode code points and handle them correctly. Here's an improved version:
+
+```java
+public void escape(Writer writer, String str) throws IOException {
+    int len = str.length();
+    for (int i = 0; i < len; i++) {
+        char c = str.charAt(i);
+        
+        // Check if this is a high surrogate
+        if (Character.isHighSurrogate(c)) {
+            // Get the low surrogate
+            if (i + 1 < len) {
+                char d = str.charAt(i + 1);
+                if (Character.isLowSurrogate(d)) {
+                    // Combine the surrogates to get the Unicode code point
+                    int codePoint = Character.toCodePoint(c, d);
+                    
+                    String entityName = this.entityName(codePoint);
+                    if (entityName != null) {
+                        writer.write('&');
+                        writer.write(entityName);
+                        writer.write(';');
+                    } else {
+                        writer.write("&#");
+                        writer.write(Integer.toString(codePoint));
+                        writer.write(';');
+                    }
+                    // Skip the next character
+                    i++;
+                    continue;
+                }
+            }
+        }
+
+        String entityName = this.entityName(c);
+        if (entityName == null) {
+            if (c > 0x7F) {
+                writer.write("&#");
+                writer.write(Integer.toString(c));
+                writer.write(';');
+            } else {
+                writer.write(c);
+            }
+        } else {
+            writer.write('&');
+            writer.write(entityName);
+            writer.write(';');
+        }
+    }
+}
+```
+
+This version handles surrogate pairs and properly escapes Unicode characters beyond the BMP by converting them to their corresponding Unicode code points.
+
+But wait, the original question says that the string contains bytes representing the UTF-8 encoding of the character. So perhaps the initial string was not correctly decoded from the byte array, leading to issues with surrogate pairs?
+
+In the example provided, the byte array represents the UTF-8 sequence for U+1D362, which is a valid code point outside the BMP. But when you create a String from those bytes without proper decoding, it might be interpreting them as a series of individual characters instead of a single code point.
+
+So the problem may not be with the escaping logic itself but with how the input string is being constructed. The line `new String(data, "UTF8")` should decode the UTF-8 bytes into the correct Unicode character, allowing the rest of the processing to work as expected.
+
+Therefore, I think the core issue is that the input string wasn't being properly decoded from its UTF-8 byte representation, resulting in a string containing surrogate pairs instead of the intended Unicode character. Once the string is properly decoded, the escape logic would work as expected.
+
+Thus, the root cause is likely in how the string is being built from the byte array rather than the escape function itself.
+</think>
+
+The issue you've identified stems from how **Java handles Unicode characters outside the Basic Multilingual Plane (BMP)** and how the `StringEscapeUtils.escapeHtml()` method processes these characters.
+
+---
+
+### ✅ **Root Cause**
+
+When working with **Unicode code points above U+FFFF** (e.g., `U+1D362`), Java uses **surrogate pairs** to represent these code points in the `char` type. However, if the original string is improperly decoded (such as in your test case), the result may contain invalid or incomplete surrogate pairs — not a fully-formed Unicode code point. This causes the subsequent escape process to treat each surrogate as a separate character, resulting in the output like `&#55348;&#57186;`.
+
+> In your example, the UTF-8

@@ -1,0 +1,181 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Missing type-checks for var_args notation
+What steps will reproduce the problem?
+1. Compile this:
+//-------------------------------------
+// ==ClosureCompiler==
+// @compilation_level SIMPLE_OPTIMIZATIONS
+// @warning_level VERBOSE
+// @output_file_name default.js
+// @formatting pretty_print
+// ==/ClosureCompiler==
+
+/**
+* @param {...string} var_args
+*/
+function foo(var_args) {
+    return arguments.length;
+}
+
+foo('hello'); // no warning - ok
+foo(123); // warning - ok
+foo('hello', 123); // no warning! error.
+//-------------------------------------
+
+What is the expected output? What do you see instead?
+Should get a type-mismatch warning for the second parameter in the third foo() call.
+
+What version of the product are you using? On what operating system?
+Both online compiler and the 20100616 release.
+
+Please provide any additional information below.
+Seems like the type-checker treats 'var_args' as a single param and thus fails to type check the subsequent parameters.
+
+// Fredrik
+This is an incorrect Java code (src/com/google/javascript/jscomp/TypeCheck.java):
+```java
+private void visitParameterList(NodeTraversal t, Node call,
+    FunctionType functionType) {
+  Iterator<Node> arguments = call.children().iterator();
+  arguments.next(); // skip the function name
+
+  Iterator<Node> parameters = functionType.getParameters().iterator();
+  int ordinal = 0;
+  Node parameter = null;
+  Node argument = null;
+  while (arguments.hasNext() &&
+         parameters.hasNext()) {
+    // If there are no parameters left in the list, then the while loop
+    // above implies that this must be a var_args function.
+      parameter = parameters.next();
+    argument = arguments.next();
+    ordinal++;
+
+    validator.expectArgumentMatchesParameter(t, argument,
+        getJSType(argument), getJSType(parameter), call, ordinal);
+  }
+
+  int numArgs = call.getChildCount() - 1;
+  int minArgs = functionType.getMinArguments();
+  int maxArgs = functionType.getMaxArguments();
+  if (minArgs > numArgs || maxArgs < numArgs) {
+    report(t, call, WRONG_ARGUMENT_COUNT,
+            validator.getReadableJSTypeName(call.getFirstChild(), false),
+            String.valueOf(numArgs), String.valueOf(minArgs),
+            maxArgs != Integer.MAX_VALUE ?
+            " and no more than " + maxArgs + " argument(s)" : "");
+  }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+The issue here is with how the Closure Compiler's type-checker handles functions with `var_args` parameters. The current implementation seems to treat all variadic arguments as a single parameter, which causes it to fail to correctly validate additional arguments passed after the first one.
+
+Let me walk through the problem:
+
+1. When a function has a `@param {...string}` annotation (indicating it accepts a variable number of string arguments), the closure compiler should treat all arguments beyond the first as part of the same type-checking context.
+2. However, the current logic processes each argument against the corresponding parameter, but doesn't properly account for the fact that multiple arguments might belong to a single var_args parameter.
+3. This results in incorrect validation where the second or later arguments in a call to a var_args function aren't being checked against the specified type.
+
+To fix this, we need to adjust the type-checking logic to:
+- Recognize when a function has a var_args parameter
+- Apply the type-checking to all arguments in the call against the var_args parameter
+
+Here's a revised approach to the function:
+
+```java
+private void visitParameterList(NodeTraversal t, Node call,
+    FunctionType functionType) {
+  Iterator<Node> arguments = call.children().iterator();
+  arguments.next(); // skip the function name
+
+  Iterator<Node> parameters = functionType.getParameters().iterator();
+  int ordinal = 0;
+  Node parameter = null;
+  Node argument = null;
+
+  // First, process regular parameters
+  while (arguments.hasNext() && parameters.hasNext()) {
+    parameter = parameters.next();
+    argument = arguments.next();
+    ordinal++;
+    
+    // Check if this parameter is a var_args
+    boolean isVarArgs = isVarArgsParameter(parameter);
+    
+    if (!isVarArgs) {
+      validator.expectArgumentMatchesParameter(
+          t, argument, getJSType(argument), getJSType(parameter), call, ordinal);
+    } else {
+      // For var_args parameters, apply type checking to all remaining arguments
+      while (arguments.hasNext()) {
+        Node nextArg = arguments.next();
+        validator.expectArgumentMatchesParameter(
+            t, nextArg, getJSType(nextArg), getJSType(parameter), call, ordinal);
+      }
+      break; // No need to check other parameters once we've handled var_args
+    }
+  }
+
+  // Now handle remaining arguments (if any)
+  int numArgs = call.getChildCount() - 1;
+  int minArgs = functionType.getMinArguments();
+  int maxArgs = functionType.getMaxArguments();
+  
+  if (minArgs > numArgs || maxArgs < numArgs) {
+    report(t, call, WRONG_ARGUMENT_COUNT,
+        validator.getReadableJSTypeName(call.getFirstChild(), false),
+        String.valueOf(numArgs), String.valueOf(minArgs),
+        maxArgs != Integer.MAX_VALUE ?
+            " and no more than " + maxArgs + " argument(s)" : "");
+  }
+}
+
+// Helper method to check if a parameter is a var_args parameter
+private boolean isVarArgsParameter(Node parameter) {
+  // Implement your logic to determine if the parameter is a var_args
+  // This could involve checking annotations, etc.
+  return parameter.hasAnnotation("...");
+}
+```
+
+This approach would allow the Closure Compiler to correctly apply type checks to all arguments in calls to functions with `var_args` parameters. It also ensures that regular parameters are validated correctly while allowing flexibility for variadic arguments.
+
+I think I have now made it clear why the original code was incorrect, identified the root cause of the problem, and provided a solution that addresses it effectively.
+</think>
+
+To address the **incorrect handling** of type-checks for **variadic (`@param {...string}`)** parameters in the Closure Compiler, we need to modify the existing logic so that all arguments passed to such functions are **correctly checked against the declared type**, even though they are spread across different positions in the call stack.
+
+---
+
+### 🧠 Problem Summary
+
+The original code incorrectly treats all **variadic arguments** as a single parameter, resulting in a misinterpretation of their types. Specifically, when passing **multiple arguments to a function annotated with `@param {...string}`**, only the **first argument** is checked against the type, while the **subsequent ones** are not verified at all — even though they should match the same type.
+
+For example, consider:
+
+```javascript
+/**
+ * @param {...string} var_args
+ */
+function foo(var_args) { ... }
+
+foo('hello', 123);
+```
+
+In this case, the compiler should warn about the second argument (`123`) since it's not a `string`, but it currently ignores the rest after the first.
+
+---
+
+### ✅ Corrected Approach
+
+We can improve the logic by:
+
+1. **Identifying variadic parameters** via their metadata (e.g., looking for the special `...` annotation).
+2. **Validating every argument in the call** against the **same type**

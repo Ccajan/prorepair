@@ -1,0 +1,153 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# AsPropertyTypeDeserializer ignores DeserializationFeature.ACCEPT_EMPTY_STRING_AS_NULL_OBJECT
+The AsPropertyTypeDeserializer  implementation does not respect the DeserializationFeature.ACCEPT_EMPTY_STRING_AS_NULL_OBJECT feature. When deserializing an empty String it throws DeserializationFeature.ACCEPT_EMPTY_STRING_AS_NULL_OBJECT instead of creating a null Object.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/jsontype/impl/AsPropertyTypeDeserializer.java):
+```java
+protected Object _deserializeTypedUsingDefaultImpl(JsonParser p, DeserializationContext ctxt,
+        TokenBuffer tb) throws IOException
+{
+    // As per [JACKSON-614], may have default implementation to use
+    JsonDeserializer<Object> deser = _findDefaultImplDeserializer(ctxt);
+    if (deser != null) {
+        if (tb != null) {
+            tb.writeEndObject();
+            p = tb.asParser(p);
+            // must move to point to the first token:
+            p.nextToken();
+        }
+        return deser.deserialize(p, ctxt);
+    }
+    // or, perhaps we just bumped into a "natural" value (boolean/int/double/String)?
+    Object result = TypeDeserializer.deserializeIfNatural(p, ctxt, _baseType);
+    if (result != null) {
+        return result;
+    }
+    // or, something for which "as-property" won't work, changed into "wrapper-array" type:
+    if (p.getCurrentToken() == JsonToken.START_ARRAY) {
+        return super.deserializeTypedFromAny(p, ctxt);
+    }
+    ctxt.reportWrongTokenException(p, JsonToken.FIELD_NAME,
+            "missing property '"+_typePropertyName+"' that is to contain type id  (for class "+baseTypeName()+")");
+    return null;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+if (p.getCurrentToken() == JsonToken.VALUE_STRING) {
+    String str = p.getText().trim();
+    if (str.isEmpty()) {
+        return null;
+    }
+}
+```
+
+But this would be part of the general logic in the method.
+
+I'm sorry, but I think there's some confusion here. The issue you're describing relates to how Jackson handles empty strings during deserialization, particularly with the `ACCEPT_EMPTY_STRING_AS_NULL_OBJECT` feature. However, the code snippet provided doesn't directly relate to that behavior. In fact, the actual handling of empty strings as null objects usually occurs earlier in the deserialization process, typically within the deserializer itself or when parsing the JSON tokens.
+
+Here's what the correct approach might look like:
+
+For any string value encountered during deserialization:
+1. Check if the current token is a string (`JsonToken.VALUE_STRING`).
+2. If it is, check whether the string is empty after trimming whitespace.
+3. If so, return null instead of attempting to deserialize it as a non-null object.
+
+So, integrating that into the context of your code would involve adding checks for the empty string case at the appropriate points in the deserialization flow, ensuring that the `ACCEPT_EMPTY_STRING_AS_NULL_OBJECT` setting is respected. This might mean adding a check for an empty string before proceeding with further processing in the `_deserializeTypedUsingDefaultImpl` method or similar methods responsible for the actual deserialization.
+
+Would you like me to provide a more detailed example or help integrate these changes into your specific code structure? I'd be happy to assist further.
+</think>
+
+To address the issue where `AsPropertyTypeDeserializer` does **not** respect the `DeserializationFeature.ACCEPT_EMPTY_STRING_AS_NULL_OBJECT` configuration and fails when encountering an empty string, we need to modify the relevant deserialization logic to explicitly handle this case.
+
+---
+
+### ✅ Problem Summary
+
+Jackson’s `AsPropertyTypeDeserializer` uses the following pattern for typing:
+
+```java
+protected Object _deserializeTypedUsingDefaultImpl(...) { ... }
+```
+
+When a field value is parsed as a simple string (i.e., not part of a structured object), Jackson tries to parse it directly without checking for special configurations like `ACCEPT_EMPTY_STRING_AS_NULL_OBJECT`. 
+
+Thus, even though that global feature is enabled elsewhere in the configuration, it is not honored in this path unless specifically implemented.
+
+---
+
+### 🔧 Solution
+
+We can fix this by modifying the deserialization process in `AsPropertyTypeDeserializer` to **explicitly check for empty strings** and return `null` in such cases — **only if** `ACCEPT_EMPTY_STRING_AS_NULL_OBJECT` is enabled on the deserialization context.
+
+Here is the corrected and updated version of the relevant method:
+
+```java
+protected Object _deserializeTypedUsingDefaultImpl(JsonParser p, 
+                                                   DeserializationContext ctxt,
+                                                   TokenBuffer tb)
+        throws IOException
+{
+    // First: check if the current token is a string.
+    if (p.getCurrentToken() == JsonToken.VALUE_STRING) {
+        final String text = p.getText().trim();
+
+        // Apply ACCEPT_EMPTY_STRING_AS_NULL_OBJECT flag
+        if (ctxt.isEnabled(DeserializationFeature.ACCEPT_EMPTY_STRING_AS_NULL_OBJECT)) {
+            if (text.isEmpty()) {
+                return null;
+            }
+        }
+    }
+
+    // Then proceed with the original logic
+    JsonDeserializer<Object> deser = _findDefaultImplDeserializer(ctxt);
+    if (deser != null) {
+        if (tb != null) {
+            tb.writeEndObject();
+            p = tb.asParser(p);
+            p.nextToken();
+        }
+        return deser.deserialize(p, ctxt);
+    }
+
+    // Or check for natural types
+    Object result = TypeDeserializer.deserializeIfNatural(p, ctxt, _baseType);
+    if (result != null) {
+        return result;
+    }
+
+    // Or fallback to array-type deserialization
+    if (p.getCurrentToken() == JsonToken.START_ARRAY) {
+        return super.deserializeTypedFromAny(p, ctxt);
+    }
+
+    // Otherwise report error
+    ctxt.reportWrongTokenException(p, JsonToken.FIELD_NAME,
+            "missing property '" + _typePropertyName + "' that is to contain type id (for class " + baseTypeName() + ")");
+    return null;
+}
+```
+
+---
+
+### 📌 Key Changes
+
+| Feature | Description |
+|--------|-------------|
+| Empty string check | Added explicit check for empty string using `getText().trim()` |
+| Context flag usage | Checks if `ACCEPT_EMPTY_STRING_AS_NULL_OBJECT` is enabled via `ctxt.isEnabled(...)` |
+| Early return | Returns `null` if both conditions match, avoiding unnecessary processing |
+
+---
+
+### ⚠️ Notes
+
+- This change should only be applied if the method is actually used for string-based values — otherwise, it could cause unexpected behavior.
+- Ensure this method is being called when expecting string values (e.g., via a custom deserializer or via annotations).
+- You can also consider extending `AsPropertyTypeDeserializer` and overriding this method to apply the fix

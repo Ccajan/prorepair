@@ -1,0 +1,179 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Template types on methods incorrectly trigger inference of a template on the class if that template type is unknown
+See i.e.
+
+/**
+  * @constructor
+  * @template CLASS
+  */
+var Class = function() {};
+
+/**
+  * @param {function(CLASS):CLASS} a
+  * @template T
+  */
+Class.prototype.foo = function(a) {
+  return 'string';
+};
+
+/** @param {number} a
+  * @return {string} */
+var a = function(a) { return '' };
+
+new Class().foo(a);
+
+The CLASS type is never specified. If the @template T line is removed from the foo method, the block compiles with but with the @annotation on the method, the compiler seems to try to infer CLASS from the usage and fails compilation.
+This is an incorrect Java code (src/com/google/javascript/jscomp/TypeInference.java):
+```java
+private boolean inferTemplatedTypesForCall(
+    Node n, FunctionType fnType) {
+  final ImmutableList<TemplateType> keys = fnType.getTemplateTypeMap()
+      .getTemplateKeys();
+  if (keys.isEmpty()) {
+    return false;
+  }
+
+  // Try to infer the template types
+  Map<TemplateType, JSType> inferred = 
+      inferTemplateTypesFromParameters(fnType, n);
+
+
+  // Replace all template types. If we couldn't find a replacement, we
+  // replace it with UNKNOWN.
+  TemplateTypeReplacer replacer = new TemplateTypeReplacer(
+      registry, inferred);
+  Node callTarget = n.getFirstChild();
+
+  FunctionType replacementFnType = fnType.visit(replacer)
+      .toMaybeFunctionType();
+  Preconditions.checkNotNull(replacementFnType);
+
+  callTarget.setJSType(replacementFnType);
+  n.setJSType(replacementFnType.getReturnType());
+
+  return replacer.madeChanges;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+// In the inferTemplatedTypesForCall method, before trying to infer template
+// types for the function call, check whether the function has any template
+// parameters that could be inferred based on the arguments.
+
+private boolean inferTemplatedTypesForCall(
+    Node n, FunctionType fnType) {
+  final ImmutableList<TemplateType> keys = fnType.getTemplateTypeMap()
+      .getTemplateKeys();
+  
+  // Check if there are any template parameters that can be inferred from
+  // argument types, or if the function's own template parameters are known.
+  if (keys.isEmpty()) {
+    return false;
+  }
+  
+  // If the function doesn't have any explicit template parameters, don't try to
+  // infer them based on the call site - this prevents inferring template types
+  // for functions without defined templates, like in the example where the class
+  // lacks a concrete template parameter.
+  if (!fnType.hasExplicitTemplateParams()) {
+    return false;
+  }
+  
+  // Try to infer the template types
+  Map<TemplateType, JSType> inferred =
+      inferTemplateTypesFromParameters(fnType, n);
+  
+  // Replace all template types. If we couldn't find a replacement, we
+  // replace it with UNKNOWN.
+  TemplateTypeReplacer replacer = new TemplateTypeReplacer(
+      registry, inferred);
+  Node callTarget = n.getFirstChild();
+  
+  FunctionType replacementFnType = fnType.visit(replacer)
+      .toMaybeFunctionType();
+  Preconditions.checkNotNull(replacementFnType);
+  
+  callTarget.setJSType(replacementFnType);
+  n.setJSType(replacementFnType.getReturnType());
+  
+  return replacer.madeChanges;
+}
+```
+
+The issue was that the previous implementation would attempt to infer template types even when the function didn't explicitly define any. By checking `fnType.hasExplicitTemplateParams()` we ensure that only functions which actually declare template parameters will attempt to infer their values, preventing incorrect inference for classes or methods that lack concrete template definitions. This aligns better with how template inference should work, especially in cases where template types are not specified at the class level.
+
+I've added a condition to skip template inference for functions without explicit template parameters, thereby fixing the problem described in the original question.
+</think>
+
+To address the issue with incorrect template inference in the given Java code, we need to refine the logic in the `inferTemplatedTypesForCall` method so that it avoids inferring template types for functions that do **not** explicitly declare them.
+
+---
+
+### ✅ Problem Recap
+
+In the current code:
+
+- The method attempts to infer template types regardless of whether the target function has declared any.
+- When the function does **not** have explicit template parameters (e.g., `@template CLASS`), it wrongly tries to infer them using the context of a call (like `new Class().foo(a)`).
+- This leads to errors because no concrete information about the template exists, causing the type inference to fail unnecessarily.
+
+---
+
+### 🔧 Solution
+
+We fix this by introducing a new check: **only perform template inference if the function has explicitly declared its template parameters**.
+
+#### ✅ Key Fix:
+Add a guard clause that checks if the `FunctionType` object has **explicitly defined** template parameters via the `hasExplicitTemplateParams()` method.
+
+Here's the corrected version of the method:
+
+```java
+private boolean inferTemplatedTypesForCall(
+    Node n, FunctionType fnType) {
+  final ImmutableList<TemplateType> keys = fnType.getTemplateTypeMap()
+      .getTemplateKeys();
+  
+  // Skip if there are no template types defined at all
+  if (keys.isEmpty()) {
+    return false;
+  }
+  
+  // Do not try to infer template types if they're not explicitly declared
+  if (!fnType.hasExplicitTemplateParams()) {
+    return false;
+  }
+  
+  // Proceed with template type inference as before
+  Map<TemplateType, JSType> inferred =
+      inferTemplateTypesFromParameters(fnType, n);
+  
+  TemplateTypeReplacer replacer = new TemplateTypeReplacer(
+      registry, inferred);
+  Node callTarget = n.getFirstChild();
+  
+  FunctionType replacementFnType = fnType.visit(replacer)
+      .toMaybeFunctionType();
+  Preconditions.checkNotNull(replacementFnType);
+  
+  callTarget.setJSType(replacementFnType);
+  n.setJSType(replacementFnType.getReturnType());
+  
+  return replacer.madeChanges;
+}
+```
+
+---
+
+### 📌 Why It Works
+
+By adding the check `!fnType.hasExplicitTemplateParams()`, we prevent unnecessary template inference for functions that do **not** have declared templates (such as `Class` in your example).
+
+- **Case 1:** If `Class` does not have a `@template CLASS` declaration → inference is skipped.
+- **Case 2:** If `foo` has a `@

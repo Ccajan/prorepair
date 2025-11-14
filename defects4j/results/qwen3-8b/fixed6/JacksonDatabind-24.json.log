@@ -1,0 +1,145 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Configuring an ObjectMapper's DateFormat changes time zone when serialising Joda DateTime
+The serialisation of Joda DateTime instances behaves differently in 2.6.0 vs 2.5.4 when the ObjectMapper's had its DateFormat configured. The behaviour change is illustrated by the following code:
+public static void main(String[] args) throws JsonProcessingException {
+    System.out.println(createObjectMapper()
+            .writeValueAsString(new DateTime(1988, 6, 25, 20, 30, DateTimeZone.UTC)));
+}
+
+private static ObjectMapper createObjectMapper() {
+    ObjectMapper mapper = new ObjectMapper();
+    mapper.registerModule(createJodaModule());
+    mapper.configure(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false);
+    System.out.println(mapper.getSerializationConfig().getTimeZone());
+    mapper.setDateFormat(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss"));
+    System.out.println(mapper.getSerializationConfig().getTimeZone());
+    return mapper;
+}
+
+private static SimpleModule createJodaModule() {
+    SimpleModule module = new SimpleModule();
+    module.addSerializer(DateTime.class, new DateTimeSerializer(
+            new JacksonJodaDateFormat(DateTimeFormat.forPattern("yyyy-MM-dd HH:mm:ss")
+                    .withZoneUTC())));
+        return module;
+    }
+When run with Jackson 2.5.4 the output is:
+sun.util.calendar.ZoneInfo[id="GMT",offset=0,dstSavings=0,useDaylight=false,transitions=0,lastRule=null]
+sun.util.calendar.ZoneInfo[id="GMT",offset=0,dstSavings=0,useDaylight=false,transitions=0,lastRule=null]
+"1988-06-25 20:30:00"
+
+When run with Jackson 2.6.0 the output is:
+sun.util.calendar.ZoneInfo[id="GMT",offset=0,dstSavings=0,useDaylight=false,transitions=0,lastRule=null]
+sun.util.calendar.ZoneInfo[id="Europe/London",offset=0,dstSavings=3600000,useDaylight=true,transitions=242,lastRule=java.util.SimpleTimeZone[id=Europe/London,offset=0,dstSavings=3600000,useDaylight=true,startYear=0,startMode=2,startMonth=2,startDay=-1,startDayOfWeek=1,startTime=3600000,startTimeMode=2,endMode=2,endMonth=9,endDay=-1,endDayOfWeek=1,endTime=3600000,endTimeMode=2]]
+"1988-06-25 21:30:00"
+
+It looks like the fix for #824 is the cause. In 2.6, the call to mapper.setDateFormat causes the ObjectMapper's time zone to be set to the JVM's default time zone. In 2.5.x, calling mapper.setDateFormat has no effect on its time zone.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/cfg/BaseSettings.java):
+```java
+public BaseSettings withDateFormat(DateFormat df) {
+    if (_dateFormat == df) {
+        return this;
+    }
+    TimeZone tz = (df == null) ? _timeZone : df.getTimeZone();
+    return new BaseSettings(_classIntrospector, _annotationIntrospector, _visibilityChecker, _propertyNamingStrategy, _typeFactory,
+            _typeResolverBuilder, df, _handlerInstantiator, _locale,
+            tz, _defaultBase64);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public BaseSettings withDateFormat(DateFormat df) {
+    if (_dateFormat == df) {
+        return this;
+    }
+    // Determine the timezone based on the provided DateFormat
+    TimeZone tz = (df == null) ? _timeZone : df.getTimeZone(); // Use existing timezone if df is not specified
+    return new BaseSettings(_classIntrospector, _annotationIntrospector, _visibilityChecker, _propertyNamingStrategy, _typeFactory,
+            _typeResolverBuilder, df, _handlerInstantiator, _locale,
+            tz, _defaultBase64);
+}
+```
+
+I think there might be some confusion here. Let me explain what's going on.
+
+In the original code, the `withDateFormat` method is creating a new instance of `BaseSettings` by passing the current `_timeZone`. However, when a new `DateFormat` is provided via `setDateFormat`, it should override the timezone used for serialization/deserialization, not just inherit from the current settings.
+
+So I would suggest modifying the code as follows:
+
+```java
+public BaseSettings withDateFormat(DateFormat df) {
+    if (_dateFormat == df) {
+        return this;
+    }
+    // If a new DateFormat is provided, use its timezone instead of the current one
+    TimeZone tz = (df == null) ? null : df.getTimeZone();
+    return new BaseSettings(_classIntrospector, _annotationIntrospector, _visibilityChecker, _propertyNamingStrategy, _typeFactory,
+            _typeResolverBuilder, df, _handlerInstantiator, _locale,
+            tz, _defaultBase64);
+}
+```
+
+This way, when a new `DateFormat` is explicitly set via `setDateFormat`, it will take precedence over any previously configured timezone. This matches the behavior we're seeing in your test case where setting a new date format changes the timezone to the JVM's default.
+
+Let me know if you'd like me to modify other parts of the code or provide additional context about how these settings interact with different date/time types (like Joda DateTime).
+
+Alternatively, if you want to preserve the previous behavior where `setDateFormat` doesn't affect the timezone, we could do something like this:
+
+```java
+public BaseSettings withDateFormat(DateFormat df) {
+    if (_dateFormat == df) {
+        return this;
+    }
+    // Preserve the current timezone unless the new DateFormat specifies one
+    TimeZone tz = (df == null) ? _timeZone : df.getTimeZone();
+    return new BaseSettings(_classIntrospector, _annotationIntrospector, _visibilityChecker, _propertyNamingStrategy, _typeFactory,
+            _typeResolverBuilder, df, _handlerInstantiator, _locale,
+            tz, _defaultBase64);
+}
+```
+
+This version keeps the old behavior where `setDateFormat` doesn't change the timezone unless the provided `DateFormat` explicitly sets one.
+
+What's the intended behavior you want to achieve? Do you want `setDateFormat` to always take precedence over the current timezone, or should it only do so when the new `DateFormat` specifically sets a timezone?
+</think>
+
+To address the issue with the behavior change between **Jackson 2.5.4** and **Jackson 2.6.0** when configuring the `DateFormat` and its interaction with the **timezone**, let’s analyze the problem first and then proceed to the solution.
+
+---
+
+### 🧠 **Understanding the Problem**
+
+In the code snippet provided, using `mapper.setDateFormat(...)` triggers a change in the **timezone** that is used during **JSON serialization** of `DateTime` objects. This happens because:
+
+- **In 2.5.4:** Setting `setDateFormat(...)` does **not** influence the underlying `TimeZone` for serialization; the timezone remains as originally defined.
+- **In 2.6.0:** The internal logic was modified such that **setting the `DateFormat` automatically updates the `TimeZone`** to match the JVM’s default time zone.
+
+The root cause is in the implementation of `BaseSettings.withDateFormat(...)`. It was updated in 2.6.0 to allow the `TimeZone` to be derived from the given `DateFormat` object — which results in potentially unintended changes to the serialization behavior.
+
+---
+
+### ✅ **What's the Correct Behavior?**
+
+There are two possible correct behaviors depending on intent:
+
+#### 🔁 Option A: `setDateFormat()` should **not** affect the timezone
+- Leave the existing timezone unchanged.
+- Only apply the provided `DateFormat` without altering the timezone.
+
+#### 🔁 Option B: `setDateFormat()` should **override** the timezone
+- Update the timezone according to the `DateFormat`.
+- Typically done when the provided `DateFormat` includes explicit timezone information.
+
+The user indicates that the **intended behavior** is **Option A** — they expect `setDateFormat()` to only affect formatting but **not** alter the timezone, consistent with earlier versions.
+
+---
+
+### 🛠️ **Fixing the Code**
+
+Here is the corrected implementation of

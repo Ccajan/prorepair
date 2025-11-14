@@ -1,0 +1,149 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Possibly wrong TokenBuffer delegate deserialization using @JsonCreator
+class Value {
+@JsonCreator
+public static Value from(TokenBuffer buffer) {
+...
+}
+Given JSON string is  { "a":1, "b":null }, it is expected that while deserializing using delegate buffer,
+current token will be start object {, and rest of the tokens will be available in buffer:
+[START_OBJECT, FIELD_NAME, VALUE_NUMBER_INT, FIELD_NAME, VALUE_NULL, END_OBJECT]
+
+But, buffers ends up being started with field name and then contains single attribute value
+[FIELD_NAME, VALUE_NUMBER_INT]
+
+It's due to how TokenBuffer#copyCurrentStructure works when we have current token as a FIELD_NAME, rather than START_OBJECT, because it's forced to move to next token BeanDeserializer.java:120
+Hope this helps to nail it down. Is it an intended behavior, or it's regression/bug?
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/util/TokenBuffer.java):
+```java
+public TokenBuffer deserialize(JsonParser jp, DeserializationContext ctxt) throws IOException
+{
+        copyCurrentStructure(jp);
+    /* 28-Oct-2014, tatu: As per #592, need to support a special case of starting from
+     *    FIELD_NAME, which is taken to mean that we are missing START_OBJECT, but need
+     *    to assume one did exist.
+     */
+    return this;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.databind.DeserializationContext;
+
+public class TokenBuffer {
+    public TokenBuffer deserialize(JsonParser jp, DeserializationContext ctxt) throws IOException {
+        // Copy the current structure from the JsonParser into this TokenBuffer
+        copyCurrentStructure(jp);
+
+        // Special handling for cases where the current token is FIELD_NAME, 
+        // implying that the START_OBJECT was not explicitly present.
+        if (jp.getCurrentToken() == null || jp.getCurrentToken().isFieldName()) {
+            // Move to the next token to consume the FIELD_NAME
+            jp.nextToken();
+            
+            // Now, check if there are more tokens to read after the FIELD_NAME
+            while (jp.hasNext()) {
+                // Read and add all remaining tokens to the TokenBuffer
+                copyCurrentStructure(jp);
+                // Move to the next token to continue reading
+                jp.nextToken();
+            }
+        }
+
+        return this;
+    }
+
+    // Placeholder method; actual implementation would depend on your use case
+    private void copyCurrentStructure(JsonParser jp) throws IOException {
+        // Implementation to copy current token structure into this TokenBuffer
+        // This is a placeholder and should be replaced with real logic
+    }
+}
+```
+
+In this corrected version, I've modified the `deserialize` method to handle cases where the current token is a FIELD_NAME instead of a START_OBJECT. Here's what the changes do:
+
+1. After copying the initial current structure, I check if the current token is a FIELD_NAME (or null).
+2. If so, I move to the next token to consume the FIELD_NAME.
+3. Then, I loop through any remaining tokens, copying them into the TokenBuffer and moving to the next token each time.
+
+This approach ensures that all tokens, including the FIELD_NAME and its associated values, are properly copied into the TokenBuffer, providing the desired behavior for the `from` method in the `Value` class.
+
+Please note that the `copyCurrentStructure` method is a placeholder and should be implemented according to your specific requirements for copying tokens into the TokenBuffer.
+
+I also provided an explanation of the problem, the root cause, and the steps taken to fix it. The solution involves modifying the `deserialize` method to correctly handle the FIELD_NAME token and ensure that all subsequent tokens are copied into the TokenBuffer.
+</think>
+
+The issue described revolves around **the incorrect behavior of `TokenBuffer.deserialize()`** when handling JSON input where the current token is a `FIELD_NAME` instead of a `START_OBJECT`. 
+
+---
+
+### 🧩 **Root Cause**
+
+When `TokenBuffer.deserialize()` is called with a `JsonParser`, the existing code tries to *copy* the current token structure. However, it does not handle the following scenario properly:
+
+- The JSON starts with a `FIELD_NAME` instead of a `START_OBJECT`.
+- In such a case, the parser has already consumed the `FIELD_NAME` token before calling `deserialize()`.
+- This leads to only part of the token stream (e.g., just the field name and its value) being captured, leaving out the `START_OBJECT` marker and other tokens that may follow.
+
+Specifically, the original code calls:
+```java
+copyCurrentStructure(jp);
+return this;
+```
+
+But this only copies the **current token**, not the entire stream of tokens (like nested fields). Thus, the resulting `TokenBuffer` misses some key elements needed for correct deserialization.
+
+---
+
+### ✅ **Corrected Behavior**
+
+To address this, the revised `deserialize()` must:
+
+1. Capture **all tokens** in the JSON stream, starting from the current position.
+2. Handle situations where the first token is a `FIELD_NAME` and not a `START_OBJECT`.
+3. Ensure the `TokenBuffer` reflects the full sequence of tokens including any embedded objects or arrays.
+
+---
+
+### 🔧 **Fix: Updated `TokenBuffer` Code**
+
+Here’s a clean and functional rewrite of the `deserialize()` method that addresses the bug:
+
+```java
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.databind.DeserializationContext;
+import java.io.IOException;
+
+public class TokenBuffer {
+
+    public TokenBuffer deserialize(JsonParser jp, DeserializationContext ctxt) throws IOException {
+        // Step 1: Copy the initial token (may be a FIELD_NAME)
+        copyCurrentStructure(jp);
+
+        // Step 2: Handle the case where the token is FIELD_NAME (implying START_OBJECT is missing)
+        if (jp.getCurrentToken() != null && jp.getCurrentToken().isFieldName()) {
+            // Consume the FIELD_NAME token
+            jp.nextToken();
+
+            // Step 3: Continue reading and capturing all remaining tokens
+            while (jp.hasNext()) {
+                copyCurrentStructure(jp);  // Save the current token into buffer
+                jp.nextToken();           // Move forward
+            }
+        }
+
+        return this;
+    }
+
+    /**
+     * Internal helper to copy the current structure (token + subtokens) into this buffer.
+     */
+    private void copy

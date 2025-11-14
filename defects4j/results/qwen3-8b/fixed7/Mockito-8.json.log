@@ -1,0 +1,140 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# 1.10 regression (StackOverflowError) with interface where generic type has itself as upper bound
+Add this to GenericMetadataSupportTest:
+    interface GenericsSelfReference<T extends GenericsSelfReference<T>> {
+        T self();
+    }
+
+    @Test
+    public void typeVariable_of_self_type() {
+        GenericMetadataSupport genericMetadata = inferFrom(GenericsSelfReference.class).resolveGenericReturnType(firstNamedMethod("self", GenericsSelfReference.class));
+
+        assertThat(genericMetadata.rawType()).isEqualTo(GenericsSelfReference.class);
+    }
+It fails on master and 1.10.8 with this:
+java.lang.StackOverflowError
+    at sun.reflect.generics.reflectiveObjects.TypeVariableImpl.hashCode(TypeVariableImpl.java:201)
+    at java.util.HashMap.hash(HashMap.java:338)
+    at java.util.HashMap.get(HashMap.java:556)
+    at org.mockito.internal.util.reflection.GenericMetadataSupport.getActualTypeArgumentFor(GenericMetadataSupport.java:193)
+    at org.mockito.internal.util.reflection.GenericMetadataSupport.getActualTypeArgumentFor(GenericMetadataSupport.java:196)
+    at org.mockito.internal.util.reflection.GenericMetadataSupport.getActualTypeArgumentFor(GenericMetadataSupport.java:196)
+
+It worked on 1.9.5. May be caused by the changes in ab9e9f3 (cc @bric3).
+(Also note that while the above interface looks strange, it is commonly used for builder hierarchies, where base class methods want to return this with a more specific type.)
+This is an incorrect Java code (src/org/mockito/internal/util/reflection/GenericMetadataSupport.java):
+```java
+protected void registerTypeVariablesOn(Type classType) {
+    if (!(classType instanceof ParameterizedType)) {
+        return;
+    }
+    ParameterizedType parameterizedType = (ParameterizedType) classType;
+    TypeVariable[] typeParameters = ((Class<?>) parameterizedType.getRawType()).getTypeParameters();
+    Type[] actualTypeArguments = parameterizedType.getActualTypeArguments();
+    for (int i = 0; i < actualTypeArguments.length; i++) {
+        TypeVariable typeParameter = typeParameters[i];
+        Type actualTypeArgument = actualTypeArguments[i];
+
+        if (actualTypeArgument instanceof WildcardType) {
+            contextualActualTypeParameters.put(typeParameter, boundsOf((WildcardType) actualTypeArgument));
+        } else {
+            contextualActualTypeParameters.put(typeParameter, actualTypeArgument);
+        }
+        // logger.log("For '" + parameterizedType + "' found type variable : { '" + typeParameter + "(" + System.identityHashCode(typeParameter) + ")" + "' : '" + actualTypeArgument + "(" + System.identityHashCode(typeParameter) + ")" + "' }");
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+<think>
+Okay, let's see what the problem is here. The user is encountering a StackOverflowError when running a test involving a generic interface with self-referential type bounds. The error occurs in Mockito's GenericMetadataSupport class, specifically in the registerTypeVariablesOn method.
+
+First, I need to understand why this code causes a stack overflow. The test case defines an interface GenericsSelfReference<T extends GenericsSelfReference<T>>, which is a common pattern in builders where methods return a more specific type. When Mockito tries to resolve the generic type information for this interface, it ends up in an infinite loop.
+
+Looking at the relevant part of the code: the method registers type variables by iterating over the type parameters and their actual arguments. For each type parameter, it checks if the actual argument is a WildcardType. If so, it processes the bounds. But in the case of self-referential generics, the actualTypeArgument might be the same type as the type parameter, leading to recursion.
+
+In the example, the type parameter T is bounded by GenericsSelfReference<T>, which means the actual type argument for T is GenericsSelfReference<T>. This creates a circular reference. When Mockito tries to process this, it might end up repeatedly adding the same type variable to the map, causing the HashMap to hash collisions and eventually leading to a StackOverflowError due to infinite recursion.
+
+The issue seems to be in how the code handles type variables that refer to themselves. The current approach doesn't check if the type variable is already being processed, leading to infinite loops. 
+
+To fix this, we need to modify the registerTypeVariablesOn method to avoid processing type variables that are already in the process of being resolved. One way to do this is to track visited type variables using a Set. Before processing a type variable, check if it's already in the set. If it is, skip it. Otherwise, add it to the set and proceed.
+
+Additionally, when handling the actualTypeArgument, especially when it's a parameterized type, we should recursively process its type variables. However, since the type variable refers to itself, we need to prevent infinite recursion. By keeping track of visited type variables, we can ensure that each type variable is only processed once, thus avoiding the stack overflow.
+
+So, modifying the code to include a visited set would help break the cycle. Let me adjust the code accordingly. Also, making sure that when we encounter a type variable that's already in the set, we don't process it again. This should prevent the infinite loop and resolve the StackOverflowError.
+</think>
+
+To address the `StackOverflowError` in Mockito's `GenericMetadataSupport` when dealing with **self-referential generic types** (such as those seen in builder patterns), we must fix the logic responsible for resolving type variables.
+
+---
+
+### ✅ Problem Summary
+
+- The interface `GenericsSelfReference<T extends GenericsSelfReference<T>>` introduces a recursive generic constraint.
+- Mockito attempts to deduce the generic type metadata using reflection.
+- In `registerTypeVariablesOn(...)`, the code processes type parameters recursively without checking for cycles or existing entries.
+- This leads to **infinite recursion**, ultimately resulting in a `StackOverflowError`.
+
+---
+
+### 🛠️ Fix Approach
+
+We need to **prevent infinite recursion** during type resolution by:
+
+1. Tracking processed type variables in a `Set`.
+2. Skipping re-processing of already handled type variables.
+3. Properly handling nested type references without looping indefinitely.
+
+Here’s the corrected implementation:
+
+```java
+protected void registerTypeVariablesOn(Type classType) {
+    if (!(classType instanceof ParameterizedType)) {
+        return;
+    }
+
+    ParameterizedType parameterizedType = (ParameterizedType) classType;
+    Class<?> rawType = (Class<?>) parameterizedType.getRawType();
+
+    // Prevent infinite recursion by tracking visited type variables
+    Set<TypeVariable<?>> visited = new HashSet<>();
+    
+    TypeVariable<?>[] typeParameters = rawType.getTypeParameters();
+    Type[] actualTypeArguments = parameterizedType.getActualTypeArguments();
+
+    for (int i = 0; i < actualTypeArguments.length; i++) {
+        TypeVariable<?> typeParameter = typeParameters[i];
+        Type actualTypeArgument = actualTypeArguments[i];
+
+        // Skip if this type variable is already being processed
+        if (visited.contains(typeParameter)) {
+            continue;
+        }
+
+        visited.add(typeParameter);
+
+        if (actualTypeArgument instanceof WildcardType) {
+            contextualActualTypeParameters.put(typeParameter, boundsOf((WildcardType) actualTypeArgument));
+        } else {
+            contextualActualTypeParameters.put(typeParameter, actualTypeArgument);
+        }
+
+        // Handle nested generic types (e.g., List<GenericsSelfReference<T>>)
+        if (actualTypeArgument instanceof ParameterizedType) {
+            registerTypeVariablesOn(actualTypeArgument);
+        }
+    }
+}
+```
+
+---
+
+### 🔍 Explanation
+
+- **Visited Set**: A `HashSet` prevents reprocessing of type variables

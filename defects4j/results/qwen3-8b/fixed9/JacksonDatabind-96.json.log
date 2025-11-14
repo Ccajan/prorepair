@@ -1,0 +1,171 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Implicit constructor property names are not renamed properly with PropertyNamingStrategy
+(note: spin-off from FasterXML/jackson-modules-java8#67)
+Looks like something with linking of creator properties (constructor arguments for annotated/discovered constructor) to "regular" properties does not work when using PropertyNamingStrategy. Apparently this was working better until 2.9.1, but broke with 2.9.2.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/deser/BasicDeserializerFactory.java):
+```java
+protected void _addExplicitAnyCreator(DeserializationContext ctxt,
+        BeanDescription beanDesc, CreatorCollector creators,
+        CreatorCandidate candidate)
+    throws JsonMappingException
+{
+    // Looks like there's bit of magic regarding 1-parameter creators; others simpler:
+    if (1 != candidate.paramCount()) {
+        // Ok: for delegates, we want one and exactly one parameter without
+        // injection AND without name
+        int oneNotInjected = candidate.findOnlyParamWithoutInjection();
+        if (oneNotInjected >= 0) {
+            // getting close; but most not have name
+            if (candidate.paramName(oneNotInjected) == null) {
+                _addExplicitDelegatingCreator(ctxt, beanDesc, creators, candidate);
+                return;
+            }
+        }
+        _addExplicitPropertyCreator(ctxt, beanDesc, creators, candidate);
+        return;
+    }
+    AnnotatedParameter param = candidate.parameter(0);
+    JacksonInject.Value injectId = candidate.injection(0);
+    PropertyName paramName = candidate.explicitParamName(0);
+    BeanPropertyDefinition paramDef = candidate.propertyDef(0);
+
+    // If there's injection or explicit name, should be properties-based
+    boolean useProps = (paramName != null) || (injectId != null);
+    if (!useProps && (paramDef != null)) {
+        // One more thing: if implicit name matches property with a getter
+        // or field, we'll consider it property-based as well
+
+        // 25-May-2018, tatu: as per [databind#2051], looks like we have to get
+        //    not implicit name, but name with possible strategy-based-rename
+          paramName = candidate.findImplicitParamName(0);
+        paramName = candidate.findImplicitParamName(0);
+        useProps = (paramName != null) && paramDef.couldSerialize();
+    }
+    if (useProps) {
+        SettableBeanProperty[] properties = new SettableBeanProperty[] {
+                constructCreatorProperty(ctxt, beanDesc, paramName, 0, param, injectId)
+        };
+        creators.addPropertyCreator(candidate.creator(), true, properties);
+        return;
+    }
+    _handleSingleArgumentCreator(creators, candidate.creator(), true, true);
+
+    // one more thing: sever link to creator property, to avoid possible later
+    // problems with "unresolved" constructor property
+    if (paramDef != null) {
+        ((POJOPropertyBuilder) paramDef).removeConstructors();
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+protected void _addExplicitAnyCreator(DeserializationContext ctxt,
+        BeanDescription beanDesc, CreatorCollector creators,
+        CreatorCandidate candidate)
+    throws JsonMappingException
+{
+    // Looks like there's bit of magic regarding 1-parameter creators; others simpler:
+    if (1 != candidate.paramCount()) {
+        // Ok: for delegates, we want one and exactly one parameter without
+        // injection AND without name
+        int oneNotInjected = candidate.findOnlyParamWithoutInjection();
+        if (oneNotInjected >= 0) {
+            // getting close; but most not have name
+            if (candidate.paramName(oneNotInjected) == null) {
+                _addExplicitDelegatingCreator(ctxt, beanDesc, creators, candidate);
+                return;
+            }
+        }
+        _addExplicitPropertyCreator(ctxt, beanDesc, creators, candidate);
+        return;
+    }
+
+    AnnotatedParameter param = candidate.parameter(0);
+    JacksonInject.Value injectId = candidate.injection(0);
+    PropertyName paramName = candidate.explicitParamName(0);
+    BeanPropertyDefinition paramDef = candidate.propertyDef(0);
+
+    // If there's injection or explicit name, should be properties-based
+    boolean useProps = (paramName != null) || (injectId != null);
+    if (!useProps && (paramDef != null)) {
+        // One more thing: if implicit name matches property with a getter
+        // or field, we'll consider it property-based as well
+
+        // 25-May-2018, tatu: as per [databind#2051], looks like we have to get
+        //    not implicit name, but name with possible strategy-based-rename
+        // Note: Need to ensure that we apply the naming strategy here
+        PropertyName implicitParamName = candidate.findImplicitParamName(0);
+        if (implicitParamName != null) {
+            // Apply the naming strategy to the implicit parameter name
+            implicitParamName = beanDesc.getBean().getClass()
+                    .getAnnotation(PropertyNamingStrategy.class)
+                    ?.apply(implicitParamName);
+        }
+        paramName = implicitParamName;
+        useProps = (paramName != null) && paramDef.couldSerialize();
+    }
+
+    if (useProps) {
+        SettableBeanProperty[] properties = new SettableBeanProperty[] {
+                constructCreatorProperty(ctxt, beanDesc, paramName, 0, param, injectId)
+        };
+        creators.addPropertyCreator(candidate.creator(), true, properties);
+        return;
+    }
+    _handleSingleArgumentCreator(creators, candidate.creator(), true, true);
+
+    // one more thing: sever link to creator property, to avoid possible later
+    // problems with "unresolved" constructor property
+    if (paramDef != null) {
+        ((POJOPropertyBuilder) paramDef).removeConstructors();
+    }
+}
+```
+
+The key fix I made is adding logic to apply the `PropertyNamingStrategy` to the implicit parameter name. This ensures that the parameter name used in constructor binding correctly respects any configured naming strategy (like camelCase to snake_case conversion).
+
+I've added:
+1. A check for the presence of a `PropertyNamingStrategy` annotation on the class
+2. Application of that strategy to the implicitly determined parameter name
+3. Assignment of the transformed name back to `paramName`
+
+This change aligns with the behavior seen before 2.9.2 where the naming strategy was being applied correctly for constructor parameters.
+
+The fix addresses the issue where implicit constructor property names were not being properly renamed according to the configured `PropertyNamingStrategy`. The duplicate call to `findImplicitParamName()` has been removed since we only need to call it once and then apply the naming strategy to the result.
+</think>
+
+The issue described pertains to how Jackson handles implicit constructor parameter names when a `PropertyNamingStrategy` is in effect. Specifically, the problem manifests when trying to map JSON keys to constructor parameters — especially when the naming strategy requires transformations such as from camelCase to snake_case.
+
+---
+
+### Root Cause:
+
+In versions prior to 2.9.2, the handling of implicit parameter names respected the `PropertyNamingStrategy`. However, after version 2.9.2, it appears that the transformation of these parameter names did not occur, which disrupted the mapping between JSON fields and constructor parameters.
+
+In particular, the original implementation attempted to compute an implicit parameter name, but it didn't apply the renaming strategy correctly.
+
+---
+
+### Fix Summary:
+
+To resolve the mismatch, we must explicitly ensure that the **implicit parameter names** undergo the same renaming as other properties. This involves:
+
+1. Retrieving the class-level `PropertyNamingStrategy`.
+2. Applying the strategy to the computed implicit parameter name.
+3. Using the renamed value in subsequent processing steps.
+
+---
+
+### Solution Code:
+
+Here's the corrected method, integrating the necessary renaming logic:
+
+```java
+protected void _addExplicitAnyCreator(DeserializationContext ctxt,
+        BeanDescription bean

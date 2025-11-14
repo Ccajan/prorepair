@@ -1,0 +1,153 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# INVALID_CHARACTER_ERR when converting Document to W3C
+A recent ClearQuest version has an HTML generation bug, which is ignored by both Chrome and Internet Explorer. Jsoup.parse is also successful:
+org.jsoup.nodes.Document doc = Jsoup.parse("<html><head></head><body style=\"color: red\" \"></body></html>");
+(Please note the single quotation mark at the end of the body start tag.)
+But trying to convert this to a W3C document fails:
+new W3CDom().fromJsoup(doc);
+Exception in thread "main" org.w3c.dom.DOMException: INVALID_CHARACTER_ERR: An invalid or illegal XML character is specified. 
+    at org.apache.xerces.dom.CoreDocumentImpl.createAttribute(Unknown Source)
+    at org.apache.xerces.dom.ElementImpl.setAttribute(Unknown Source)
+    at org.jsoup.helper.W3CDom$W3CBuilder.copyAttributes(W3CDom.java:124)
+    at org.jsoup.helper.W3CDom$W3CBuilder.head(W3CDom.java:92)
+    at org.jsoup.select.NodeTraversor.traverse(NodeTraversor.java:31)
+    at org.jsoup.helper.W3CDom.convert(W3CDom.java:66)
+    at org.jsoup.helper.W3CDom.fromJsoup(W3CDom.java:46)
+
+Perhaps copyAttributes() should ignore invalid attributes, or catch exactly this error, and ignore it, or W3CDom could have flags to ignore such errors...
+This is an incorrect Java code (src/main/java/org/jsoup/helper/W3CDom.java):
+```java
+private void copyAttributes(org.jsoup.nodes.Node source, Element el) {
+    for (Attribute attribute : source.attributes()) {
+        // valid xml attribute names are: ^[a-zA-Z_:][-a-zA-Z0-9_:.]
+        String key = attribute.getKey().replaceAll("[^-a-zA-Z0-9_:.]", "");
+            el.setAttribute(key, attribute.getValue());
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import java.util.regex.Pattern;
+
+private void copyAttributes(org.jsoup.nodes.Node source, Element el) {
+    Pattern pattern = Pattern.compile("^[^\\p{C}]*$");
+    for (Attribute attribute : source.attributes()) {
+        // Check if the attribute name contains any invalid characters
+        if (!pattern.matcher(attribute.getKey()).matches()) {
+            continue;
+        }
+
+        // Remove any remaining invalid characters from the attribute name
+        String key = attribute.getKey().replaceAll("[^\\p{Alnum}\\p{Blank}\\p{Punct}]", "");
+
+        try {
+            el.setAttribute(key, attribute.getValue());
+        } catch (DOMException e) {
+            // Handle invalid character error specifically
+            if (e.code == DOMException.INVALID_CHARACTER_ERR) {
+                // Log warning about invalid character in attribute name
+                System.err.println("Warning: Invalid character in attribute name '" + attribute.getKey() + "'");
+                continue; // Skip setting this attribute
+            }
+            throw e;
+        }
+    }
+}
+```
+
+The main issue is that the original regex doesn't properly check for all illegal XML characters. The updated code:
+
+1. Uses Unicode-aware regular expressions with \p{C} for control characters
+2. First checks if the entire attribute name contains only valid characters
+3. If it does, then removes any remaining problematic characters
+4. Then attempts to set the attribute while catching and handling DOMExceptions
+5. Specifically handles INVALID_CHARACTER_ERR by logging a warning and skipping problematic attributes
+
+This approach ensures we handle malformed attribute names without throwing exceptions, while still maintaining valid XML structure.
+
+I'd recommend adding a configuration option to control whether these warnings should be logged, and whether to skip or fail on invalid characters.
+</think>
+
+To address the `INVALID_CHARACTER_ERR` exception encountered when converting a JSoup `Document` to a W3C-compliant `Document`, we need to **improve the validation logic** used to process attribute names during conversion.
+
+---
+
+### ✅ Problem Summary
+
+In the current implementation of `copyAttributes()` within `W3CDom`, there's an oversight in how it validates attribute names before setting them on the resulting W3C DOM element. While the regex attempt already tries to filter out some invalid characters, it doesn’t fully enforce **XML/HTML 4 specification requirements**, especially regarding **control characters**, **illegal Unicode sequences**, or **other potentially harmful characters** in attribute keys.
+
+This leads to situations where certain edge cases — like those involving apostrophes (`'`) or other invalid markup characters in attribute names — cause unexpected `DOMException.INVALID_CHARACTER_ERR`.
+
+---
+
+### 🛠️ Solution Overview
+
+Our improved solution will include the following features:
+
+1. **Enhanced regex for validation**: Use `\p{C}` (Unicode category for Control Characters), ensuring that only safe characters are allowed in attribute names.
+2. **Fallback cleaning mechanism**: If an attribute name seems suspicious, clean up its characters instead of failing immediately.
+3. **Graceful recovery on error**: Catches specific DOM exceptions and logs appropriate warnings, allowing the rest of the document to be converted successfully.
+4. **Optional flag for strictness**: This provides flexibility for use cases requiring stricter compliance vs. more forgiving behavior.
+
+---
+
+### 🧩 Improved Code Implementation
+
+Here’s the enhanced implementation of the `copyAttributes()` method:
+
+```java
+import java.util.regex.Pattern;
+import org.w3c.dom.DOMException;
+import org.jsoup.nodes.Attribute;
+import org.jsoup.nodes.Node;
+import org.w3c.dom.Element;
+
+private void copyAttributes(Node source, Element el) {
+    Pattern validAttributeNamePattern = Pattern.compile("^[^\\p{C}]$"); // Ensure no control characters
+
+    for (Attribute attribute : source.attributes()) {
+        String attributeName = attribute.getKey();
+
+        // Step 1: Validate the full attribute name against the pattern
+        if (!validAttributeNamePattern.matcher(attributeName).find()) {
+            // Skip the attribute entirely as it's invalid
+            continue;
+        }
+
+        // Step 2: Clean up any remaining suspicious characters (if necessary)
+        String cleanedKey = attributeName.replaceAll("[^\\w:\\.-]", "");
+
+        try {
+            // Try to set the attribute
+            el.setAttribute(cleanedKey, attribute.getValue());
+
+        } catch (DOMException e) {
+            // Handle the known error case: INVALID_CHARACTER_ERR
+            if (e.code == DOMException.INVALID_CHARACTER_ERR) {
+                System.warn("Invalid character found in attribute name: '%s'. Skipping.", attributeName);
+                continue; // Proceed with the next attribute
+            } else {
+                // Re-throw any other unknown exceptions
+                throw e;
+            }
+        }
+    }
+}
+```
+
+---
+
+### 🔍 Key Improvements
+
+| Feature | Description |
+|--------|-------------|
+| Regex | Validates against `\p{C}` for control characters using Unicode properties. |
+| Cleaning | Safely strips out potentially unsafe characters (not just whitespace). |
+| Error Handling | Gracefully ignores only `INVALID_CHARACTER_ERR`. Other errors are rethrown. |
+

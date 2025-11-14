@@ -1,0 +1,128 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Problem with polymorphic types, losing properties from base type(s)
+(background, see: dropwizard/dropwizard#1449)
+Looks like sub-type resolution may be broken for one particular case: that of using defaultImpl. If so, appears like properties from super-types are not properly resolved; guessing this could be follow-up item for #1083 (even sooner than I thought...).
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/type/SimpleType.java):
+```java
+protected JavaType _narrow(Class<?> subclass)
+{
+    if (_class == subclass) {
+        return this;
+    }
+    // Should we check that there is a sub-class relationship?
+    // 15-Jan-2016, tatu: Almost yes, but there are some complications with
+    //    placeholder values (`Void`, `NoClass`), so can not quite do yet.
+    // TODO: fix in 2.8
+        /*
+        throw new IllegalArgumentException("Class "+subclass.getName()+" not sub-type of "
+                +_class.getName());
+                */
+        return new SimpleType(subclass, _bindings, this, _superInterfaces,
+                _valueHandler, _typeHandler, _asStatic);
+    // Otherwise, stitch together the hierarchy. First, super-class
+    // if not found, try a super-interface
+    // should not get here but...
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+protected JavaType _narrow(Class<?> subclass)
+{
+    if (_class == subclass) {
+        return this;
+    }
+    // Check if subclass is actually a subtype of our class
+    if (!isSubType(subclass, _class)) {
+        throw new IllegalArgumentException(String.format(
+            "Class %s is not a subtype of %s", 
+            subclass.getName(), _class.getName()
+        ));
+    }
+
+    // Create a new SimpleType instance with the subclass
+    return new SimpleType(subclass, _bindings, this, _superInterfaces,
+                         _valueHandler, _typeHandler, _asStatic);
+}
+
+// Helper method to check if a class is a subclass of another class
+private boolean isSubType(Class<?> candidate, Class<?> superClass) {
+    // Handle null cases
+    if (candidate == null || superClass == null) {
+        return false;
+    }
+
+    // Check direct inheritance
+    if (superClass.isAssignableFrom(candidate)) {
+        return true;
+    }
+
+    // Check interfaces (if superClass is an interface)
+    if (superClass.isInterface()) {
+        // Check if candidate implements the interface directly
+        if (candidate.isAssignableFrom(superClass)) {
+            return true;
+        }
+        
+        // Check all implemented interfaces recursively
+        for (Class<?> intf : candidate.getInterfaces()) {
+            if (isSubType(intf, superClass)) {
+                return true;
+            }
+        }
+    }
+
+    // Check superclass chain
+    Class<?> current = candidate.getSuperclass();
+    while (current != null) {
+        if (current == superClass) {
+            return true;
+        }
+        current = current.getSuperclass();
+    }
+
+    return false;
+}
+```
+
+Okay, let me look at the problem described here. The user mentioned an issue with polymorphic types where properties from base types aren't being properly resolved when using defaultImpl. They provided a snippet from SimpleType.java that seems to have an error.
+
+Looking at the original code, the `_narrow` method checks if the class is equal to the subclass and returns this if so. Then it creates a new SimpleType instance without checking if subclass is indeed a subtype. This could lead to situations where the subclass isn't actually a valid subtype, causing issues with type resolution.
+
+The main issue here is that the current implementation doesn't verify whether the subclass is actually a subtype of the current class. The comment suggests that there's a TODO to add a check, which was postponed due to complications with placeholder values. But the user is pointing out that this might be the root cause of their problem.
+
+So the proposed solution includes adding a check to ensure that the subclass is indeed a subtype of the current class. The helper method `isSubType` is introduced to handle this. It first checks direct inheritance using `isAssignableFrom`, then handles interfaces and superclass chains recursively.
+
+Wait, but in the original code, they mention handling placeholders like Void and NoClass. Those are special cases, maybe because they're used as dummy types. So the check shouldn't fail on those. However, the current approach does check for isAssignableFrom, which would correctly identify these cases since Void is a subclass of Object, and NoClass might be designed similarly.
+
+I need to make sure that the `isSubType` method correctly handles all possible scenarios, including nested classes and generic types. Also, considering that in Java, `isAssignableFrom` works for both classes and interfaces, so that part is covered.
+
+Another thing to note is that the original code has a commented-out line that throws an exception when the subclass isn't a subtype. That was likely a temporary measure. By implementing the check in the modified code, we're ensuring that only valid subtypes are processed, preventing potential type errors downstream.
+
+Testing this change would involve creating various test cases where subclasses are correctly and incorrectly specified, ensuring that the method behaves as expected. It's also important to consider performance implications, especially since the method might be called frequently during serialization/deserialization processes.
+
+In summary, the key fix is adding a proper subtype check to prevent invalid type narrowing operations, which should resolve the issue where properties from base types are lost due to incorrect subtype relationships.
+</think>
+
+To address the issue in the `SimpleType._narrow()` method, the core problem lies in **incorrectly assuming** that any `Class<?>` passed as `subclass` is a valid subtype. Without proper validation, this leads to improper type resolution and loss of polymorphic behavior, particularly affecting inherited property handling in complex type hierarchies.
+
+---
+
+### ✅ Problem Summary
+
+- The current implementation fails to **validate** if the given `subclass` is truly a *subtype* of the current class.
+- This results in:
+  - Incorrect creation of `JavaType` objects.
+  - Loss of polymorphic type information (especially from superclasses/interfaces).
+  - Potential runtime exceptions or inconsistent behaviors in deserialization/serialization pipelines.
+
+---
+
+### 🔧 Proposed Fix
+
+We introduce a robust `isSubType` helper method to validate the subtyping relationship,

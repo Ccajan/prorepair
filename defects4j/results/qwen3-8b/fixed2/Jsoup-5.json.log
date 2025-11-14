@@ -1,0 +1,184 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# StringIndexOutOfBoundsException when testing whether String content is valid HTML
+If I try to parse a tag with an equals sign (an empty attribute) but without any single or double quotes around an attribute value, then I get a StringIndexOutOfBoundsException.  The stack trace is pasted below.
+An example String would be "<a =a"
+The following JUnit test case should not throw a StringIndexOutOfBoundsException:
+import static org.junit.Assert.assertTrue;
+import org.jsoup.Jsoup;
+import org.jsoup.safety.Whitelist;
+import org.junit.Test;
+public class BadAttributeTest {
+@test
+public void aTagWithABadAttributeIsValid() throws Exception {
+assertTrue(Jsoup.isValid("<a =a", Whitelist.relaxed()));
+}
+}
+java.lang.StringIndexOutOfBoundsException: String index out of range: 13
+at java.lang.String.charAt(String.java:686)
+at org.jsoup.parser.TokenQueue.consume(TokenQueue.java:130)
+at org.jsoup.parser.Parser.parseAttribute(Parser.java:207)
+at org.jsoup.parser.Parser.parseStartTag(Parser.java:142)
+at org.jsoup.parser.Parser.parse(Parser.java:91)
+at org.jsoup.parser.Parser.parseBodyFragment(Parser.java:64)
+at org.jsoup.Jsoup.parseBodyFragment(Jsoup.java:99)
+at org.jsoup.Jsoup.isValid(Jsoup.java:155)
+This is an incorrect Java code (src/main/java/org/jsoup/parser/Parser.java):
+```java
+private Attribute parseAttribute() {
+    tq.consumeWhitespace();
+    String key = tq.consumeAttributeKey();
+    String value = "";
+    tq.consumeWhitespace();
+    if (tq.matchChomp("=")) {
+        tq.consumeWhitespace();
+
+        if (tq.matchChomp(SQ)) {
+            value = tq.chompTo(SQ);
+        } else if (tq.matchChomp(DQ)) {
+            value = tq.chompTo(DQ);
+        } else {
+            StringBuilder valueAccum = new StringBuilder();
+            // no ' or " to look for, so scan to end tag or space (or end of stream)
+            while (!tq.matchesAny("<", "/>", ">") && !tq.matchesWhitespace() && !tq.isEmpty()) {
+                valueAccum.append(tq.consume());
+            }
+            value = valueAccum.toString();
+        }
+        tq.consumeWhitespace();
+    }
+    if (key.length() != 0)
+        return Attribute.createFromEncoded(key, value);
+    else {
+        tq.consume();
+            
+        return null;
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+I'll fix the issue in the Jsoup parser that's causing a StringIndexOutOfBoundsException when parsing invalid HTML attributes.
+
+The problem occurs when we have an attribute like "=a" without quotes. Let me analyze the relevant code:
+
+In the parseAttribute method, after checking for '=', there's this block:
+if (tq.matchChomp("=")) {
+    ...
+    // Handle unquoted values
+    while (!tq.matchesAny("<", "/>", ">") && !tq.matchesWhitespace() && !tq.isEmpty()) {
+        valueAccum.append(tq.consume());
+    }
+
+The issue arises when there's no '=' at all. For example, in "<a =a", the parser might be trying to process the '=' as part of the attribute value instead of as the attribute name.
+
+Let me modify the code to handle this correctly:
+
+1. First, check if we're actually seeing an '=' after the attribute key
+2. If we are, then proceed to parse the value
+3. If not, treat it as an empty attribute (like <a=a)
+
+Here's my suggested fix:
+
+```java
+private Attribute parseAttribute() {
+    tq.consumeWhitespace();
+    String key = tq.consumeAttributeKey();
+    String value = "";
+
+    tq.consumeWhitespace();
+
+    // Check if we have an '=' character
+    boolean hasValue = false;
+    if (tq.matchChomp("=")) {
+        hasValue = true;
+
+        tq.consumeWhitespace();
+
+        if (tq.matchChomp(SQ)) {
+            value = tq.chompTo(SQ);
+        } else if (tq.matchChomp(DQ)) {
+            value = tq.chompTo(DQ);
+        } else {
+            StringBuilder valueAccum = new StringBuilder();
+            // Scan until end tag, whitespace, or end of stream
+            while (!tq.matchesAny("<", "/>", ">") && !tq.matchesWhitespace() && !tq.isEmpty()) {
+                valueAccum.append(tq.consume());
+            }
+            value = valueAccum.toString();
+        }
+        tq.consumeWhitespace();
+    }
+
+    if (key.length() != 0) {
+        return Attribute.createFromEncoded(key, value);
+    } else {
+        // This handles cases like <a=a where the key is empty (but the attribute exists)
+        // We need to consume the '=' and the value
+        if (hasValue) {
+            // Consume the rest of the value
+            while (!tq.matchesAny("<", "/>", ">") && !tq.matchesWhitespace() && !tq.isEmpty()) {
+                tq.consume();
+            }
+        }
+        return null;
+    }
+}
+```
+
+This change will:
+- Add a flag to track whether we've seen an '='
+- In the case where the key is empty but we saw an '=', consume the remaining characters to avoid index errors
+- Maintain the correct handling of quoted vs unquoted values
+
+The error occurred because the original code wasn't properly handling the case where an attribute was present but didn't have proper syntax (like <a=a), leading to an invalid state in the tokenizer that caused the StringIndexOutOfBoundsException.
+
+For your specific test case "<a =a", the modified code will now correctly interpret this as having an empty attribute value, rather than attempting to access an invalid string index.
+</think>
+
+To resolve the `StringIndexOutOfBoundsException` in the Jsoup parser when processing invalid HTML such as `<a =a`, we need to carefully handle edge cases where attribute keys may be empty but still contain values.
+
+---
+
+### 📌 Problem Summary
+
+When encountering malformed HTML like `<a =a`, Jsoup tries to process it but fails due to improper token handling. Specifically, the issue lies in how the tokenizer (`TokenQueue`) consumes and validates attribute values—especially when the attribute lacks surrounding quotes and contains an equal sign but no actual value.
+
+The root cause is that the current logic doesn’t robustly distinguish between cases where the key is empty (as in `<a=a`) and those with expected attributes, leading to invalid indexing in strings during consumption.
+
+---
+
+### ✅ Solution
+
+Here’s the corrected version of the `parseAttribute()` function:
+
+```java
+private Attribute parseAttribute() {
+    tq.consumeWhitespace();
+    String key = tq.consumeAttributeKey();
+    String value = "";
+    boolean hasValue = false;
+
+    tq.consumeWhitespace();
+
+    // Check for '=' to denote an attribute value
+    if (tq.matchChomp("=")) {
+        hasValue = true;
+        tq.consumeWhitespace();
+
+        if (tq.matchChomp(SQ)) {
+            value = tq.chompTo(SQ);
+        } else if (tq.matchChomp(DQ)) {
+            value = tq.chompTo(DQ);
+        } else {
+            // Unquoted value, read until non-whitespace or closing tag
+            StringBuilder valueAccum = new StringBuilder();
+            while (!tq.matchesAny("<", "/>", ">") && 
+                   !tq.matchesWhitespace() && 
+                   !tq.isEmpty()) {
+                valueAccum.append(t

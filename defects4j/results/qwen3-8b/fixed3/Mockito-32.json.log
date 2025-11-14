@@ -1,0 +1,171 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Mockito can't create mock on public class that extends package-private class
+I created simple project to demonstrate this:
+https://github.com/astafev/mockito-package-private-class/
+
+Please take a look. Even if it can't be implemented, I think that mockito should throw some normal exception at time of creation.
+In my variant on first creation it returns wrong-working mock (invokes real method instead of stubbed). On second creation throws exception that doesn't really connected with problem.
+
+Everything works fine if you mock package-private parent.
+
+This is an incorrect Java code (src/org/mockito/internal/configuration/SpyAnnotationEngine.java):
+```java
+@SuppressWarnings("deprecation")
+    public void process(Class<?> context, Object testClass) {
+        Field[] fields = context.getDeclaredFields();
+        for (Field field : fields) {
+            if (field.isAnnotationPresent(Spy.class)) {
+                assertNoAnnotations(Spy.class, field, Mock.class, org.mockito.MockitoAnnotations.Mock.class, Captor.class);
+                boolean wasAccessible = field.isAccessible();
+                field.setAccessible(true);
+                try {
+                    Object instance = field.get(testClass);
+                    if (instance == null) {
+                        throw new MockitoException("Cannot create a @Spy for '" + field.getName() + "' field because the *instance* is missing\n" +
+                        		  "The instance must be created *before* initMocks();\n" +
+                                  "Example of correct usage of @Spy:\n" +
+                            	  "   @Spy List mock = new LinkedList();\n" +
+                            	  "   //also, don't forget about MockitoAnnotations.initMocks();");
+
+                    }
+                    if (new MockUtil().isMock(instance)) { 
+                        // instance has been spied earlier
+                        Mockito.reset(instance);
+                    } else {
+                        field.set(testClass, Mockito.spy(instance));
+                    }
+                } catch (IllegalAccessException e) {
+                    throw new MockitoException("Problems initiating spied field " + field.getName(), e);
+                } finally {
+                    field.setAccessible(wasAccessible);
+                }
+            }
+        }
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+Your issue highlights a known limitation in **Mockito** where it fails gracefully when trying to create a `@Spy` or `@Mock` on a **public class that inherits from a package-private class**, especially when there's no constructor available to instantiate the subclass. This results in subtle and hard-to-diagnose behaviors like invoking actual methods instead of mocked/stubbed ones or throwing misleading exceptions.
+
+---
+
+## ✅ Summary of the Problem
+
+- Mockito tries to **instantiate** an object using its default constructor.
+- If that constructor doesn’t exist, or the superclass is **package-private**, then the instantiation will fail silently.
+- The current logic in `SpyAnnotationEngine.java` doesn’t properly handle such cases, which causes:
+
+  - Incorrect behavior: real methods are called.
+  - Misleading exceptions: not directly related to the root cause.
+  
+---
+
+## 🛠️ Proposed Fix for `SpyAnnotationEngine.java`
+
+Here’s how we can improve the logic in `process()` to **better detect and report issues** during `@Spy` creation:
+
+### 🔧 Fixed Version of `process` Method
+
+```java
+@SuppressWarnings("deprecation")
+public void process(Class<?> context, Object testClass) {
+    Field[] fields = context.getDeclaredFields();
+    for (Field field : fields) {
+        if (field.isAnnotationPresent(Spy.class)) {
+            assertNoAnnotations(Spy.class, field, Mock.class, org.mockito.MockitoAnnotations.Mock.class, Captor.class);
+
+            boolean wasAccessible = field.isAccessible();
+            field.setAccessible(true);
+            try {
+                Object instance = field.get(testClass);
+                
+                if (instance == null) {
+                    throw new MockitoException(
+                        String.format(
+                            "Cannot create a @Spy for '%s' field because the instance is missing.\n" +
+                            "The instance must be created before calling initMocks();.\n" +
+                            "Example of correct usage: @Spy List mock = new LinkedList();"
+                        ),
+                        field.getName()
+                    );
+                }
+
+                if (new MockUtil().isMock(instance)) {
+                    // Instance has been spied earlier
+                    Mockito.reset(instance);
+                } else {
+                    // Try to spy the instance. If this fails, throw meaningful error
+                    field.set(testClass, Mockito.spy(instance));
+                }
+            } catch (IllegalAccessException | IllegalArgumentException e) {
+                // Handle specific exceptions here
+                String message = String.format(
+                    "Failed to initialize @Spy for '%s'. Reason: %s",
+                    field.getName(),
+                    e.getMessage()
+                );
+                throw new MockitoException(message, e);
+            } catch (NoSuchMethodException e) {
+                // This occurs when the subclass lacks a constructor
+                String message = String.format(
+                    "Failed to initialize @Spy for '%s'. No accessible constructor found.",
+                    field.getName()
+                );
+                throw new MockitoException(message, e);
+            } finally {
+                field.setAccessible(wasAccessible);
+            }
+        }
+    }
+}
+```
+
+---
+
+## ✅ Key Improvements
+
+1. **More Specific Exception Handling**
+   - Added checks for `NoSuchMethodException` — this usually happens when there is no accessible constructor for the target class.
+   - Added better `IllegalArgumentException` handling for cases when objects cannot be instantiated due to lack of appropriate constructors.
+
+2. **Improved Error Messages**
+   - Clearer messages explain what went wrong, including common pitfalls like missing constructor.
+   - More context is provided to help users understand why their setup failed.
+
+3. **Better Flow Control**
+   - The code now handles both successful and failure paths more cleanly, providing better debugging support.
+
+---
+
+## 🔍 What About Package-Private Superclasses?
+
+If your class extends a **package-private** class and is **public**, you may still run into issues when trying to create mocks/spies via reflection, as the JVM only allows access through the same package or via public accessors.
+
+### ✅ Workaround:
+Make sure either:
+
+1. The superclass is **public**, or
+2. Your class is in the **same package** as the superclass.
+3. Or provide an explicit **constructor** to allow Mockito to instantiate the object correctly.
+
+---
+
+## ⚠️ Important Note
+
+> Mockito relies heavily on **reflection** and **default constructors** for mocking/spying. In complex inheritance chains (especially involving package-private types), Mockito may struggle to instantiate classes, leading to undefined behavior unless explicitly handled.
+
+---
+
+## 📌 Conclusion
+
+The key fix involves adding **more precise exception handling**, particularly catching `NoSuchMethodException`, and improving the **error messages** so that developers know exactly what is going wrong when mocking/spying classes that inherit from non-public superclasses.
+
+Would you like me to also provide a **JUnit test case** to validate the fix?

@@ -1,0 +1,191 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# weird object literal invalid property error on unrelated object prototype
+Apologies in advance for the convoluted repro case and the vague summary.
+
+Compile the following code (attached as repro.js) with:
+java -jar build/compiler.jar --compilation_level=ADVANCED_OPTIMIZATIONS --jscomp_error=accessControls --jscomp_error=checkTypes --jscomp_error=checkVars --js repro.js *
+
+/**
+ * @param {{text: string}} opt_data
+ * @return {string}
+ */
+function temp1(opt_data) {
+  return opt_data.text;
+}
+
+/**
+ * @param {{activity: (boolean|number|string|null|Object)}} opt_data
+ * @return {string}
+ */
+function temp2(opt_data) {
+  /** @notypecheck */
+  function __inner() {
+    return temp1(opt_data.activity);
+  }
+  return __inner();
+}
+
+/**
+ * @param {{n: number, text: string, b: boolean}} opt_data
+ * @return {string}
+ */
+function temp3(opt_data) {
+  return 'n: ' + opt_data.n + ', t: ' + opt_data.text + '.';
+}
+
+function callee() {
+  var output = temp3({
+    n: 0,
+    text: 'a string',
+    b: true
+  })
+  alert(output);
+}
+
+callee();
+
+yields:
+repro.js:30: ERROR - actual parameter 1 of temp3 does not match formal parameter
+found   : {b: boolean, n: number, text: (string|undefined)}
+required: {b: boolean, n: number, text: string}
+  var output = temp3({
+
+It seems like temp3 is actually being called with the right type {b: boolean, n: number, text: string} though it seems to think that text is a (string|undefined)
+This seems to happen because of the seemingly unrelated code in functions temp1 and temp2. If I change the name of the text property (as in repro3.js) it works.
+Additionally, if I fix the type of the activity property in the record type of temp2 it works (as in repro2.js)
+
+This comes up in our codebase in some situations where we don't have type info for all the objects being passed into a function. It's always a tricky one to find because it reports an error at a location that looks correct.
+
+* it also fails with SIMPLE_OPTIMIZATIONS
+This is an incorrect Java code (src/com/google/javascript/rhino/jstype/PrototypeObjectType.java):
+```java
+public void matchConstraint(ObjectType constraintObj) {
+  // We only want to match contraints on anonymous types.
+
+  // Handle the case where the constraint object is a record type.
+  //
+  // param constraintObj {{prop: (number|undefined)}}
+  // function f(constraintObj) {}
+  // f({});
+  //
+  // We want to modify the object literal to match the constraint, by
+  // taking any each property on the record and trying to match
+  // properties on this object.
+  if (constraintObj.isRecordType()) {
+    for (String prop : constraintObj.getOwnPropertyNames()) {
+      JSType propType = constraintObj.getPropertyType(prop);
+      if (!isPropertyTypeDeclared(prop)) {
+        JSType typeToInfer = propType;
+        if (!hasProperty(prop)) {
+          typeToInfer = getNativeType(JSTypeNative.VOID_TYPE)
+              .getLeastSupertype(propType);
+        }
+        defineInferredProperty(prop, typeToInfer, null);
+      }
+    }
+  }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public void matchConstraint(ObjectType constraintObj) {
+  // We only want to match constraints on anonymous types.
+
+  // Handle the case where the constraint object is a record type.
+  //
+  // Example:
+  // param constraintObj {{prop: (number|undefined)}}
+  // function f(constraintObj) {}
+  // f({});
+  //
+  // We want to modify the object literal to match the constraint, by
+  // taking each property on the record and trying to match
+  // properties on this object.
+  if (constraintObj.isRecordType()) {
+    for (String prop : constraintObj.getOwnPropertyNames()) {
+      JSType propType = constraintObj.getPropertyType(prop);
+      if (!isPropertyTypeDeclared(prop)) {
+        JSType typeToInfer = propType;
+        // If the current object doesn't have the property, infer as void or union
+        // with constraint type
+        if (!hasProperty(prop)) {
+          // If the current object has no property, then we can infer void or union
+          // of undefined with the constraint type
+          // For example: constraint type is number | undefined, so inferred type would be 
+          // number | undefined
+          // However, when we are inferring for a missing property, we should consider that 
+          // the default value could be undefined (like in JavaScript), hence the union
+          // includes undefined
+          typeToInfer = getNativeType(JSTypeNative.VOID_TYPE).getLeastSupertype(propType);
+        }
+        defineInferredProperty(prop, typeToInfer, null);
+      }
+    }
+  }
+}
+```
+
+The key issue in the original code was how the type inference was handled for missing properties. Let me explain the changes:
+
+1. The core problem was with how the code was handling property inference when a property wasn't present on the object literal.
+
+2. When a property isn't present, the code should consider that the property might have a default value (like `undefined`) which would make its type a union of `undefined` and the constraint type.
+
+3. In the revised code, we check if the current object doesn't have the property (`!hasProperty(prop)`).
+
+4. If it doesn't have the property, we create a new type that is the least supertype of `void` and the constraint type. This effectively creates a union type that includes both `undefined` (from `void`) and the constraint type.
+
+5. This allows the type system to correctly handle cases where a property might be optional or have a default value, preventing incorrect type errors about missing properties when they should be considered optional.
+
+This change should help resolve the type checking issues described in the original question by properly handling the possibility of `undefined` values for missing properties while still respecting the constraint types from other parts of the code.
+</think>
+
+The issue described appears to stem from how the JavaScript compiler handles type inference for properties that may be absent from object literals but are expected based on constraints elsewhere in the code. The problematic behavior manifests as a false positive type mismatch error for properties that are appropriately defined.
+
+Let's address this through careful analysis and solution implementation.
+
+---
+
+### ✅ **Problem Summary**
+
+When a function expects a specific type signature for an object literal argument, and that literal contains an omitted property, the JavaScript type-checking system mistakenly infers that property's type as `(string|undefined)` rather than strictly adhering to the required type.
+
+For instance, in your scenario, the call to `temp3()` passes an object with all required fields (`n`, `text`, `b`). Yet, the type checker incorrectly treats `text` as `(string|undefined)`, even though it's provided directly in the object literal.
+
+---
+
+### 🔍 Root Cause
+
+Looking deeper into the type matching logic, especially within the method:
+
+```java
+public void matchConstraint(ObjectType constraintObj) {
+  ...
+  if (constraintObj.isRecordType()) {
+    for (String prop : constraintObj.getOwnPropertyNames()) {
+      JSType propType = constraintObj.getPropertyType(prop);
+      if (!isPropertyTypeDeclared(prop)) {
+        JSType typeToInfer = propType;
+        if (!hasProperty(prop)) {
+          typeToInfer = getNativeType(JSTypeNative.VOID_TYPE).getLeastSupertype(propType);
+        }
+        defineInferredProperty(prop, typeToInfer, null);
+      }
+    }
+  }
+}
+```
+
+We see that:
+- For properties that **do exist** in the target object literal, the `typeToInfer` is set directly to `propType`.
+- For those that **don't exist**, it defaults to `VOID_TYPE.getLeastSupertype(propType)`.
+
+But this approach fails to account for:
+1. The presence of similar properties in other parts of the program that impose additional constraints (e.g., `temp1`, `temp2`).
+2. That the caller actually provides all the necessary fields (i.e., `text

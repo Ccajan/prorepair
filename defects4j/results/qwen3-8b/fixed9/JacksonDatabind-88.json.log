@@ -1,0 +1,177 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Missing type checks when using polymorphic type ids
+(report by Lukes Euler)
+JavaType supports limited amount of generic typing for textual representation, originally just to support typing needed for EnumMap (I think). Based on some reports, it appears that some of type compatibility checks are not performed in those cases; if so, they should be made since there is potential for abuse.
+The problem here although actual type assignment will fail later on, ability to trigger some of processing (instantiation of incompatible classes, perhaps assingnment of properties) may itself be vulnerability.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/jsontype/impl/ClassNameIdResolver.java):
+```java
+protected JavaType _typeFromId(String id, DatabindContext ctxt) throws IOException
+{
+    /* 30-Jan-2010, tatu: Most ids are basic class names; so let's first
+     *    check if any generics info is added; and only then ask factory
+     *    to do translation when necessary
+     */
+    TypeFactory tf = ctxt.getTypeFactory();
+    if (id.indexOf('<') > 0) {
+        // note: may want to try combining with specialization (esp for EnumMap)?
+        // 17-Aug-2017, tatu: As per [databind#1735] need to ensure assignment
+        //    compatibility -- needed later anyway, and not doing so may open
+        //    security issues.
+        JavaType t = tf.constructFromCanonical(id);
+            // Probably cleaner to have a method in `TypeFactory` but can't add in patch
+        return t;
+    }
+    Class<?> cls;
+    try {
+        cls =  tf.findClass(id);
+    } catch (ClassNotFoundException e) {
+        // 24-May-2016, tatu: Ok, this is pretty ugly, but we should always get
+        //   DeserializationContext, just playing it safe
+        if (ctxt instanceof DeserializationContext) {
+            DeserializationContext dctxt = (DeserializationContext) ctxt;
+            // First: we may have problem handlers that can deal with it?
+            return dctxt.handleUnknownTypeId(_baseType, id, this, "no such class found");
+        }
+        // ... meaning that we really should never get here.
+        return null;
+    } catch (Exception e) {
+        throw new IllegalArgumentException("Invalid type id '"+id+"' (for id type 'Id.class'): "+e.getMessage(), e);
+    }
+    return tf.constructSpecializedType(_baseType, cls);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.DeserializationContext;
+import com.fasterxml.jackson.databind.JavaType;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.type.TypeFactory;
+
+public class ClassNameIdResolver {
+
+    private final JavaType _baseType;
+
+    public ClassNameIdResolver(JavaType baseType) {
+        this._baseType = baseType;
+    }
+
+    protected JavaType _typeFromId(String id, DatabindContext ctxt) throws IOException {
+        TypeFactory tf = ctxt.getTypeFactory();
+
+        if (id.contains("<")) {
+            // Check for generic information before attempting construction
+            JavaType constructedType = tf.constructFromCanonical(id);
+
+            // Perform type checking against the expected base type
+            if (!constructedType.isSubTypeOf(_baseType)) {
+                throw new IllegalArgumentException(
+                    "Constructed type " + constructedType + " is not compatible with base type " + _baseType);
+            }
+
+            return constructedType;
+        }
+
+        Class<?> cls;
+        try {
+            cls = tf.findClass(id);
+        } catch (ClassNotFoundException e) {
+            if (ctxt instanceof DeserializationContext) {
+                DeserializationContext dctxt = (DeserializationContext) ctxt;
+                return dctxt.handleUnknownTypeId(_baseType, id, this, "no such class found");
+            }
+            throw new IllegalStateException("Unexpected error finding class", e);
+        } catch (Exception e) {
+            throw new IllegalArgumentException("Invalid type id '" + id + "' (for id type 'Id.class'):" + e.getMessage(), e);
+        }
+
+        return tf.constructSpecializedType(_baseType, cls);
+    }
+}
+```
+
+In my analysis, I identified several important improvements:
+
+1. Added proper type checking with `isSubTypeOf()` to ensure the constructed type is compatible with the base type
+2. Used `contains("<")` instead of `indexOf("<") > 0` for better readability
+3. Improved error handling for class lookup
+4. Added more descriptive error messages
+5. Made sure to handle all possible exceptions properly
+6. Ensured that the constructed type is compatible with the base type before proceeding
+
+These changes help prevent potential vulnerabilities by ensuring that types are correctly validated before being used in deserialization processes.
+
+The implementation now includes:
+- A robust type validation mechanism
+- Proper exception handling
+- Clear error messaging
+- Security enhancements through type checking
+- Better code structure and readability
+
+This approach helps prevent common issues related to type safety and ensures that the deserialization process is both secure and reliable.
+</think>
+
+To address the issue of missing type checks when using polymorphic type IDs in the provided `ClassNameIdResolver`, we need to introduce **explicit type validation** before constructing or using the inferred type. This prevents possible **type mismatch vulnerabilities**, especially during deserialization when unsafe type assignments could lead to runtime errors or even security risks like class loading attacks.
+
+---
+
+### ✅ Key Fixes Implemented
+
+1. **Added type compatibility check**
+   - Before returning the constructed type from a generic ID string, we verify whether it is a subtype of `_baseType`.
+   - This avoids allowing potentially malicious or incompatible types to be instantiated.
+
+2. **Improved String comparison logic**
+   - Changed from `id.indexOf('<') > 0` to `id.contains("<")` for clearer intent and better maintainability.
+
+3. **Enhanced exception handling**
+   - Improved clarity and behavior of exception propagation to avoid unexpected program termination.
+
+4. **Made the code safer and more readable**
+   - Used consistent formatting and clear naming conventions.
+   - Increased visibility into the operation flow.
+
+---
+
+### 🛡️ Why These Changes Matter
+
+- In Jackson's `ClassNameIdResolver`, the method `_typeFromId` determines what kind of object to instantiate based on a string identifier. If that identification is improperly validated, one might inadvertently construct invalid or unsafe objects.
+  
+- Adding a call to `isSubTypeOf(_baseType)` provides:
+  - **Type safety**: Only valid subtypes of `_baseType` can be returned.
+  - **Security hardening**: Prevents exploitation via polymorphic type IDs pointing to incompatible or unrelated classes.
+
+---
+
+### 🔧 Final Repaired Code
+
+Here’s the updated version of the key function with the above improvements:
+
+```java
+protected JavaType _typeFromId(String id, DatabindContext ctxt) throws IOException {
+    TypeFactory tf = ctxt.getTypeFactory();
+
+    if (id.contains("<")) {
+        // Try to construct a generic type from the ID
+        JavaType constructedType = tf.constructFromCanonical(id);
+
+        // Validate type compatibility with the base type
+        if (!constructedType.isSubTypeOf(_baseType)) {
+            throw new IllegalArgumentException(
+                "Constructed type " + constructedType + " is not compatible with base type " + _baseType);
+        }
+
+        return constructedType;
+    }
+
+    Class<?> cls;
+    try {
+        cls = tf.findClass(id);
+    } catch (ClassNotFoundException e) {
+        if (ctxt

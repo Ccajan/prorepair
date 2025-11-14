@@ -1,0 +1,145 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Calling SevenZFile.read() on empty SevenZArchiveEntry throws IllegalStateException
+I'm pretty sure COMPRESS-340 breaks reading empty archive entries. When calling getNextEntry() and that entry has no content, the code jumps into the first block at line 830 (SevenZFile.class), clearing the deferredBlockStreams. When calling entry.read(...) afterwards an IllegalStateException ("No current 7z entry (call getNextEntry() first).") is thrown. IMHO, there should be another check for entry.getSize() == 0.
+This worked correctly up until 1.10.
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/sevenz/SevenZFile.java):
+```java
+private InputStream getCurrentStream() throws IOException {
+    if (deferredBlockStreams.isEmpty()) {
+        throw new IllegalStateException("No current 7z entry (call getNextEntry() first).");
+    }
+    
+    while (deferredBlockStreams.size() > 1) {
+        // In solid compression mode we need to decompress all leading folder'
+        // streams to get access to an entry. We defer this until really needed
+        // so that entire blocks can be skipped without wasting time for decompression.
+        final InputStream stream = deferredBlockStreams.remove(0);
+        IOUtils.skip(stream, Long.MAX_VALUE);
+        stream.close();
+    }
+
+    return deferredBlockStreams.get(0);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+package org.apache.commons.compress.archivers.sevenz;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.List;
+
+public class SevenZFile {
+
+    private static final int DEFLATE_METHOD = 273;
+    private List<InputStream> deferredBlockStreams;
+
+    public SevenZFile() {
+        this.deferredBlockStreams = new ArrayList<>();
+    }
+
+    // ... other methods ...
+
+    private InputStream getCurrentStream() throws IOException {
+        if (deferredBlockStreams.isEmpty()) {
+            throw new IllegalStateException("No current 7z entry (call getNextEntry() first).");
+        }
+
+        long size = 0L; // Add this line to store the size of the entry
+        
+        while (deferredBlockStreams.size() > 1 || size <= 0) { 
+            InputStream stream = deferredBlockStreams.remove(0); 
+            IOUtils.skip(stream, Long.MAX_VALUE);
+            
+            if (!stream.markSupported()) { 
+                stream = new MarkableWrapperInputStream(stream);
+            }           
+            try {
+                HeaderIterator headerIt = new HeaderIterator(this, stream);
+                EntryHeader eh = null;
+                
+                if(headerIt.hasNext()){
+                    eh = headerIt.next();
+                    size = eh.getDataSize(); // Store the size of the entry
+                }
+            } finally {
+                stream.close();
+            }
+        }
+        
+        return deferredBlockStreams.get(0);
+    }
+}
+
+// Add this utility class to handle marking and resetting of InputStreams
+class MarkableWrapperInputStream extends WrapperInputStream {
+    public MarkableWrapperInputStream(final InputStream inputStream) {
+        super(inputStream);
+    }
+    @Override
+    public void mark(int readlimit) {
+        try {
+            realStream.mark(readlimit);
+        } catch (IOException e) {
+            // Ignore or log error as per requirement
+        }
+    }
+    @Override
+    public void reset() throws IOException {
+        try {
+            realStream.reset();
+        } catch (IOException ex) {
+            throw new IOException("Mark not set", ex);
+        }
+    }
+}
+
+abstract class WrapperInputStream extends InputStream {
+    protected InputStream realStream;
+    public WrapperInputStream(InputStream in) {
+        realStream = in;
+    }
+    public InputStream getRealStream() {
+        return realStream;
+    }
+    public void setRealStream(InputStream realStream) {
+        this.realStream = realStream;
+    }
+    @Override
+    public int available() throws IOException {
+        return realStream.available();
+    }
+    @Override
+    public long skip(long n) throws IOException {
+        return realStream.skip(n);
+    }
+    @Override
+    public synchronized void mark(int readlimit) {
+        realStream.mark(readlimit);
+    }
+    @Override
+    public boolean markSupported() {
+        return true;
+    }
+    @Override
+    public void close() throws IOException {
+        realStream.close();
+    }
+    @Override
+    public int read() throws IOException {
+        return realStream.read();
+    }
+    @Override
+    public int read(byte[] b, int off, int len) throws IOException {
+        return realStream.read(b, off, len);
+    }
+}
+```
+

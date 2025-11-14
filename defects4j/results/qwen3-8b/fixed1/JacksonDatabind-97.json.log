@@ -1,0 +1,139 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Context attributes are not passed/available to custom serializer if object is in POJO
+Below is a test case where I create a custom serializer and use it to serialize an object 1) in a HashMap and 2) in an ObjectNode. In both cases I pass attribute to the serializer like this:
+mapper.writer().withAttribute("myAttr", "Hello!")
+Serializing HashMap works as expected, but during ObjectNode serialization the attribute is null . It seems that in both cases the custom serializer should get access to the passed attribute and so both lines in the output should contain "Hello!"
+Produced output from running testCase.test()
+{"data":{"aStr":"The value is: Hello!"}}
+{"data":{"aStr":"The value is: NULL"}}
+
+Test case:
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializerProvider;
+import com.fasterxml.jackson.databind.annotation.JsonSerialize;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.fasterxml.jackson.databind.ser.std.StdSerializer;
+
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
+
+public class TestCase {
+  public final static ObjectMapper mapper = new ObjectMapper();
+
+  @JsonSerialize(using = TestCase.CustomSer.class)
+  public static class Data {
+    public String aStr;
+  }
+
+  public static class CustomSer extends StdSerializer<Data> {
+    public CustomSer() {
+      super(Data.class);
+    }
+
+    @Override
+    public void serialize(Data value, JsonGenerator gen, SerializerProvider provider) throws IOException {
+      String attrStr = (String) provider.getAttribute("myAttr");
+      gen.writeStartObject();
+      gen.writeObjectField("aStr", "The value is: " + (attrStr == null ? "NULL" : attrStr));
+      gen.writeEndObject();
+    }
+  }
+
+  public static void test() throws IOException {
+    Data data = new Data();
+    data.aStr = "Hello";
+
+    Map<String, Object> mapTest = new HashMap<>();
+    mapTest.put("data", data);
+
+    ObjectNode treeTest = mapper.createObjectNode();
+    treeTest.putPOJO("data", data);
+
+    String mapOut = mapper.writer().withAttribute("myAttr", "Hello!").writeValueAsString(mapTest);
+    System.out.println(mapOut);
+
+    String treeOut = mapper.writer().withAttribute("myAttr", "Hello!").writeValueAsString(treeTest);
+    System.out.println(treeOut);
+  }
+}
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/node/POJONode.java):
+```java
+public final void serialize(JsonGenerator gen, SerializerProvider ctxt) throws IOException
+{
+    if (_value == null) {
+        ctxt.defaultSerializeNull(gen);
+    } else if (_value instanceof JsonSerializable) {
+        ((JsonSerializable) _value).serialize(gen, ctxt);
+    } else {
+        // 25-May-2018, tatu: [databind#1991] do not call via generator but through context;
+        //    this to preserve contextual information
+        gen.writeObject(_value);
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public final void serialize(JsonGenerator gen, SerializerProvider ctxt) throws IOException
+{
+    if (_value == null) {
+        ctxt.defaultSerializeNull(gen);
+    } else if (_value instanceof JsonSerializable) {
+        ((JsonSerializable) _value).serialize(gen, ctxt);
+    } else {
+        // 25-May-2018, taru: [databind#1991] do not call via generator but through context;
+        //    this to preserve contextual information
+        ctxt.findAndRegisterMapper(_value.getClass()).serialize(_value, gen, ctxt);
+    }
+}
+```
+
+Okay, let me try to figure out why the original code isn't working as intended. The user's problem is about custom serializers not receiving attributes when serializing an ObjectNode, but they work fine with a HashMap.
+
+So, looking at their test case, they have a Data class annotated with a custom serializer. When they serialize a HashMap containing Data, the attribute is correctly passed. But when using an ObjectNode with putPOJO, the attribute becomes null.
+
+In the provided code snippet from POJONode.java, the serialize method checks if the value is an instance of JsonSerializable. If it is, it calls the serialize method directly. Otherwise, it uses the generator to write the object.
+
+Wait, the issue here might be that when the value is a POJO (like the Data class), the code is checking if it implements JsonSerializable. If it does, then it calls the serialize method on that object. However, in the user's case, the Data class is being serialized using the custom serializer (CustomSer), which is registered via the @JsonSerialize annotation.
+
+But in the current code, if the value is not a JsonSerializable, it falls back to using the generator. So for a normal POJO, it would use the default serializer, not the custom one. That's probably not the right approach because the custom serializer needs to be used.
+
+Wait, no. Let me think again. The Data class has a custom serializer specified. So when the ObjectMapper is configured, it should use that custom serializer. But in the code from POJONode, when they do putPOJO("data", data), they're putting a Data object into the ObjectNode. Then, when serializing the ObjectNode, the code checks if the value is a JsonSerializable. If it is, it calls its serialize method. But if the Data class doesn't implement JsonSerializable, then it would fall back to writing the object normally.
+
+Wait, but the Data class is a regular POJO, not implementing any special interface. So the code in POJONode would check if it's a JsonSerializable. Since it's not, it proceeds to call gen.writeObject(_value). But that would use the default serializer, which may not be the custom one the user set up.
+
+Ah, right. The problem here is that the POJONode is handling the value, and in some cases, it's not properly triggering the custom serializer. Instead, it's using the default serialization mechanism, which doesn't include the attributes passed via withAttribute().
+
+Looking at the original code:
+
+In the serialize method of POJONode, when the value is not a JsonSerializable, it does gen.writeObject(_value). This method uses the default serializer for the type, which may not be the custom one specified in the Data class. Therefore, the attributes passed via withAttribute() are not getting propagated to the custom serializer.
+
+To fix this, we need to ensure that when a POJO is placed into the ObjectNode, the custom serializer is used, even when the POJO is being written through the ObjectNode's serialize method. 
+
+So, instead of calling gen.writeObject(), which delegates to the default serializer, we should use the SerializerProvider to find the appropriate serializer for the given class, and then call its serialize method. That way, the custom serializer can be triggered, and the attributes passed via withAttribute() will be available.
+
+Therefore, the correct code would replace the line gen.writeObject(_value); with something like:
+
+ctxt.findAndRegisterMapper(_value.getClass()).serialize(_value, gen, ctxt);
+
+This ensures that the proper serializer is found and used, allowing the attributes to be passed correctly.
+
+By making this change, the POJONode's serialize method would trigger the custom serializer for the Data class, and the attributes added via withAttribute() would be accessible in the CustomSer's serialize method. Thus, both the HashMap and ObjectNode serialization would correctly display "Hello!" instead of "NULL".
+</think>
+
+To address the described issue — where custom serializer attributes are not available when serializing an `ObjectNode` despite being correctly applied to a `HashMap` — we must understand how Jackson’s `ObjectNode` handles POJOs during serialization.
+
+---
+
+### 🧠 Root Cause
+
+The core problem lies in how Jackson’s `ObjectNode.serialize()` method processes values:
+
+1. If the value is a known `JsonSerializable`, it invokes `.serialize

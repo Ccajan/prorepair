@@ -1,0 +1,157 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Jackson Deserializer security vulnerability via default typing (CVE-2017-7525)
+I have send email to info@fasterxml.com
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/deser/BeanDeserializerFactory.java):
+```java
+@Override
+    public JsonDeserializer<Object> createBeanDeserializer(DeserializationContext ctxt,
+            JavaType type, BeanDescription beanDesc)
+        throws JsonMappingException
+    {
+        final DeserializationConfig config = ctxt.getConfig();
+        // We may also have custom overrides:
+        JsonDeserializer<Object> custom = _findCustomBeanDeserializer(type, config, beanDesc);
+        if (custom != null) {
+            return custom;
+        }
+        /* One more thing to check: do we have an exception type
+         * (Throwable or its sub-classes)? If so, need slightly
+         * different handling.
+         */
+        if (type.isThrowable()) {
+            return buildThrowableDeserializer(ctxt, type, beanDesc);
+        }
+        /* Or, for abstract types, may have alternate means for resolution
+         * (defaulting, materialization)
+         */
+        // 29-Nov-2015, tatu: Also, filter out calls to primitive types, they are
+        //    not something we could materialize anything for
+        if (type.isAbstract() && !type.isPrimitive() && !type.isEnumType()) {
+            // Let's make it possible to materialize abstract types.
+            JavaType concreteType = materializeAbstractType(ctxt, type, beanDesc);
+            if (concreteType != null) {
+                /* important: introspect actual implementation (abstract class or
+                 * interface doesn't have constructors, for one)
+                 */
+                beanDesc = config.introspect(concreteType);
+                return buildBeanDeserializer(ctxt, concreteType, beanDesc);
+            }
+        }
+        // Otherwise, may want to check handlers for standard types, from superclass:
+        @SuppressWarnings("unchecked")
+        JsonDeserializer<Object> deser = (JsonDeserializer<Object>) findStdDeserializer(ctxt, type, beanDesc);
+        if (deser != null) {
+            return deser;
+        }
+
+        // Otherwise: could the class be a Bean class? If not, bail out
+        if (!isPotentialBeanType(type.getRawClass())) {
+            return null;
+        }
+        // For checks like [databind#1599]
+        // Use generic bean introspection to build deserializer
+        return buildBeanDeserializer(ctxt, type, beanDesc);
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+package com.fasterxml.jackson.databind.deser;
+
+import com.fasterxml.jackson.annotation.JsonTypeInfo;
+import com.fasterxml.jackson.databind.DeserializationContext;
+import com.fasterxml.jackson.databind.JavaType;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.type.TypeFactory;
+import java.lang.reflect.Modifier;
+import java.util.LinkedHashSet;
+import org.codehaus.jackson.map.JsonDeserializer;
+import com.fasterxml.jackson.databind.BeanDescription;
+import com.fasterxml.jackson.databind.DeserializationConfig;
+import com.fasterxml.jackson.databind.util.ClassUtil;
+
+public class BeanDeserializerFactory {
+    private static final Class<?>[] DEFAULT_BASE_TYPES = { 
+        Throwable.class, Exception.class, Error.class, RuntimeException.class
+    };
+    
+    protected boolean _canOverrideAccessModifiers = false;    
+    
+    public JsonDeserializer<Object> createBeanDeserializer(DeserializationContext ctxt, JavaType type, BeanDescription beanDesc) throws JsonMappingException {
+        final DeserializationConfig config = ctxt.getConfig();        
+        JsonDeserializer<Object> custom = this._findCustomBeanDeserializer(type, config, beanDesc);
+        if (custom != null) {
+            return custom;
+        }   
+        if (type.isThrowable()) {            
+            throw new IllegalArgumentException("Illegal usage of polymorphic deserializer for Throwable");
+        }    
+        if (this._hasDefaultConstructor(beanDesc)) {
+            return null;
+        }
+        return this.buildBeanDeserializer(ctxt, type, beanDesc);
+    }
+
+    protected JsonDeserializer<Object> _findCustomBeanDeserializer(JavaType type, DeserializationConfig config, BeanDescription beanDesc)
+            throws JsonMappingException {
+        // ... existing code ...
+    }
+
+    protected JsonDeserializer<Object> findStdDeserializer(DeserializationContext ctxt, JavaType type, BeanDescription beanDesc) {
+        // ... existing code ...
+    }
+
+    protected JsonDeserializer<Object> buildThrowableDeserializer(DeserializationContext ctxt, JavaType type, BeanDescription beanDesc) {
+        // ... existing code ...
+    }
+
+    protected JsonDeserializer<Object> buildBeanDeserializer(DeserializationContext ctxt, JavaType type, BeanDescription beanDesc) {
+        if (!_nonTrivialBaseType(type)) {          
+            return new StdDeserializer(Object.class);       
+        }
+        JsonDeserializer<Object> deser = new NonClosingReferenceResolver(null).createInstanceBasedDeserializer(ctxt, type, beanDesc);      
+        return deser;
+    }
+
+    protected JavaType materializeAbstractType(DeserializationContext ctxt, JavaType type, BeanDescription beanDesc) {
+        JavaType rawType = type.getRawClass();
+
+        // Check if the type has a valid no-arg constructor
+        try {
+            rawType.getRawClass().getDeclaredConstructor();
+        } catch (NoSuchMethodException e) {
+            return null; // No valid constructor found
+        }
+
+        // Instantiate the type using the default constructor
+        Object instance = ObjectMapper.getDefaultInstance().convertValue(rawType, rawType);
+
+        // Update the type to reference the instantiated object's class
+        TypeFactory typeFactory = TypeFactory.defaultInstance();
+        return typeFactory.constructSpecializedType(rawType, instance.getClass());
+    }
+
+    protected boolean _nonTrivialBaseType(JavaType type) {
+        // ... existing code ...
+    }
+
+    protected boolean _hasDefaultConstructor(BeanDescription beanDesc) {
+        // ... existing code ...
+    }
+
+    protected boolean isPotentialBeanType(Class<?> rawType) {
+        return !Modifier.isAbstract(rawType.getModifiers())
+                && !rawType.isInterface()
+                && !rawType.isArray()
+                && !String.class.equals(rawType)
+                && !Number.class.isAssignableFrom(rawType)
+                && !Throwable.class.isAssignableFrom(rawType)
+                && !Object.class.equals(rawType);
+    }
+}
+```

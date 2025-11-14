@@ -1,0 +1,120 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# ACCEPT_CASE_INSENSITIVE_PROPERTIES fails with @JsonUnwrapped
+(note: moved from FasterXML/jackson-dataformat-csv#133)
+When trying to deserialize type like:
+public class Person {
+  @JsonUnwrapped(prefix = "businessAddress.")
+  public Address businessAddress;
+}
+
+public class Address {
+  public String street;
+  public String addon;
+  public String zip = "";
+  public String town;    
+  public String country;
+}
+with case-insensitive mapper (mapper.enable(MapperFeature.ACCEPT_CASE_INSENSITIVE_PROPERTIES);) I get exception:
+java.util.NoSuchElementException: No entry 'businessAddress' found, can't remove
+	at com.fasterxml.jackson.databind.deser.impl.BeanPropertyMap.remove(BeanPropertyMap.java:447)
+	at com.fasterxml.jackson.databind.deser.BeanDeserializerBase.resolve(BeanDeserializerBase.java:534)
+	at com.fasterxml.jackson.databind.deser.DeserializerCache._createAndCache2(DeserializerCache.java:293)
+   ...
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/deser/impl/BeanPropertyMap.java):
+```java
+public void remove(SettableBeanProperty propToRm)
+{
+    ArrayList<SettableBeanProperty> props = new ArrayList<SettableBeanProperty>(_size);
+    String key = getPropertyName(propToRm);
+    boolean found = false;
+
+    for (int i = 1, end = _hashArea.length; i < end; i += 2) {
+        SettableBeanProperty prop = (SettableBeanProperty) _hashArea[i];
+        if (prop == null) {
+            continue;
+        }
+        if (!found) {
+            // 09-Jan-2017, tatu: Important: must check name slot and NOT property name,
+            //   as only former is lower-case in case-insensitive case
+            found = key.equals(prop.getName());
+            if (found) {
+                // need to leave a hole here
+                _propsInOrder[_findFromOrdered(prop)] = null;
+                continue;
+            }
+        }
+        props.add(prop);
+    }
+    if (!found) {
+        throw new NoSuchElementException("No entry '"+propToRm.getName()+"' found, can't remove");
+    }
+    init(props);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public void remove(SettableBeanProperty propToRm)
+{
+    ArrayList<SettableBeanProperty> props = new ArrayList<SettableBeanProperty>(_size);
+    String key = getPropertyName(propToRm);
+    boolean found = false;
+
+    for (int i = 1, end = _hashArea.length; i < end; i += 2) {
+        SettableBeanProperty prop = (SettableBeanProperty) _hashArea[i];
+        if (caseInsensitive && prop != null) {
+            // When case insensitive, compare using the canonical name
+            if (key.equals(prop.getCanonicalName())) {
+                // Need to leave a hole here
+                _propsInOrder[_findFromOrdered(prop)] = null;
+                continue;
+            }
+        } else if (prop != null) {
+            if (key.equals(prop.getName())) {
+                // Need to leave a hole here
+                _propsInOrder[_findFromOrdered(prop)] = null;
+                continue;
+            }
+        }
+        props.add(prop);
+    }
+
+    if (!found) {
+        throw new NoSuchElementException("No entry '" + propToRm.getName() + "' found, can't remove");
+    }
+    init(props);
+}
+```
+
+Okay, let me try to figure out how to fix this issue. The problem seems to be related to the `ACCEPT_CASE_INSENSITIVE_PROPERTIES` feature in Jackson when using `@JsonUnwrapped`. 
+
+First, I remember that when case insensitivity is enabled, Jackson should treat property names in a case-insensitive manner. But in the current code, there's an error when removing a property from the map because it's not checking the canonical name correctly.
+
+Looking at the existing code in `BeanPropertyMap.java`, the `remove` method is trying to find a property by its name, but when case insensitivity is active, it might not match the actual property name stored. The comment mentions that when case insensitive, the name slot is lower-case, so they should check against that. However, the code isn't handling this properly.
+
+The original code uses `prop.getName()` which would return the original name, possibly uppercase or mixed case. But when case insensitivity is on, the actual comparison should use the canonicalized version of the name. Wait, the note says that the name slot is lower-case in case-insensitive scenarios. So maybe the correct approach is to compare against the canonical name instead of the regular name?
+
+Wait, in the existing code, when case insensitivity is enabled, the code checks if `key.equals(prop.getName())`. That doesn't seem right because if case insensitivity is on, the property name should be compared in a case-insensitive way. But the code isn't doing that. Instead, it's using `prop.getName()`, which could have a different casing than the key, leading to no match even though the properties exist.
+
+So, perhaps the fix involves comparing the key with the canonical name of the property. The `getCanonicalName()` method would give the standard form (like lowercase), allowing the comparison to work when case insensitivity is enabled.
+
+But wait, looking at the original code, there's a comment saying that in case-insensitive mode, the name slot is lower-case. Therefore, the code should check whether the key (which is the property name in lowercase, perhaps?) matches the canonical name. Alternatively, when case insensitivity is on, we should compare using the canonical name, otherwise use the regular name.
+
+Another thing to consider is that the key is generated via `getPropertyName(propToRm)`, which might already be in a certain format. Let me think about how `getPropertyName` works. If the case sensitivity is enabled, then maybe it returns the property name in lowercase. For example, if the property is named "BusinessAddress", then `getPropertyName` would return "businessaddress" when case insensitivity is on. Then, the code needs to compare this lowercase name with the canonical name of the property. Wait, but the canonical name might not necessarily be lowercase. Or does `getCanonicalName()` return the standardized name?
+
+Alternatively, maybe the key should be compared using the canonical name of the property, regardless of case. So, the correct approach is to check if the key equals the canonical name of the property, which is the same across all instances of the property, ensuring case-insensitive matching.
+
+Therefore, modifying the code to compare the key with the canonical name of the property when case insensitivity is enabled would resolve the issue. This way, even if the key is in a different case, it will match the canonical name, and the removal operation will succeed.
+
+So the fix would involve:
+
+1. Checking if case insensitivity is enabled.
+2. Using `prop.getCanonicalName()` for comparison when it is enabled.
+3. Otherwise, using `prop.getName()`.
+
+However, looking back at the original code, the code is checking `key.equals(prop.getName())` without considering case sensitivity. The correct approach would be to use `getCanonical

@@ -1,0 +1,208 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# weird object literal invalid property error on unrelated object prototype
+Apologies in advance for the convoluted repro case and the vague summary.
+
+Compile the following code (attached as repro.js) with:
+java -jar build/compiler.jar --compilation_level=ADVANCED_OPTIMIZATIONS --jscomp_error=accessControls --jscomp_error=checkTypes --jscomp_error=checkVars --js repro.js *
+
+/**
+ * @param {{text: string}} opt_data
+ * @return {string}
+ */
+function temp1(opt_data) {
+  return opt_data.text;
+}
+
+/**
+ * @param {{activity: (boolean|number|string|null|Object)}} opt_data
+ * @return {string}
+ */
+function temp2(opt_data) {
+  /** @notypecheck */
+  function __inner() {
+    return temp1(opt_data.activity);
+  }
+  return __inner();
+}
+
+/**
+ * @param {{n: number, text: string, b: boolean}} opt_data
+ * @return {string}
+ */
+function temp3(opt_data) {
+  return 'n: ' + opt_data.n + ', t: ' + opt_data.text + '.';
+}
+
+function callee() {
+  var output = temp3({
+    n: 0,
+    text: 'a string',
+    b: true
+  })
+  alert(output);
+}
+
+callee();
+
+yields:
+repro.js:30: ERROR - actual parameter 1 of temp3 does not match formal parameter
+found   : {b: boolean, n: number, text: (string|undefined)}
+required: {b: boolean, n: number, text: string}
+  var output = temp3({
+
+It seems like temp3 is actually being called with the right type {b: boolean, n: number, text: string} though it seems to think that text is a (string|undefined)
+This seems to happen because of the seemingly unrelated code in functions temp1 and temp2. If I change the name of the text property (as in repro3.js) it works.
+Additionally, if I fix the type of the activity property in the record type of temp2 it works (as in repro2.js)
+
+This comes up in our codebase in some situations where we don't have type info for all the objects being passed into a function. It's always a tricky one to find because it reports an error at a location that looks correct.
+
+* it also fails with SIMPLE_OPTIMIZATIONS
+This is an incorrect Java code (src/com/google/javascript/rhino/jstype/PrototypeObjectType.java):
+```java
+public void matchConstraint(ObjectType constraintObj) {
+  // We only want to match contraints on anonymous types.
+
+  // Handle the case where the constraint object is a record type.
+  //
+  // param constraintObj {{prop: (number|undefined)}}
+  // function f(constraintObj) {}
+  // f({});
+  //
+  // We want to modify the object literal to match the constraint, by
+  // taking any each property on the record and trying to match
+  // properties on this object.
+  if (constraintObj.isRecordType()) {
+    for (String prop : constraintObj.getOwnPropertyNames()) {
+      JSType propType = constraintObj.getPropertyType(prop);
+      if (!isPropertyTypeDeclared(prop)) {
+        JSType typeToInfer = propType;
+        if (!hasProperty(prop)) {
+          typeToInfer = getNativeType(JSTypeNative.VOID_TYPE)
+              .getLeastSupertype(propType);
+        }
+        defineInferredProperty(prop, typeToInfer, null);
+      }
+    }
+  }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+The issue arises from how the PrototypeObjectType class attempts to infer types when matching constraints. The problem occurs when the constraint object has a property that isn't explicitly declared in the current object, leading to incorrect type inference for properties that shouldn't be considered.
+
+Here's a revised version of the method:
+
+```java
+public void matchConstraint(ObjectType constraintObj) {
+  // Only process constraints for anonymous types
+  if (constraintObj.isRecordType()) {
+    for (String propName : constraintObj.getOwnPropertyNames()) {
+      JSType propType = constraintObj.getPropertyType(propName);
+      
+      // Skip properties that aren't defined in the current object
+      if (!hasProperty(propName)) {
+        continue;
+      }
+
+      // Check if the property is already inferred or declared
+      if (!isPropertyTypeDeclared(propName)) {
+        JSType typeToInfer = propType;
+        
+        // If the property isn't present in the current object, 
+        // we should not infer its type from the constraint
+        if (!hasProperty(propName)) {
+          continue; // Skip this property since it's not present
+        }
+        
+        // Determine the appropriate type to infer based on presence
+        JSType inferredType = hasProperty(propName) ? 
+            getNativeType(JSTypeNative.VOID_TYPE).getLeastSupertype(propType) :
+            propType;
+            
+        defineInferredProperty(propName, inferredType, null);
+      }
+    }
+  }
+}
+```
+
+Key changes:
+1. Added a check to skip properties that aren't defined in the current object
+2. Properly handles type inference based on whether the property exists
+3. Ensures we don't incorrectly infer types for properties that should be ignored
+
+The original code was inferring types for properties that weren't actually part of the object, which caused the incorrect type checking issues seen in the JavaScript example. This fix ensures that we only consider properties that are actually present in the object when performing type matching.
+</think>
+
+The issue described involves an incorrect type inference mechanism in the `matchConstraint` method of the `PrototypeObjectType` class, leading to false positive errors in TypeScript-like type checks when dealing with object literals and their properties. Let's analyze the root cause and provide a solution.
+
+---
+
+### 🧠 Root Cause Analysis
+
+The core of the issue lies in how the constraint object (`constraintObj`) is used to deduce the type of untyped or undefined properties in the receiver object.
+
+#### ✅ What's Happening:
+- When a property in `constraintObj` doesn't exist in the target object, the logic tries to assign a generic type to it using `getNativeType(...).getLeastSupertype(...)`.
+- This can lead to assigning an incorrect type (like `void | string`, etc.) to properties that do **not** exist on the object literal, especially when there's ambiguity due to missing declarations.
+- This results in misalignment between expected and actual type signatures later on—e.g., allowing a field to be typed as `string | undefined` instead of just `string`.
+
+#### ❌ Example Behavior:
+If the constraint defines a property `text` as `string` but the actual object literal lacks this property, the method will incorrectly try to assign it a generic or fallback type, which leads to misleading errors during validation.
+
+---
+
+### 🔧 Solution: Fixing the Type Matching Logic
+
+We need to adjust the logic so it only considers existing properties in the current object when matching constraints. Here's a corrected implementation:
+
+```java
+public void matchConstraint(ObjectType constraintObj) {
+  // Only process constraints for anonymous types
+  if (constraintObj.isRecordType()) {
+    for (String propName : constraintObj.getOwnPropertyNames()) {
+      JSType propType = constraintObj.getPropertyType(propName);
+
+      // Skip properties not declared in the current object
+      if (!hasProperty(propName)) {
+        continue;
+      }
+
+      // Skip properties that are already declared or inferred
+      if (isPropertyTypeDeclared(propName)) {
+        continue;
+      }
+
+      // Infer type based on whether the property is optional or required
+      JSType inferredType = hasProperty(propName) && !constraintObj.isOptionalProperty(propName)
+          ? getNativeType(JSTypeNative.VOID_TYPE).getLeastSupertype(propType)
+          : propType;
+
+      defineInferredProperty(propName, inferredType, null);
+    }
+  }
+}
+```
+
+---
+
+### ✅ Key Fixes & Improvements
+
+| Feature               | Before                          | After                            |
+|----------------------|----------------------------------|----------------------------------|
+| Handling of Unmatched Properties | Could falsely infer types         | Skipped if not present          |
+| Optional vs Required Prop Support | No distinction                   | Uses `isOptionalProperty()`     |
+| Clearer Constraint Matching | Misaligned property types        | Correct inference based on existence |
+
+---
+
+### 💡 Additional Notes
+
+- Ensure that `isOptionalProperty()` and similar utilities correctly distinguish between optional and required properties.
+-

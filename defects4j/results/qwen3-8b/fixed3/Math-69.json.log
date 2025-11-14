@@ -1,0 +1,136 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# PearsonsCorrelation.getCorrelationPValues() precision limited by machine epsilon
+Similar to the issue described in MATH-201, using PearsonsCorrelation.getCorrelationPValues() with many treatments results in p-values that are continuous down to 2.2e-16 but that drop to 0 after that.
+In MATH-201, the problem was described as such:
+> So in essence, the p-value returned by TTestImpl.tTest() is:
+> 
+> 1.0 - (cumulativeProbability(t) - cumulativeProbabily(-t))
+> 
+> For large-ish t-statistics, cumulativeProbabilty(-t) can get quite small, and cumulativeProbabilty(t) can get very close to 1.0. When 
+> cumulativeProbability(-t) is less than the machine epsilon, we get p-values equal to zero because:
+> 
+> 1.0 - 1.0 + 0.0 = 0.0
+The solution in MATH-201 was to modify the p-value calculation to this:
+> p = 2.0 * cumulativeProbability(-t)
+Here, the problem is similar.  From PearsonsCorrelation.getCorrelationPValues():
+  p = 2 * (1 - tDistribution.cumulativeProbability(t));
+Directly calculating the p-value using identical code as PearsonsCorrelation.getCorrelationPValues(), but with the following change seems to solve the problem:
+  p = 2 * (tDistribution.cumulativeProbability(-t));
+This is an incorrect Java code (src/main/java/org/apache/commons/math/stat/correlation/PearsonsCorrelation.java):
+```java
+public RealMatrix getCorrelationPValues() throws MathException {
+    TDistribution tDistribution = new TDistributionImpl(nObs - 2);
+    int nVars = correlationMatrix.getColumnDimension();
+    double[][] out = new double[nVars][nVars];
+    for (int i = 0; i < nVars; i++) {
+        for (int j = 0; j < nVars; j++) {
+            if (i == j) {
+                out[i][j] = 0d;
+            } else {
+                double r = correlationMatrix.getEntry(i, j);
+                double t = Math.abs(r * Math.sqrt((nObs - 2)/(1 - r * r)));
+                out[i][j] = 2 * (1 - tDistribution.cumulativeProbability(t));
+            }
+        }
+    }
+    return new BlockRealMatrix(out);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public RealMatrix getCorrelationPValues() throws MathException {
+    TDistribution tDistribution = new TDistributionImpl(nObs - 2);
+    int nVars = correlationMatrix.getColumnDimension();
+    double[][] out = new double[nVars][nVars];
+    for (int i = 0; i < nVars; i++) {
+        for (int j = 0; j < nVars; j++) {
+            if (i == j) {
+                out[i][j] = 0d;
+            } else {
+                double r = correlationMatrix.getEntry(i, j);
+                double t = Math.abs(r * Math.sqrt((nObs - 2)/(1 - r * r)));
+                // Modified line: Use cumulativeProbability(-t) instead of 1 - cumulativeProbability(t)
+                out[i][j] = 2 * tDistribution.cumulativeProbability(-t);
+            }
+        }
+    }
+    return new BlockRealMatrix(out);
+}
+```
+
+The key change is replacing `2 * (1 - tDistribution.cumulativeProbability(t))` with `2 * tDistribution.cumulativeProbability(-t)`. This avoids the floating point subtraction that causes loss of precision when the values are very close to 1.0.
+
+The original implementation had a flaw where for large t-values, `cumulativeProbability(t)` would be extremely close to 1.0, and subtracting it from 1.0 would result in a value that's too small to represent accurately due to the limitations of floating-point arithmetic. By directly computing the cumulative probability at `-t`, we avoid this loss of precision.
+</think>
+
+To address the precision limitation in calculating p-values using `PearsonsCorrelation.getCorrelationPValues()`, we need to adjust how the p-value is computed. The original approach involves subtracting two nearly identical cumulative probabilities, which introduces significant floating-point error—especially for large test statistics.
+
+---
+
+### 📌 Problem Summary:
+
+The current implementation uses:
+
+```java
+out[i][j] = 2 * (1 - tDistribution.cumulativeProbability(t));
+```
+
+For large values of `t`, both `cumulativeProbability(t)` and `1 - cumulativeProbability(t)` become extremely close to each other, leading to a loss of precision due to **machine epsilon** limitations in floating-point arithmetic.
+
+This often results in p-values being incorrectly rounded to `0.0` even when they should remain non-zero and potentially very small (like ~1e-15 or lower).
+
+---
+
+### ✅ Proposed Fix:
+
+Instead of computing the p-value as `2*(1 - P(t))`, use:
+
+```java
+out[i][j] = 2 * tDistribution.cumulativeProbability(-t);
+```
+
+This leverages symmetry properties of the t-distribution (`P(-t) = 1 - P(t)`) to avoid the subtraction that leads to precision issues. It ensures higher numerical stability by computing only one cumulative probability and avoiding the floating-point subtraction.
+
+---
+
+### ✅ Final Fixed Code:
+
+```java
+public RealMatrix getCorrelationPValues() throws MathException {
+    TDistribution tDistribution = new TDistributionImpl(nObs - 2);
+    int nVars = correlationMatrix.getColumnDimension();
+    double[][] out = new double[nVars][nVars];
+    for (int i = 0; i < nVars; i++) {
+        for (int j = 0; j < nVars; j++) {
+            if (i == j) {
+                out[i][j] = 0d;
+            } else {
+                double r = correlationMatrix.getEntry(i, j);
+                double t = Math.abs(r * Math.sqrt((nObs - 2) / (1 - r * r)));
+                // Avoids precision loss by computing cumulativeProbability(-t)
+                out[i][j] = 2 * tDistribution.cumulativeProbability(-t);
+            }
+        }
+    }
+    return new BlockRealMatrix(out);
+}
+```
+
+---
+
+### ✅ Why This Works:
+
+By using `cumulativeProbability(-t)` instead of `1 - cumulativeProbability(t)`, we bypass the problematic subtraction operation. Since the t-distribution is symmetric around zero, `P(-t) = 1 - P(t)` holds true. Computing just `P(-t)` provides the correct p-value without losing precision.
+
+---
+
+### 🔍 Additional Notes:
+
+- This fix aligns with best practices in statistical computing, particularly in scenarios involving extreme tail probabilities.
+- It avoids underflow issues and ensures more accurate representation of p-values, especially when dealing with highly significant correlations (e.g., with many observations).

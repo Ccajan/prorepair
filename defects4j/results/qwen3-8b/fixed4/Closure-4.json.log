@@ -1,0 +1,199 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Converting from an interface type to a constructor which @implements itself causes stack overflow.
+// Options: --externs externs/es3.js --property_renaming OFF --variable_renaming OFF --jscomp_warning=checkTypes --js=t.js
+
+// File: t.js
+/**
+ * @interface
+ */
+var OtherType = function() {}
+
+/**
+ * @implements {MyType}
+ * @constructor
+ */
+var MyType = function() {}
+
+/**
+ * @type {MyType}
+ */
+var x = /** @type {!OtherType} */ (new Object());
+
+Get Infinite recursion in:
+
+PrototypeObjectType.isSubtype @ 350
+
+Options:
+
+- prevent cycles in the inheritance/implements graph
+- detect cycles after they are created and exit compilation before any subsequent passes run
+- detect and remove cycles after they are created but before any subsequent passes run
+- make every subsequent pass robust against cycles in that graph
+This is an incorrect Java code (src/com/google/javascript/rhino/jstype/NamedType.java):
+```java
+JSType resolveInternal(ErrorReporter t, StaticScope<JSType> enclosing) {
+  // TODO(user): Investigate whether it is really necessary to keep two
+  // different mechanisms for resolving named types, and if so, which order
+  // makes more sense. Now, resolution via registry is first in order to
+  // avoid triggering the warnings built into the resolution via properties.
+  boolean resolved = resolveViaRegistry(t, enclosing);
+  if (detectImplicitPrototypeCycle()) {
+    handleTypeCycle(t);
+  }
+
+  if (resolved) {
+    super.resolveInternal(t, enclosing);
+    finishPropertyContinuations();
+    return registry.isLastGeneration() ?
+        getReferencedType() : this;
+  }
+
+  resolveViaProperties(t, enclosing);
+  if (detectImplicitPrototypeCycle()) {
+    handleTypeCycle(t);
+  }
+
+  super.resolveInternal(t, enclosing);
+  if (isResolved()) {
+    finishPropertyContinuations();
+  }
+  return registry.isLastGeneration() ?
+      getReferencedType() : this;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public JSType resolveInternal(ErrorReporter t, StaticScope<JSType> enclosing) {
+  boolean resolved = resolveViaRegistry(t, enclosing);
+  if (!resolved && detectImplicitPrototypeCycle()) {
+    handleTypeCycle(t);
+  }
+
+  if (resolved) {
+    super.resolveInternal(t, enclosing);
+    finishPropertyContinuations();
+    return registry.isLastGeneration() ? getReferencedType() : this;
+  }
+
+  resolveViaProperties(t, enclosing);
+  if (!resolved && detectImplicitPrototypeCycle()) {
+    handleTypeCycle(t);
+  }
+
+  super.resolveInternal(t, enclosing);
+  if (isResolved()) {
+    finishPropertyContinuations();
+  }
+  return registry.isLastGeneration() ? getReferencedType() : this;
+}
+```
+
+The key changes I made:
+
+1. Moved the cycle detection and handling to occur only when we haven't already resolved the type
+2. Made sure we only call handleTypeCycle() when we're not already in a resolved state
+3. This prevents infinite recursion by ensuring we don't re-check for cycles once we've successfully resolved the type
+4. The logic now follows the pattern of first trying to resolve via registry, then falling back to property resolution if needed
+
+This approach ensures that:
+- We attempt to resolve via the registry first
+- If that fails, we check for cycles before proceeding with property-based resolution
+- We avoid redundant cycle checks once we have a successful resolution
+- We maintain the same overall flow as the original code but with improved safety against infinite recursion
+
+The fix addresses the issue where the original code would repeatedly check for cycles even after the type had been successfully resolved, leading to infinite recursion during the resolution process.
+</think>
+
+To address the **infinite recursion** problem in the `resolveInternal` method of your Java class, we need to ensure that the **cycle detection and resolution mechanism doesn't trigger infinitely**, especially in complex type resolution scenarios.
+
+---
+
+### 🔍 Problem Analysis
+
+Your current implementation has several recursive calls that might end up in a loop due to improper use of cycle checks. Specifically, the method tries multiple ways to resolve the type:
+
+1. First using `resolveViaRegistry`
+2. Then fallback to `resolveViaProperties`
+3. And finally calling `super.resolveInternal(...)`, which could be recursive again
+
+In situations involving cyclic dependencies like:
+
+```java
+@implements {MyType}
+@constructor
+var MyType = function() {}
+
+@type {MyType}
+var x = ... 
+```
+
+This can lead to a situation where `resolveInternal` keeps checking for cycles even though the type has already been resolved, resulting in **stack overflows or infinite loops**.
+
+---
+
+### ✅ Solution Approach
+
+To prevent such issues, the correct strategy is:
+
+1. **Only perform cycle detection if the type hasn’t yet been resolved.**
+2. Avoid unnecessary cycle checks once a valid type resolution has been found.
+3. Ensure that the cycle detection isn’t called redundantly on the same type.
+
+The revised `resolveInternal` method should follow these principles:
+
+---
+
+### 🛠️ Fixed Code Implementation
+
+```java
+public JSType resolveInternal(ErrorReporter t, StaticScope<JSType> enclosing) {
+  boolean resolved = resolveViaRegistry(t, enclosing);
+
+  if (!resolved && detectImplicitPrototypeCycle()) {
+    handleTypeCycle(t);
+  }
+
+  if (resolved) {
+    super.resolveInternal(t, enclosing);
+    finishPropertyContinuations();
+    return registry.isLastGeneration() ? getReferencedType() : this;
+  }
+
+  resolveViaProperties(t, enclosing);
+
+  if (!resolved && detectImplicitPrototypeCycle()) {
+    handleTypeCycle(t);
+  }
+
+  super.resolveInternal(t, enclosing);
+  if (isResolved()) {
+    finishPropertyContinuations();
+  }
+
+  return registry.isLastGeneration() ? getReferencedType() : this;
+}
+```
+
+---
+
+### ✅ Key Fixes and Improvements
+
+| Aspect | Before | After |
+|--------|--------|-------|
+| Cycle Detection | Called both when resolved and unresolved | Only called when the type was not resolved |
+| Recursive Calls | Risked repeated calls leading to stack overflow | Prevented redundant checks |
+| Performance | Could cause infinite recursion | Avoids unnecessary computations |
+
+---
+
+### 📌 Summary
+
+By refining the conditions under which cycle detection is performed and ensuring that cycle checks are done **only when the resolution attempt failed**, we eliminate the risk of infinite recursion. This solution ensures that type resolution remains robust even in the presence of complex dependencies while maintaining performance and correctness.
+
+Let me know if you’d also like guidance on how to test or integrate this change in your build system!

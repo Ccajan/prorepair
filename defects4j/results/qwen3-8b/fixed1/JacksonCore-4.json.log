@@ -1,0 +1,129 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# What is the maximum key length allowed?
+I noticed that even in Jackson 2.4, if a JSON key is longer than 262144 bytes, ArrayIndexOutOfBoundsException is thrown from TextBuffer. Below is the stack trace:
+java.lang.ArrayIndexOutOfBoundsException
+    at java.lang.System.arraycopy(Native Method)
+    at com.fasterxml.jackson.core.util.TextBuffer.expandCurrentSegment(TextBuffer.java:604)
+    at com.fasterxml.jackson.core.json.UTF8StreamJsonParser.addName(UTF8StreamJsonParser.java:2034)
+    at com.fasterxml.jackson.core.json.UTF8StreamJsonParser.findName(UTF8StreamJsonParser.java:1928)
+    at com.fasterxml.jackson.core.json.UTF8StreamJsonParser.parseLongFieldName(UTF8StreamJsonParser.java:1534)
+    at com.fasterxml.jackson.core.json.UTF8StreamJsonParser.parseMediumFieldName(UTF8StreamJsonParser.java:1502)
+    at com.fasterxml.jackson.core.json.UTF8StreamJsonParser._parseFieldName(UTF8StreamJsonParser.java:1437)
+    at com.fasterxml.jackson.core.json.UTF8StreamJsonParser.nextToken(UTF8StreamJsonParser.java:668)
+    ... <below are our code> ...
+
+Looking at TextBuffer.expandCurrentSegment(TextBuffer.java:604), once the length of _currentSegment is increased to MAX_SEGMENT_LEN + 1 (262145) bytes, the newLen will stay at MAX_SEGMENT_LEN, which is smaller than len. Therefore System.arraycopy() will fail.
+I understand it is rare to have key larger than 262144 bytes, but it would be nice if
+
+Jackson explicitly throw exception stating that key is too long.
+Document that the maximum key length is 262144 bytes.
+
+OR
+
+Update TextBuffer to support super long key.
+
+Thanks!
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/core/util/TextBuffer.java):
+```java
+public char[] expandCurrentSegment()
+{
+    final char[] curr = _currentSegment;
+    // Let's grow by 50% by default
+    final int len = curr.length;
+    // but above intended maximum, slow to increase by 25%
+    int newLen = (len == MAX_SEGMENT_LEN) ? (MAX_SEGMENT_LEN+1) : Math.min(MAX_SEGMENT_LEN, len + (len >> 1));
+    return (_currentSegment = Arrays.copyOf(curr, newLen));
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+The issue you've identified is indeed a problem with the `expandCurrentSegment` method in Jackson's `TextBuffer`. The current implementation has a flaw where it attempts to grow the segment size beyond `MAX_SEGMENT_LEN`, but instead of increasing the capacity when necessary, it clamps the value to `MAX_SEGMENT_LEN`. This results in an `ArrayIndexOutOfBoundsException` when the input exceeds this limit, as you've observed.
+
+Here's how we can fix the code:
+
+1. **Understand the Purpose**: The method is responsible for expanding the current character buffer segment used to store text data. It should ensure that there's enough space to accommodate more characters without exceeding memory constraints or causing errors.
+
+2. **Fix the Logic**: The line 
+   ```java
+   int newLen = (len == MAX_SEGMENT_LEN) ? (MAX_SEGMENT_LEN+1) : Math.min(MAX_SEGMENT_LEN, len + (len >> 1));
+   ```
+   tries to calculate the new length based on the existing length and a growth factor. However, when `len == MAX_SEGMENT_LEN`, it incorrectly sets `newLen` to `MAX_SEGMENT_LEN + 1` which then gets passed to `Arrays.copyOf`, resulting in no actual expansion since it cannot exceed `MAX_SEGMENT_LEN`.
+
+3. **Correct the Calculation**: We need to make sure that if the current length is equal to `MAX_SEGMENT_LEN`, we still allow some growth. One approach is to set `newLen` to `Math.max(len + (len >> 1), MAX_SEGMENT_LEN + 1)` when `len == MAX_SEGMENT_LEN`. Alternatively, we could increase the `MAX_SEGMENT_LEN` itself if we're willing to allow longer keys.
+
+Here's the corrected version of the method:
+
+```java
+public char[] expandCurrentSegment()
+{
+    final char[] curr = _currentSegment;
+    final int len = curr.length;
+
+    // Determine the new length based on whether we're already at max segment size
+    int newLen = (len == MAX_SEGMENT_LEN) 
+        ? MAX_SEGMENT_LEN * 2 
+        : Math.min(MAX_SEGMENT_LEN, len + (len >> 1));
+
+    return (_currentSegment = Arrays.copyOf(curr, newLen));
+}
+```
+
+**Explanation**:
+- When the current segment length equals `MAX_SEGMENT_LEN`, the new length becomes double the original (`MAX_SEGMENT_LEN * 2`). This ensures that even though the initial limit exists, we can grow the buffer further beyond it when needed.
+- For lengths less than `MAX_SEGMENT_LEN`, the segment grows by half its current size, up to the maximum limit.
+
+**Alternative Consideration**:
+If there's a requirement to strictly limit the key length due to performance or design considerations, the maximum key length could be adjusted. But given your scenario, allowing some growth beyond the current limit seems more practical to prevent the `ArrayIndexOutOfBoundsException` and provide better error handling.
+
+Remember, adjusting these limits affects overall memory usage and may require testing under various conditions to ensure stability and efficiency.
+```
+</think>
+
+To resolve the issue you've encountered with Jackson's `TextBuffer` class, we need to address the logic in the `expandCurrentSegment()` method so that it allows for dynamic resizing of the character array even when the current segment reaches its maximum allowed length (`MAX_SEGMENT_LEN`). Here's how to fix it:
+
+---
+
+### ✅ **Problem Summary**
+
+The `expandCurrentSegment()` method currently attempts to grow the current character segment but fails to do so when the length of the segment matches `MAX_SEGMENT_LEN`. Specifically:
+
+- When `_currentSegment.length == MAX_SEGMENT_LEN`, the method calculates `newLen = MAX_SEGMENT_LEN + 1`, which gets clamped back to `MAX_SEGMENT_LEN` when calling `Arrays.copyOf(...)`.
+- This leads to an `ArrayIndexOutOfBoundsException` because the input JSON key is longer than 262,144 bytes.
+
+---
+
+### 🔧 **Fix: Update `expandCurrentSegment()` Logic**
+
+We need to revise the calculation of `newLen` to correctly handle cases where the current segment is already at the `MAX_SEGMENT_LEN` threshold.
+
+#### 💡 Key Fixes:
+- Instead of clamping `newLen` to `MAX_SEGMENT_LEN`, we should allow expansion beyond the threshold.
+- To avoid unbounded memory usage, a safe strategy is to double the size of the array when reaching the maximum allowed size.
+
+---
+
+### 🛠 Corrected Code
+
+```java
+public char[] expandCurrentSegment() {
+    final char[] curr = _currentSegment;
+    final int len = curr.length;
+
+    // If we are already at the max segment size, double the capacity
+    int newLen = (len == MAX_SEGMENT_LEN) 
+        ? (len * 2)  // Allow doubling the length beyond MAX_SEGMENT_LEN
+        : Math.min(MAX_SEGMENT_LEN, len + (len >> 1));  // Grow by 50% otherwise
+
+    return (_currentSegment = Arrays.copyOf(curr, newLen));
+}
+```
+
+---
+
+###

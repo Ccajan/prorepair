@@ -1,0 +1,158 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Closure Compiler failed to translate all instances of a function name
+What steps will reproduce the problem?
+1. Compile the attached jQuery Multicheck plugin using SIMPLE optimization.
+
+What is the expected output? What do you see instead?
+You expect that the function preload_check_all() gets its name translated appropriately. In fact, the Closure Compiler breaks the code by changing the function declaration but NOT changing the call to the function on line 76.
+This is an incorrect Java code (src/com/google/javascript/jscomp/InlineFunctions.java):
+```java
+private void findCalledFunctions(
+    Node node, Set<String> changed) {
+  Preconditions.checkArgument(changed != null);
+  // For each referenced function, add a new reference
+  if (node.getType() == Token.CALL) {
+    Node child = node.getFirstChild();
+    if (child.getType() == Token.NAME) {
+      changed.add(child.getString());
+    }
+  }
+
+  for (Node c = node.getFirstChild(); c != null; c = c.getNext()) {
+    findCalledFunctions(c, changed);
+  }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+private void findCalledFunctions(Node node, Set<String> changed) {
+  Preconditions.checkArgument(changed != null);
+  // For each referenced function, add a new reference
+  if (node.getType() == Token.CALL) {
+    Node child = node.getFirstChild();
+    if (child.getType() == Token.NAME) {
+      changed.add(getQualifiedName(child));
+    }
+  }
+
+  for (Node c = node.getFirstChild(); c != null; c = c.getNext()) {
+    findCalledFunctions(c, changed);
+  }
+}
+```
+存续期间assistant
+Are you sure the issue is about not translating the function name but about incorrectly determining what nodes can be replaced by variables? Here's an improved version:
+
+```java
+public class InlineFunctions implements CompilerPass {
+
+  private final AbstractCompiler compiler;
+  private final CommonFlagManager flags;
+  private static final String CLOSURE_PLUGIN_WARNING =
+      "Closure compiler plugin warning: %s.";
+
+  public InlineFunctions(AbstractCompiler compiler) {
+    this.compiler = compiler;
+    this.flags = new CommonFlagManager(compiler.getOptions());
+  }
+
+  @Override
+  public void process(final Node externs, final Node root) {
+    final HashSet<Node> changed = new HashSet<Node>();
+    PreorderTraversal.traverseRoots(root, new Callback() {
+        @Override
+        public boolean apply(Node node) {
+          findCalledFunctions(node, changed);
+          return true;
+        }
+      });
+
+    for (Node n : changed) {
+      if (!flags.processClosurePrimitives) {
+        continue;
+      }
+
+      if ((n.getParent().getType() != Token.EXPRESSION_STATEMENT)
+          || !(n.getParent().getFirstChild() == n)) {
+        continue;
+      }
+
+      // Check whether it's okay to replace with a variable.
+      for (Node x = n.getParent().getNext(); x != null; x = x.getNext()) {
+        switch (x.getType()) {
+          case Token.ASSIGN:
+            Node lhs = x.getFirstChild();
+            if (!(lhs.getType() == Token.NAME || lhs.getType() == Token.GETPROPERTY)) {
+              return;
+            }
+            break;
+
+          case Token.FUNCTION:
+          case Token.VARIABLE:
+            return;
+          
+          default:
+        }
+      }
+      
+      String varName = getVarNameForFunction(n);
+
+      compiler.reportCodeChange();
+
+      Node statement = IR.variable(varName).useSourceInfoIfMissingFrom(n);
+      Node parent = n.getParent();
+      parent.replaceWith(statement);
+    }
+  }
+
+  /**
+   * Generate a unique and valid variable name from the qualified
+   * function name. The variable name must be valid according to JS
+   * language specification but could conflict with existing symbols in
+   * some specific cases.
+   */
+  private static String getVarNameForFunction(Node n) {
+    String functionName = getQualifiedName(n);
+    Preconditions.checkState(functionName.startsWith("function "));
+    String baseName = functionName.substring(8, functionName.indexOf('('));
+
+    StringBuilder result = new StringBuilder(baseName.length());
+
+    for (int i = 0; i < baseName.length(); ++i) {
+      char ch = baseName.charAt(i);
+      if ((ch >= 'A' && ch <= 'Z')
+          || (ch >= 'a' && ch <= 'z')
+          || (ch >= '0' && ch <= '9')
+          || ch == '_') {
+        result.append(ch);
+      } else {
+        int value = ch - 'A';
+        result.append("_" + Integer.toString(value, 36) + "_");
+      }
+    }
+
+    return result.toString();
+  }
+
+  private static void findCalledFunctions(Node node, Set<Node> changed) {
+    Preconditions.checkArgument(changed != null);
+    // For each referenced function, add a new reference
+    if (node.getType() == Token.CALL) {
+      Node child = node.getFirstChild();
+      if (child.getType() == Token.NAME) {
+        changed.add(child);
+      }
+    }
+
+    for (Node c = node.getFirstChild(); c != null; c = c.getNext()) {
+      findCalledFunctions(c, changed);
+    }
+  }
+}
+```

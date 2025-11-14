@@ -1,0 +1,111 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Add support for writing byte[] via JsonGenerator.writeEmbeddedObject()
+(note: should be safe for patch, that is, 2.8.3)
+Default implementation of 2.8-added writeEmbeddedObject() throws exception (unsupported operation) for all values, since JSON does not have any native object types.
+This is different from handling of writeObject(), which tries to either delegate to ObjectCodec (if one registered), or even encode "simple" values.
+However: since support for binary data is already handled in some cases using VALUE_EMBEDDED_OBJECT, it would actually make sense to handle case of byte[] (and, if feasible, perhaps ByteBuffer for extra points), and also ensure null can be written.
+This is likely necessary to support FasterXML/jackson-databind#1361 and should in general make system more robust.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/core/JsonGenerator.java):
+```java
+public void writeEmbeddedObject(Object object) throws IOException {
+    // 01-Sep-2016, tatu: As per [core#318], handle small number of cases
+    throw new JsonGenerationException("No native support for writing embedded objects",
+            this);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public void writeEmbeddedObject(Object object) throws IOException {
+    // Check if the object is null; if so, just write null
+    if (object == null) {
+        writeNull();
+        return;
+    }
+
+    // Handle byte arrays specifically
+    if (object instanceof byte[]) {
+        byte[] bytes = (byte[]) object;
+        writeBinary(bytes, 0, bytes.length);
+        return;
+    }
+
+    // For other types, use the existing writeObject method
+    writeObject(object);
+}
+```
+
+Okay, I need to fix the `writeEmbeddedObject` method in the `JsonGenerator` class. The current implementation just throws an exception because there's no native support for embedded objects in JSON. But according to the problem statement, we need to handle `byte[]` and possibly `ByteBuffer`, and also allow null.
+
+First, I'll check if the object is null. If it is, I should call `writeNull()` to write a JSON null value. That covers the null case.
+
+Next, I need to handle `byte[]`. Since JSON doesn't have a native type for binary data, but the `writeBinary` method exists, I can use that. So, I'll check if the object is an instance of `byte[]`, cast it, and then call `writeBinary` with the array, starting at index 0 and length equal to the array's size.
+
+For other types, the original approach was to call `writeObject(object)`. However, I should verify if that's still appropriate. The `writeObject` method might use the `ObjectCodec` if available, or handle simple values. This seems acceptable for non-byte array objects, as it delegates to the existing machinery.
+
+Wait, what about `ByteBuffer`? The user mentioned it as a possible addition. Should I add that too? The original question says "if feasible". Let me think. The `writeBinary` method in Jackson can take a `ByteBuffer`, but I'm not sure how that interacts with the existing methods. Maybe adding a check for `ByteBuffer` and converting it to a byte array first?
+
+But the user said "should be safe for patch", implying that maybe just handling `byte[]` is sufficient for now. Also, considering the context of issue #1361, which probably relates to handling byte arrays. So maybe sticking to `byte[]` is better for a minimal patch.
+
+So the final code checks for null, then for byte[], then falls back to writeObject. That should cover the required cases without introducing complexity.
+
+Testing this, when a byte array is passed, it will be written as a base64 encoded string using the `writeBinary` method. Nulls will be written as JSON null. Other objects will be handled by the existing `writeObject` logic, which may involve serialization via the configured codec.
+
+I should also make sure that this method doesn't throw exceptions for these cases. The original code threw an exception for all objects, but now we're handling specific ones. This should make the method more robust for the cases where embedded objects are needed, like in the mentioned issue.
+</think>
+
+To address the need for supporting `byte[]` through `JsonGenerator.writeEmbeddedObject()`, we need to enhance the default implementation, which currently throws an unsupported operation exception. 
+
+---
+
+### ✅ **Rationale**
+JSON does not natively support embedded binary data, but some implementations (like Jackson) use `VALUE_EMBEDDED_OBJECT` to allow for custom binary encoding. By overriding `writeEmbeddedObject()`:
+
+1. We handle **null** values directly.
+2. We specifically support **`byte[]`**, which can be serialized via `writeBinary(...)`.
+3. We delegate **other object types** to the standard `writeObject(...)` mechanism, preserving backward compatibility and flexibility.
+
+---
+
+### 🛠️ **Patch Implementation**
+
+Here’s the updated and corrected version of the `writeEmbeddedObject()` method:
+
+```java
+@Override
+public void writeEmbeddedObject(Object object) throws IOException {
+    if (object == null) {
+        writeNull();
+        return;
+    }
+
+    if (object instanceof byte[]) {
+        byte[] bytes = (byte[]) object;
+        writeBinary(bytes, 0, bytes.length);
+        return;
+    }
+
+    writeObject(object);
+}
+```
+
+---
+
+### 💡 Key Points Explained
+
+| Feature                | Description                                                                 |
+|-----------------------|-----------------------------------------------------------------------------|
+| **Null Handling**     | Explicitly writes `null` if `object` is `null`.                           |
+| **Byte Array Support**| Uses `writeBinary(...)` for direct byte array writing — ideal for binary data. |
+| **Fallback Behavior** | Delegates unknown objects to `writeObject(...)`, allowing proper serialization via codec or default handlers. |
+
+---
+
+### 📌 Notes
+- The method overrides the default behavior introduced in Jackson 2.8.
+- It preserves compatibility with existing serializers while extending functionality for byte arrays, making the API more robust for use-cases such as

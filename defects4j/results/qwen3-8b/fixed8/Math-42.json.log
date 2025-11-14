@@ -1,0 +1,161 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Negative value with restrictNonNegative
+Problem: commons-math-2.2 SimplexSolver.
+A variable with 0 coefficient may be assigned a negative value nevertheless restrictToNonnegative flag in call:
+SimplexSolver.optimize(function, constraints, GoalType.MINIMIZE, true);
+Function
+1 * x + 1 * y + 0
+Constraints:
+1 * x + 0 * y = 1
+Result:
+x = 1; y = -1;
+Probably variables with 0 coefficients are omitted at some point of computation and because of that the restrictions do not affect their values.
+This is an incorrect Java code (src/main/java/org/apache/commons/math/optimization/linear/SimplexTableau.java):
+```java
+protected RealPointValuePair getSolution() {
+  int negativeVarColumn = columnLabels.indexOf(NEGATIVE_VAR_COLUMN_LABEL);
+  Integer negativeVarBasicRow = negativeVarColumn > 0 ? getBasicRow(negativeVarColumn) : null;
+  double mostNegative = negativeVarBasicRow == null ? 0 : getEntry(negativeVarBasicRow, getRhsOffset());
+
+  Set<Integer> basicRows = new HashSet<Integer>();
+  double[] coefficients = new double[getOriginalNumDecisionVariables()];
+  for (int i = 0; i < coefficients.length; i++) {
+      int colIndex = columnLabels.indexOf("x" + i);
+      if (colIndex < 0) {
+        coefficients[i] = 0;
+        continue;
+      }
+      Integer basicRow = getBasicRow(colIndex);
+          // if the basic row is found to be the objective function row
+          // set the coefficient to 0 -> this case handles unconstrained 
+          // variables that are still part of the objective function
+      if (basicRows.contains(basicRow)) {
+          // if multiple variables can take a given value
+          // then we choose the first and set the rest equal to 0
+          coefficients[i] = 0 - (restrictToNonNegative ? 0 : mostNegative);
+      } else {
+          basicRows.add(basicRow);
+          coefficients[i] =
+              (basicRow == null ? 0 : getEntry(basicRow, getRhsOffset())) -
+              (restrictToNonNegative ? 0 : mostNegative);
+      }
+  }
+  return new RealPointValuePair(coefficients, f.getValue(coefficients));
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public class SimplexTableau {
+
+    public RealPointValuePair getSolution(boolean restrictToNonNegative) {
+        int negativeVarColumn = columnLabels.indexOf(NEGATIVE_VAR_COLUMN_LABEL);
+        Integer negativeVarBasicRow = negativeVarColumn > 0 ? getBasicRow(negativeVarColumn) : null;
+        double mostNegative = negativeVarBasicRow == null ? 0 : getEntry(negativeVarBasicRow, getRhsOffset());
+
+        Set<Integer> basicRows = new HashSet<>();
+        double[] coefficients = new double[getOriginalNumDecisionVariables()];
+        
+        for (int i = 0; i < coefficients.length; i++) {
+            int colIndex = columnLabels.indexOf("x" + i);
+            if (colIndex < 0) {
+                coefficients[i] = 0;
+                continue;
+            }
+            
+            Integer basicRow = getBasicRow(colIndex);
+            boolean isBasicVariable = basicRow != null && !basicRows.contains(basicRow);
+            
+            if (!isBasicVariable) {
+                // If it's not a basic variable, set its coefficient to zero
+                coefficients[i] = 0;
+                continue;
+            }
+            
+            basicRows.add(basicRow);
+            double rhsValue = basicRow == null ? 0 : getEntry(basicRow, getRhsOffset());
+            double adjustment = restrictToNonNegative ? 0 : mostNegative;
+            
+            coefficients[i] = rhsValue - adjustment;
+        }
+        
+        return new RealPointValuePair(coefficients, f.getValue(coefficients));
+    }
+    
+    // Rest of the class remains unchanged
+}
+```
+
+The problem lies in how the `getSolution()` method handles the restriction to non-negative values when retrieving the solution from the simplex tableau.
+
+In the original implementation:
+1. It attempts to find the coefficient for each decision variable
+2. For non-basic variables (which should be zero), it incorrectly applies adjustments based on the most negative value
+3. This leads to non-basic variables potentially getting negative values when they shouldn't
+
+The key issues are:
+1. The original code didn't properly distinguish between basic and non-basic variables
+2. It applied the same adjustment logic to all variables, including those that should naturally be zero
+3. The use of `mostNegative` was causing unintended behavior for non-basic variables
+
+The repaired code:
+1. Separately identifies basic and non-basic variables
+2. Sets non-basic variables to exactly zero
+3. Applies the restriction only to basic variables that might have negative values
+4. Maintains the core functionality of the simplex algorithm while ensuring non-negativity constraints are respected
+
+This change ensures that variables with 0 coefficients in the constraint matrix (like 'y' in your example) will correctly be set to zero, even if they appear in the objective function.
+</think>
+
+To address the issue with the `SimplexSolver.optimize(...)` method producing a negative value for a variable that should be constrained to be non-negative (e.g., `y` in the given example), we need to carefully review how the internal `SimplexTableau.getSolution()` method assigns final values to variables.
+
+---
+
+### 🔍 Problem Analysis
+
+In the provided code snippet:
+
+```java
+protected RealPointValuePair getSolution() {
+  ...
+  if (basicRows.contains(basicRow)) {
+    coefficients[i] = 0 - (restrictToNonNegative ? 0 : mostNegative);
+  } else {
+    ...
+  }
+}
+```
+
+There’s a flaw in handling **non-basic variables** — specifically, those with **zero coefficients in the constraint system**, such as `y`.
+
+These variables **should inherently be zero**, yet the current logic incorrectly applies adjustments derived from the "most negative" value from other rows (including possibly the objective function or slack variables). This results in variables like `y`, which should be zero due to having no explicit constraint, being assigned a non-zero value.
+
+---
+
+### ✅ Solution Overview
+
+We need to:
+1. Identify which variables are **non-basic**, and ensure they're explicitly set to **zero**.
+2. Apply the non-negative restriction **only to basic variables**.
+3. Avoid applying arbitrary adjustments like `mostNegative` to non-basic or unconstrained variables.
+
+Instead, the correct approach is:
+- Non-basic variables (those not in the basis) should always be set to **0**, regardless of the rest of the tableau state.
+- Basic variables should have values extracted directly from the right-hand side of their respective rows, with optional clamping to zero when restricted to non-negativity.
+
+---
+
+### 🛠️ Fixed Code Implementation
+
+Here is the corrected version of the `getSolution()` method with proper distinction between basic and non-basic variables:
+
+```java
+private RealPointValuePair getSolution(boolean restrictToNonNegative) {
+    int negativeVarColumn = columnLabels.indexOf(NEGATIVE_VAR_COLUMN_LABEL);
+    Integer negativeVarBasicRow = negativeVarColumn > 0 ? getBasicRow(negativeVarColumn) : null;
+    double mostNegative = negative

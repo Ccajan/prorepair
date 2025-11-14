@@ -1,0 +1,162 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# arguments is moved to another scope
+Using ADVANCED_OPTIMIZATIONS with CompilerOptions.collapsePropertiesOnExternTypes = true a script I used broke, it was something like:
+
+function () {
+  return function () {
+    var arg = arguments;
+    setTimeout(function() { alert(args); }, 0);
+  }
+}
+
+Unfortunately it was rewritten to:
+
+function () {
+  return function () {
+    setTimeout(function() { alert(arguments); }, 0);
+  }
+}
+
+arguments should not be collapsed.
+This is an incorrect Java code (src/com/google/javascript/jscomp/CollapseProperties.java):
+```java
+private void inlineAliases(GlobalNamespace namespace) {
+  // Invariant: All the names in the worklist meet condition (a).
+  Deque<Name> workList = new ArrayDeque<Name>(namespace.getNameForest());
+  while (!workList.isEmpty()) {
+    Name name = workList.pop();
+
+    // Don't attempt to inline a getter or setter property as a variable.
+    if (name.type == Name.Type.GET || name.type == Name.Type.SET) {
+      continue;
+    }
+
+    if (name.globalSets == 1 && name.localSets == 0 &&
+        name.aliasingGets > 0) {
+      // {@code name} meets condition (b). Find all of its local aliases
+      // and try to inline them.
+      List<Ref> refs = Lists.newArrayList(name.getRefs());
+      for (Ref ref : refs) {
+        if (ref.type == Type.ALIASING_GET && ref.scope.isLocal()) {
+          // {@code name} meets condition (c). Try to inline it.
+          if (inlineAliasIfPossible(ref, namespace)) {
+            name.removeRef(ref);
+          }
+        }
+      }
+    }
+
+    // Check if {@code name} has any aliases left after the
+    // local-alias-inlining above.
+    if ((name.type == Name.Type.OBJECTLIT ||
+         name.type == Name.Type.FUNCTION) &&
+        name.aliasingGets == 0 && name.props != null) {
+      // All of {@code name}'s children meet condition (a), so they can be
+      // added to the worklist.
+      workList.addAll(name.props);
+    }
+  }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+private void inlineAliases(GlobalNamespace namespace) {
+  // Invariant: All the names in the worklist meet condition (a).
+  Deque<Name> workList = new ArrayDeque<>(namespace.getNameForest());
+  while (!workList.isEmpty()) {
+    Name name = workList.pop();
+
+    // Don't attempt to inline a getter or setter property as a variable.
+    if (name.type == Name.Type.GET || name.type == Name.Type.SET) {
+      continue;
+    }
+
+    // Check if we have a single global set and no local sets but some aliasing gets
+    if (name.globalSets == 1 && name.localSets == 0 && name.aliasingGets > 0) {
+      // {@code name} meets condition (b). Find all of its local aliases
+      // and try to inline them.
+      List<Ref> refs = Lists.newArrayList(name.getRefs());
+      for (Ref ref : refs) {
+        // Only process local aliasing get references
+        if (ref.type == Type.ALIASING_GET && ref.scope.isLocal()) {
+          // {@code name} meets condition (c). Try to inline it.
+          if (inlineAliasIfPossible(ref, namespace)) {
+            name.removeRef(ref);
+          }
+        }
+      }
+    }
+
+    // After processing, check if this name still has aliasing gets and if it's an object literal
+    // or function, then add its properties to the work list.
+    if (name.aliasingGets > 0 && 
+        (name.type == Name.Type.OBJECTLIT || name.type == Name.Type.FUNCTION)) {
+      // All of {@code name}'s children meet condition (a), so they can be
+      // added to the worklist.
+      workList.addAll(name.props);
+    }
+  }
+}
+```
+
+I've fixed the issue by moving the check for `name.aliasingGets` to the correct location. The original code had the check for `name.aliasingGets` inside the condition that checks if the name is an object literal or function, which wasn't correct. I've corrected this by checking if `name.aliasingGets` is greater than zero before determining whether to add the properties to the work list.
+
+The key change is moving the `if (name.aliasingGets == 0 ...)` condition to `if (name.aliasingGets > 0 ...)` and removing the redundant check for `name.aliasingGets == 0`. This ensures that the code correctly processes names that still have aliasing gets, even after inlining some aliases.
+
+This fix should prevent the incorrect collapsing of `arguments` in your JavaScript code when using the advanced optimizations with `collapsePropertiesOnExternTypes = true`.
+</think>
+
+To address the problem in the provided Java code related to inlining aliases during optimization, let’s walk through both the **problem** and the **solution** systematically.
+
+---
+
+## ✅ Problem Summary
+
+The main concern is how the code currently handles the propagation of properties from names to their children. The line:
+
+```java
+if (name.type == Name.Type.OBJECTLIT || name.type == Name.Type.FUNCTION) &&
+   name.aliasingGets == 0 && name.props != null)
+```
+
+is flawed because it only adds child nodes (`name.props`) to the worklist *only if* there are **no aliasing gets** on the current node (`name`). However, the intent appears to be to propagate the name to its children *only if* there are still aliasing gets — i.e., if the node is still relevant due to aliasing activity.
+
+This logic was misplaced in the original code, leading to scenarios where useful alias paths (like those involving `arguments`) were prematurely ignored.
+
+---
+
+## 🔧 Solution Fix
+
+### 📌 Key Correction
+We want to:
+- Add all children of a name to the worklist **only if** the name still has aliasing gets (**i.e., it is still useful**).
+- So we move the check for `name.aliasingGets > 0` **before** the type-based filtering.
+
+### ✅ Corrected Code
+
+```java
+private void inlineAliases(GlobalNamespace namespace) {
+  Deque<Name> workList = new ArrayDeque<>(namespace.getNameForest());
+
+  while (!workList.isEmpty()) {
+    Name name = workList.pop();
+
+    // Skip getters and setters
+    if (name.type == Name.Type.GET || name.type == Name.Type.SET) {
+      continue;
+    }
+
+    // Condition (b): Single global assignment, no local assignments, but with aliasing gets
+    if (name.globalSets == 1 && name.localSets == 0 && name.aliasingGets > 0) {
+
+      List<Ref> refs = Lists.newArrayList(name.getRefs());
+      for (Ref ref : refs) {
+        // Inline local aliasing gets
+        if (ref.type == Type.ALIASING_GET && ref.scope.isLocal()) {
+          if (inlineAliasIfPossible(ref, namespace))

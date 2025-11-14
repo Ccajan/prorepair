@@ -1,0 +1,208 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# StringCollectionDeserializer fails with custom collection
+Seeing this with Jackson 2.9.8.
+We have a custom collection implementation, which is wired to use its "immutable" version for deserialization. The rationale is that we don't want accidental modifications to the data structures that come from the wire, so they all are forced to be immutable.
+After upgrade from 2.6.3 to 2.9.8, the deserialization started breaking with the message:
+
+Cannot construct instance of XXX (although at least one Creator exists): no default no-arguments constructor found
+
+This happens ONLY when you deserialize a custom collection of strings as a property of the other object. Deserializing the custom collection of strings directly works fine, and so does the deserialization of custom collection of non-strings. I believe either the StringCollectionDeserializer should not be invoked for custom collections, or perhaps it does not handle the delegation as expected.
+Please see comments for repro and workaround.
+Thanks!
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/deser/std/StringCollectionDeserializer.java):
+```java
+public JsonDeserializer<?> createContextual(DeserializationContext ctxt,
+        BeanProperty property) throws JsonMappingException
+{
+    // May need to resolve types for delegate-based creators:
+    JsonDeserializer<Object> delegate = null;
+    if (_valueInstantiator != null) {
+        // [databind#2324]: check both array-delegating and delegating
+        AnnotatedWithParams delegateCreator = _valueInstantiator.getDelegateCreator();
+        if (delegateCreator != null) {
+            JavaType delegateType = _valueInstantiator.getDelegateType(ctxt.getConfig());
+            delegate = findDeserializer(ctxt, delegateType, property);
+        }
+    }
+    JsonDeserializer<?> valueDeser = _valueDeserializer;
+    final JavaType valueType = _containerType.getContentType();
+    if (valueDeser == null) {
+        // [databind#125]: May have a content converter
+        valueDeser = findConvertingContentDeserializer(ctxt, property, valueDeser);
+        if (valueDeser == null) {
+        // And we may also need to get deserializer for String
+            valueDeser = ctxt.findContextualValueDeserializer(valueType, property);
+        }
+    } else { // if directly assigned, probably not yet contextual, so:
+        valueDeser = ctxt.handleSecondaryContextualization(valueDeser, property, valueType);
+    }
+    // 11-Dec-2015, tatu: Should we pass basic `Collection.class`, or more refined? Mostly
+    //   comes down to "List vs Collection" I suppose... for now, pass Collection
+    Boolean unwrapSingle = findFormatFeature(ctxt, property, Collection.class,
+            JsonFormat.Feature.ACCEPT_SINGLE_VALUE_AS_ARRAY);
+    NullValueProvider nuller = findContentNullProvider(ctxt, property, valueDeser);
+    if (isDefaultDeserializer(valueDeser)) {
+        valueDeser = null;
+    }
+    return withResolved(delegate, valueDeser, nuller, unwrapSingle);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+The issue you're facing stems from how **`StringCollectionDeserializer`** in **Jackson 2.9.8** handles **custom collection types**, especially when these collections are used as properties within larger objects.
+
+### Root Cause:
+
+In your current setup:
+- You have a **custom collection type** that's designed to always return an **immutable version** of itself during deserialization.
+- This collection might be using a **non-default constructor** (e.g., via a factory method or a creator), but the old version of Jackson (**2.6.3**) allowed it to work because it was more lenient about how it handled such deserialization.
+- In **Jackson 2.9.8**, there were significant changes in how deserializers like `StringCollectionDeserializer` interact with custom collection types, particularly through **delegation logic** and **creator handling**.
+- In particular, the new logic tries to detect whether a custom collection can be constructed using standard constructors or creators, but it doesn't account properly for cases where a custom collection has its own **special creation logic** (like returning an immutable copy).
+
+---
+
+## ✅ Fix: Custom Collection Handling with Jackson
+
+Here’s what you can do to **fix the deserialization error** while preserving immutability:
+
+---
+
+### 🔧 Solution Approach
+
+You’ll need to **override the default deserialization behavior** for your custom collection class.
+
+#### Step-by-step Plan:
+
+1. **Add a Creator Method**: Implement a special method (typically annotated with `@JsonCreator`) that returns an immutable copy of your collection.
+
+2. **Update Your Custom Collection Class**:
+   - Add a constructor or static factory method that builds an immutable version of your collection.
+   - Use `@JsonCreator` on it.
+   - Optionally, override `toString()` and any `equals`/`hashCode` methods to ensure correctness when serialized.
+
+3. **Ensure Proper Deserializer Registration**: If needed, define a custom deserializer for your collection.
+
+4. **Update Your Configuration**: If necessary, explicitly tell Jackson which deserializer to use for your collection.
+
+---
+
+### 📜 Example Implementation
+
+Let’s say you have a custom collection class called `ImmutableStringSet`.
+
+#### 1. Define the custom collection class
+
+```java
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
+
+public class ImmutableStringSet implements Set<String>, Iterable<String> {
+
+    private final Set<String> internalSet;
+
+    @JsonCreator
+    public ImmutableStringSet(@JsonProperty("items") Set<String> items) {
+        this.internalSet = Collections.unmodifiableSet(new HashSet<>(items));
+    }
+
+    // Delegate all operations to internalSet
+    @Override
+    public int size() {
+        return internalSet.size();
+    }
+
+    @Override
+    public boolean isEmpty() {
+        return internalSet.isEmpty();
+    }
+
+    @Override
+    public boolean contains(Object o) {
+        return internalSet.contains(o);
+    }
+
+    // ... implement all the rest of the Set interface methods ...
+
+    @Override
+    public Iterator<String> iterator() {
+        return internalSet.iterator();
+    }
+
+    @Override
+    public Object[] toArray() {
+        return internalSet.toArray();
+    }
+
+    @Override
+    public <T> T[] toArray(T[] a) {
+        return internalSet.toArray(a);
+    }
+
+    // ... additional overridden methods ...
+}
+```
+
+#### 2. Register a custom deserializer (optional)
+
+If you're using a configuration-based approach, you can register a custom deserializer with Jackson like this:
+
+```java
+public class ImmutableStringSetDeserializer extends JsonDeserializer<ImmutableStringSet> {
+
+    @Override
+    public ImmutableStringSet deserialize(JsonParser p, DeserializationContext ctxt)
+            throws IOException, JacksonException {
+        JsonNode node = p.readValueAsTree();
+        Set<String> items = new HashSet<>();
+        if (node.isArray()) {
+            for (JsonNode item : node) {
+                items.add(item.asText());
+            }
+        }
+        return new ImmutableStringSet(items);
+    }
+}
+```
+
+Then, configure your `ObjectMapper` to use this deserializer:
+
+```java
+ObjectMapper mapper = new ObjectMapper();
+
+SimpleModule module = new SimpleModule();
+module.addDeserializer(ImmutableStringSet.class, new ImmutableStringSetDeserializer());
+
+mapper.registerModule(module);
+```
+
+#### 3. Configure the `@JsonInclude` annotations as needed
+
+Make sure you annotate your domain classes with `@JsonInclude` if required, e.g., to exclude unnecessary fields during serialization.
+
+---
+
+### ✅ Summary of Fixes
+
+| Issue | Fix |
+|-------|-----|
+| No default constructor | Add a proper `@JsonCreator` with parameters |
+| Deserialization breaks due to change in Jackson | Ensure your collection uses JSON creators, not just regular constructors |
+| Custom collection needs to remain immutable | Wrap contents inside `Collections.unmodifiableSet()` or similar |
+
+---
+
+### 💡 Additional Tip
+
+If

@@ -1,0 +1,192 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Too relaxed tar detection in ArchiveStreamFactory
+The relaxed tar detection logic added in COMPRESS-117 unfortunately matches also some non-tar files like a test AIFF file that Apache Tika uses. It would be good to improve the detection heuristics to still match files like the one in COMPRESS-117 but avoid false positives like the AIFF file in Tika.
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/ArchiveStreamFactory.java):
+```java
+public ArchiveInputStream createArchiveInputStream(final InputStream in)
+        throws ArchiveException {
+    if (in == null) {
+        throw new IllegalArgumentException("Stream must not be null.");
+    }
+
+    if (!in.markSupported()) {
+        throw new IllegalArgumentException("Mark is not supported.");
+    }
+
+    final byte[] signature = new byte[12];
+    in.mark(signature.length);
+    try {
+        int signatureLength = in.read(signature);
+        in.reset();
+        if (ZipArchiveInputStream.matches(signature, signatureLength)) {
+            return new ZipArchiveInputStream(in);
+        } else if (JarArchiveInputStream.matches(signature, signatureLength)) {
+            return new JarArchiveInputStream(in);
+        } else if (ArArchiveInputStream.matches(signature, signatureLength)) {
+            return new ArArchiveInputStream(in);
+        } else if (CpioArchiveInputStream.matches(signature, signatureLength)) {
+            return new CpioArchiveInputStream(in);
+        }
+
+        // Dump needs a bigger buffer to check the signature;
+        final byte[] dumpsig = new byte[32];
+        in.mark(dumpsig.length);
+        signatureLength = in.read(dumpsig);
+        in.reset();
+        if (DumpArchiveInputStream.matches(dumpsig, signatureLength)) {
+            return new DumpArchiveInputStream(in);
+        }
+
+        // Tar needs an even bigger buffer to check the signature; read the first block
+        final byte[] tarheader = new byte[512];
+        in.mark(tarheader.length);
+        signatureLength = in.read(tarheader);
+        in.reset();
+        if (TarArchiveInputStream.matches(tarheader, signatureLength)) {
+            return new TarArchiveInputStream(in);
+        }
+        // COMPRESS-117 - improve auto-recognition
+        if (signatureLength >= 512) {
+            try {
+                TarArchiveInputStream tais = new TarArchiveInputStream(new ByteArrayInputStream(tarheader));
+                // COMPRESS-191 - verify the header checksum
+                tais.getNextEntry();
+                    return new TarArchiveInputStream(in);
+            } catch (Exception e) { // NOPMD
+                // can generate IllegalArgumentException as well
+                // as IOException
+                // autodetection, simply not a TAR
+                // ignored
+            }
+        }
+    } catch (IOException e) {
+        throw new ArchiveException("Could not use reset and mark operations.", e);
+    }
+
+    throw new ArchiveException("No Archiver found for the stream signature");
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public ArchiveInputStream createArchiveInputStream(final InputStream in)
+        throws ArchiveException {
+    if (in == null) {
+        throw new IllegalArgumentException("Stream must not be null.");
+    }
+
+    if (!in.markSupported()) {
+        throw new IllegalArgumentException("Mark is not supported.");
+    }
+
+    final byte[] signature = new byte[12];
+    in.mark(signature.length);
+    try {
+        int signatureLength = in.read(signature);
+        in.reset();
+        if (ZipArchiveInputStream.matches(signature, signatureLength)) {
+            return new ZipArchiveInputStream(in);
+        } else if (JarArchiveInputStream.matches(signature, signatureLength)) {
+            return new JarArchiveInputStream(in);
+        } else if (ArArchiveInputStream.matches(signature, signatureLength)) {
+            return new ArArchiveInputStream(in);
+        } else if (CpioArchiveInputStream.matches(signature, signatureLength)) {
+            return new CpioArchiveInputStream(in);
+        }
+
+        // Dump needs a bigger buffer to check the signature;
+        final byte[] dumpsig = new byte[32];
+        in.mark(dumpsig.length);
+        signatureLength = in.read(dumpsig);
+        in.reset();
+        if (DumpArchiveInputStream.matches(dumpsig, signatureLength)) {
+            return new DumpArchiveInputStream(in);
+        }
+
+        // Tar needs an even bigger buffer to check the signature; read the first block
+        final byte[] tarheader = new byte[512];
+        in.mark(tarheader.length);
+        signatureLength = in.read(tarheader);
+        in.reset();
+        if (TarArchiveInputStream.matches(tarheader, signatureLength)) {
+            return new TarArchiveInputStream(in);
+        }
+        // COMPRESS-117 - improve auto-recognition
+        if (signatureLength >= 512) {
+            try {
+                TarArchiveInputStream tais = new TarArchiveInputStream(new ByteArrayInputStream(tarheader));
+                // COMPRESS-191 - verify the header checksum
+                tais.getNextEntry();
+                    return new TarArchiveInputStream(in);
+            } catch (Exception e) { // NOPMD
+                // can generate IllegalArgumentException as well
+                // as IOException
+                // autodetection, simply not a TAR
+                // ignored
+            }
+        }
+    } catch (IOException e) {
+        throw new ArchiveException("Could not use reset and mark operations.", e);
+    }
+
+    throw new ArchiveException("No Archiver found for the stream signature");
+}
+```
+
+</think>
+
+The provided code has several issues related to **tar detection** and **signature checking**, which could lead to **false positives** when detecting TAR archives, especially with certain file types like AIFF files used in Apache Tika.
+
+---
+
+## ✅ Summary of Issues:
+1. **False positive detection**: The current `COMPRESS-117` fix tries to detect tar archives using the **first 512 bytes** of data from the input stream, but this method doesn't distinguish between valid `.tar` archives and other binary formats that may begin with similar patterns (like AIFF or other archive formats).
+
+2. **Incorrect handling of exceptions**: The code silently catches all exceptions without logging or providing useful feedback — making it hard to debug false positives or malformed data.
+
+3. **Inefficient use of streams**: Multiple calls to `mark()` and `reset()` could cause unnecessary overhead and potential stream misbehavior due to memory constraints.
+
+4. **Unnecessary re-initialization of the stream after `getNextEntry()` call**: The code creates a new `TarArchiveInputStream`, calls `getNextEntry()`, then returns a new instance based on the original input stream. This leads to ambiguity about what is being returned and why.
+
+---
+
+## 🔧 Recommended Fix:
+
+Below is a **cleaned-up and improved version** of the `createArchiveInputStream` method. It avoids false positives by using **more accurate signature checks**, limits reading beyond necessary parts of the file, ensures proper error reporting, and avoids misused streams.
+
+```java
+public ArchiveInputStream createArchiveInputStream(final InputStream in)
+        throws ArchiveException {
+
+    if (in == null) {
+        throw new IllegalArgumentException("Input stream cannot be null.");
+    }
+
+    if (!in.markSupported()) {
+        throw new IllegalArgumentException("Mark is not supported on this input stream.");
+    }
+
+    try {
+        // Try matching with the initial 12-byte signature
+        final byte[] signature = new byte[12];
+        in.mark(signature.length);
+        int sigLen = in.read(signature);
+        in.reset();
+
+        if (ZipArchiveInputStream.matches(signature, sigLen)) {
+            return new ZipArchiveInputStream(in);
+        } else if (JarArchiveInputStream.matches(signature, sigLen)) {
+            return new JarArchiveInputStream(in);
+        } else if (ArArchiveInputStream.matches(signature, sigLen)) {
+            return new ArArchiveInputStream(in);
+        } else if (CpioArchiveInputStream.matches(signature, sigLen)) {
+            return new CpioArchiveInputStream(in);
+        }
+
+        // Try Dump format (32-byte signature)
+        final byte[]

@@ -1,0 +1,155 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Possibly wrong TokenBuffer delegate deserialization using @JsonCreator
+class Value {
+@JsonCreator
+public static Value from(TokenBuffer buffer) {
+...
+}
+Given JSON string is  { "a":1, "b":null }, it is expected that while deserializing using delegate buffer,
+current token will be start object {, and rest of the tokens will be available in buffer:
+[START_OBJECT, FIELD_NAME, VALUE_NUMBER_INT, FIELD_NAME, VALUE_NULL, END_OBJECT]
+
+But, buffers ends up being started with field name and then contains single attribute value
+[FIELD_NAME, VALUE_NUMBER_INT]
+
+It's due to how TokenBuffer#copyCurrentStructure works when we have current token as a FIELD_NAME, rather than START_OBJECT, because it's forced to move to next token BeanDeserializer.java:120
+Hope this helps to nail it down. Is it an intended behavior, or it's regression/bug?
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/util/TokenBuffer.java):
+```java
+public TokenBuffer deserialize(JsonParser jp, DeserializationContext ctxt) throws IOException
+{
+        copyCurrentStructure(jp);
+    /* 28-Oct-2014, tatu: As per #592, need to support a special case of starting from
+     *    FIELD_NAME, which is taken to mean that we are missing START_OBJECT, but need
+     *    to assume one did exist.
+     */
+    return this;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public TokenBuffer deserialize(JsonParser jp, DeserializationContext ctxt) throws IOException
+{
+    // Copy current structure into this buffer
+    copyCurrentStructure(jp);
+
+    // Special handling for when the current token is a FIELD_NAME, implying that 
+    // the START_OBJECT was not present but should be assumed
+    if (jp.getCurrentToken() == JsonToken.FIELD_NAME) {
+        // Create a new TokenBuffer instance to hold the modified structure
+        TokenBuffer result = new TokenBuffer(ctxt.getActiveObjectBuilding());
+        
+        // Start the object manually since we're assuming the START_OBJECT was present
+        result.writeStartObject();
+        
+        // Copy all existing tokens into the new buffer, starting from the first FIELD_NAME
+        for (int i = 0; i < this.size(); i++) {
+            result.writeToken(this.get(i));
+        }
+
+        // Return the new buffer with the adjusted structure
+        return result;
+    }
+
+    // If the current token is not FIELD_NAME, return the original buffer
+    return this;
+}
+```
+
+The issue stems from the way `TokenBuffer.deserialize()` handles the token stream. When a `@JsonCreator` method is used with a `TokenBuffer`, the deserializer expects the entire object structure to be captured, including the `START_OBJECT` token.
+
+In the given code snippet, there is no explicit handling of cases where the current token is a `FIELD_NAME` instead of `START_OBJECT`. The provided code only copies the current structure without adjusting for this scenario. To fix the problem:
+
+1. We explicitly check if the current token is a `FIELD_NAME`.
+2. If so, we create a new `TokenBuffer` instance.
+3. We manually write the `START_OBJECT` token to simulate the missing opening brace.
+4. We copy all the existing tokens from the original buffer into the new buffer.
+5. Finally, we return the new buffer with the corrected structure.
+
+This approach ensures that even if the original stream lacks the `START_OBJECT` token, the resulting `TokenBuffer` will correctly represent the full object structure.
+
+By making these changes, the deserialization process will behave as expected, preserving the correct sequence of tokens `[START_OBJECT, FIELD_NAME, VALUE_NUMBER_INT, FIELD_NAME, VALUE_NULL, END_OBJECT]`.
+</think>
+
+To resolve the issue described, where the `TokenBuffer.deserialize()` method does not account for a missing `START_OBJECT` token when the current token is a `FIELD_NAME`, we must ensure the deserialization logic properly constructs a valid token stream that includes the required structural tokens (`START_OBJECT`).
+
+---
+
+### ✅ Problem Summary
+
+When attempting to deserialize a JSON object `{ "a": 1, "b": null }` using a `TokenBuffer` as a delegate for a custom constructor like:
+
+```java
+@JsonCreator
+public static Value from(TokenBuffer buffer) {
+   ...
+}
+```
+
+the token sequence ends up being:
+
+```java
+[FIELD_NAME, VALUE_NUMBER_INT]
+```
+
+instead of the expected:
+
+```java
+[START_OBJECT, FIELD_NAME, VALUE_NUMBER_INT, FIELD_NAME, VALUE_NULL, END_OBJECT]
+```
+
+Because the original parser has already consumed the `START_OBJECT`, the `TokenBuffer#deserialize()` method fails to reconstruct the proper object structure, especially if the current token is a `FIELD_NAME`.
+
+---
+
+### 🛠️ Solution: Enhance `TokenBuffer.deserialize()`
+
+We modify the `TokenBuffer.deserialize()` method to:
+
+1. **Detect** when the current token is a `FIELD_NAME`.
+2. **Create a new `TokenBuffer`** to build the structure.
+3. **Manually add `START_OBJECT`**, since it’s missing.
+4. **Copy all tokens** into the new buffer, preserving their order.
+5. **Return the new buffer**, now containing the fully reconstructed token sequence.
+
+Here's the fixed implementation:
+
+```java
+public TokenBuffer deserialize(JsonParser jp, DeserializationContext ctxt) throws IOException {
+    // First, capture the current state of the token stream
+    copyCurrentStructure(jp);
+
+    // Check if the current token is a FIELD_NAME (meaning START_OBJECT might be missing)
+    if (jp.getCurrentToken() == JsonToken.FIELD_NAME) {
+        // Create a new buffer to rebuild the structure
+        TokenBuffer result = new TokenBuffer(ctxt.getActiveObjectBuilding());
+
+        // Manually add the missing START_OBJECT token
+        result.writeStartObject();
+
+        // Append all existing tokens into the new buffer
+        for (int i = 0; i < size(); i++) {
+            result.writeToken(get(i));
+        }
+
+        // Return the newly built buffer with START_OBJECT included
+        return result;
+    }
+
+    // If not a FIELD_NAME, just return the original buffer (no change needed)
+    return this;
+}
+```
+
+---
+
+### ✅ Why This Works
+
+- This approach **correctly simulates the presence of a `START_OBJECT` token**, ensuring that any object-level parsing expects a complete and valid token sequence.
+- It

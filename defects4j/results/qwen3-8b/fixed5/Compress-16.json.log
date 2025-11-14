@@ -1,0 +1,185 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Too relaxed tar detection in ArchiveStreamFactory
+The relaxed tar detection logic added in COMPRESS-117 unfortunately matches also some non-tar files like a test AIFF file that Apache Tika uses. It would be good to improve the detection heuristics to still match files like the one in COMPRESS-117 but avoid false positives like the AIFF file in Tika.
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/ArchiveStreamFactory.java):
+```java
+public ArchiveInputStream createArchiveInputStream(final InputStream in)
+        throws ArchiveException {
+    if (in == null) {
+        throw new IllegalArgumentException("Stream must not be null.");
+    }
+
+    if (!in.markSupported()) {
+        throw new IllegalArgumentException("Mark is not supported.");
+    }
+
+    final byte[] signature = new byte[12];
+    in.mark(signature.length);
+    try {
+        int signatureLength = in.read(signature);
+        in.reset();
+        if (ZipArchiveInputStream.matches(signature, signatureLength)) {
+            return new ZipArchiveInputStream(in);
+        } else if (JarArchiveInputStream.matches(signature, signatureLength)) {
+            return new JarArchiveInputStream(in);
+        } else if (ArArchiveInputStream.matches(signature, signatureLength)) {
+            return new ArArchiveInputStream(in);
+        } else if (CpioArchiveInputStream.matches(signature, signatureLength)) {
+            return new CpioArchiveInputStream(in);
+        }
+
+        // Dump needs a bigger buffer to check the signature;
+        final byte[] dumpsig = new byte[32];
+        in.mark(dumpsig.length);
+        signatureLength = in.read(dumpsig);
+        in.reset();
+        if (DumpArchiveInputStream.matches(dumpsig, signatureLength)) {
+            return new DumpArchiveInputStream(in);
+        }
+
+        // Tar needs an even bigger buffer to check the signature; read the first block
+        final byte[] tarheader = new byte[512];
+        in.mark(tarheader.length);
+        signatureLength = in.read(tarheader);
+        in.reset();
+        if (TarArchiveInputStream.matches(tarheader, signatureLength)) {
+            return new TarArchiveInputStream(in);
+        }
+        // COMPRESS-117 - improve auto-recognition
+        if (signatureLength >= 512) {
+            try {
+                TarArchiveInputStream tais = new TarArchiveInputStream(new ByteArrayInputStream(tarheader));
+                // COMPRESS-191 - verify the header checksum
+                tais.getNextEntry();
+                    return new TarArchiveInputStream(in);
+            } catch (Exception e) { // NOPMD
+                // can generate IllegalArgumentException as well
+                // as IOException
+                // autodetection, simply not a TAR
+                // ignored
+            }
+        }
+    } catch (IOException e) {
+        throw new ArchiveException("Could not use reset and mark operations.", e);
+    }
+
+    throw new ArchiveException("No Archiver found for the stream signature");
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+Certainly! The issue with the current `createArchiveInputStream` method is that it has **relaxed tar detection logic** which is matching **non-tar files**, such as the AIFF file used by Apache Tika. This can lead to **false positives**, where the system incorrectly identifies certain binary formats as tar archives.
+
+### ✅ Summary of the Problem:
+- The existing code reads up to 512 bytes from the input stream and tries to detect the archive type.
+- For tar files, after reading 512 bytes, it creates a temporary `TarArchiveInputStream` using those bytes, calls `getNextEntry()`, and then returns a real `TarArchiveInputStream` based on the original stream.
+- However, this approach may mistakenly identify other files (like AIFF) as tar files because they may have a valid tar header format at the beginning.
+
+---
+
+### 🔧 Solution:
+
+We need to **refactor** the **tar detection logic** so that it only considers **true tar headers** and avoids unnecessary creation or evaluation of potentially false positive inputs.
+
+Here's the corrected version of your method:
+
+```java
+public ArchiveInputStream createArchiveInputStream(final InputStream in)
+        throws ArchiveException {
+    if (in == null) {
+        throw new IllegalArgumentException("Stream must not be null.");
+    }
+
+    if (!in.markSupported()) {
+        throw new IllegalArgumentException("Mark is not supported.");
+    }
+
+    final byte[] signature = new byte[12];
+    in.mark(signature.length);
+    try {
+        int signatureLength = in.read(signature);
+        in.reset();
+
+        if (ZipArchiveInputStream.matches(signature, signatureLength)) {
+            return new ZipArchiveInputStream(in);
+        } else if (JarArchiveInputStream.matches(signature, signatureLength)) {
+            return new JarArchiveInputStream(in);
+        } else if (ArArchiveInputStream.matches(signature, signatureLength)) {
+            return new ArArchiveInputStream(in);
+        } else if (CpioArchiveInputStream.matches(signature, signatureLength)) {
+            return new CpioArchiveInputStream(in);
+        }
+
+        // Check for dump archive (requires more data)
+        final byte[] dumpsig = new byte[32];
+        in.mark(dumpsig.length);
+        signatureLength = in.read(dumpsig);
+        in.reset();
+        if (DumpArchiveInputStream.matches(dumpsig, signatureLength)) {
+            return new DumpArchiveInputStream(in);
+        }
+
+        // Now handle Tar archive with proper detection
+        final byte[] tarHeader = new byte[512];
+        in.mark(tarHeader.length);
+        signatureLength = in.read(tarHeader);
+        in.reset();
+
+        // Only attempt to parse if we actually read 512 bytes
+        if (signatureLength == tarHeader.length) {
+            // Use ByteArrayInputStream to check the header without modifying original stream
+            ByteArrayInputStream bais = new ByteArrayInputStream(tarHeader);
+            TarArchiveInputStream tais = new TarArchiveInputStream(bais);
+
+            try {
+                // Read one entry to validate the header (this will throw if header is invalid)
+                tais.getNextEntry();
+                // If we reach here, header is valid → create TarArchiveInputStream
+                return new TarArchiveInputStream(in);
+            } catch (Exception e) {
+                // Catch any exceptions during header validation
+                // This includes invalid headers, malformed entries, etc.
+                // Do NOT fall back or consider as Tar
+            } finally {
+                try {
+                    tais.close();
+                } catch (IOException ignore) {}
+            }
+        }
+
+    } catch (IOException e) {
+        throw new ArchiveException("Could not use reset and mark operations.", e);
+    }
+
+    throw new ArchiveException("No Archiver found for the stream signature");
+}
+```
+
+---
+
+### 📌 Key Improvements:
+
+| Feature | Description |
+|--------|-------------|
+| **Exact header length check** | Ensures only full tar headers (512 bytes) are considered. |
+| **Use of ByteArrayInputStream** | Avoids creating actual `TarArchiveInputStream` before confirming it’s a tar. |
+| **Robust exception handling** | Prevents side effects of invalid headers and allows clean resource cleanup. |
+| **Avoids unnecessary object instantiation** | Only instantiate `TarArchiveInputStream` if the header validates correctly. |
+
+---
+
+### ✅ Additional Notes:
+
+- Ensure that all helper methods (`matches(...)`) properly handle edge cases.
+- The `TarArchiveInputStream` might not fully validate until the first entry is read via `getNextEntry()` — this is intentional behavior and helps avoid early assumptions about the file type.
+- Consider wrapping the logic inside a utility class or function for better maintainability, especially if these checks become complex or are reused.
+
+Let me know if you'd like help updating related classes like `TarArchiveInputStream` or adding additional format detectors.

@@ -1,0 +1,201 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Constructing invalid Partials
+Partials can be constructed by invoking a constructor Partial(DateTimeFieldType[], int[]) or by merging together a set of partials using with, each constructed by calling Partial(DateTimeFieldType, int), e.g.:
+Partial a = new Partial(new DateTimeFieldType[] { year(), hourOfDay() }, new int[] { 1, 1});
+Partial b = new Partial(year(), 1).with(hourOfDay(), 1);
+assert(a == b);
+However, the above doesn't work in all cases:
+new Partial(new DateTimeFieldType[] { clockhourOfDay(), hourOfDay() }, new int[] { 1, 1}); // throws Types array must not contain duplicate
+new Partial(clockhourOfDay(), 1).with(hourOfDay(), 1); // #<Partial [clockhourOfDay=1, hourOfDay=1]>
+I suppose the Partials should not allow to be constructed in either case. Is that right?
+There's also a related issue (probably stems from the fact that the Partial is invalid):
+new Partial(clockhourOfDay(), 1).with(hourOfDay(), 1).isEqual(new Partial(hourOfDay() ,1).with(clockhourOfDay(), 1)) // throws objects must have matching field types
+This is an incorrect Java code (src/main/java/org/joda/time/Partial.java):
+```java
+public Partial with(DateTimeFieldType fieldType, int value) {
+    if (fieldType == null) {
+        throw new IllegalArgumentException("The field type must not be null");
+    }
+    int index = indexOf(fieldType);
+    if (index == -1) {
+        DateTimeFieldType[] newTypes = new DateTimeFieldType[iTypes.length + 1];
+        int[] newValues = new int[newTypes.length];
+        
+        // find correct insertion point to keep largest-smallest order
+        int i = 0;
+        DurationField unitField = fieldType.getDurationType().getField(iChronology);
+        if (unitField.isSupported()) {
+            for (; i < iTypes.length; i++) {
+                DateTimeFieldType loopType = iTypes[i];
+                DurationField loopUnitField = loopType.getDurationType().getField(iChronology);
+                if (loopUnitField.isSupported()) {
+                    int compare = unitField.compareTo(loopUnitField);
+                    if (compare > 0) {
+                        break;
+                    } else if (compare == 0) {
+                        DurationField rangeField = fieldType.getRangeDurationType().getField(iChronology);
+                        DurationField loopRangeField = loopType.getRangeDurationType().getField(iChronology);
+                        if (rangeField.compareTo(loopRangeField) > 0) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        System.arraycopy(iTypes, 0, newTypes, 0, i);
+        System.arraycopy(iValues, 0, newValues, 0, i);
+        newTypes[i] = fieldType;
+        newValues[i] = value;
+        System.arraycopy(iTypes, i, newTypes, i + 1, newTypes.length - i - 1);
+        System.arraycopy(iValues, i, newValues, i + 1, newValues.length - i - 1);
+        // use public constructor to ensure full validation
+        // this isn't overly efficient, but is safe
+        Partial newPartial = new Partial(iChronology, newTypes, newValues);
+        iChronology.validate(newPartial, newValues);
+        return newPartial;
+    }
+    if (value == getValue(index)) {
+        return this;
+    }
+    int[] newValues = getValues();
+    newValues = getField(index).set(this, index, newValues, value);
+    return new Partial(this, newValues);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+To fix the **incorrect** `Partial.with(...)` method and address the issues mentioned in your question — such as **duplicate fields**, **invalid partial construction**, and **mismatched field types during comparison** — we need to perform several key steps:
+
+---
+
+## ✅ Summary of Issues
+
+1. **Duplicate Field Construction**  
+   If two field types are considered "equal" (same duration field), then adding them again causes an error like:
+   ```java
+   new Partial(new DateTimeFieldType[] { clockhourOfDay(), hourOfDay() }, new int[] { 1, 1 });
+   ```
+   This raises:  
+   > `Types array must not contain duplicate`
+
+2. **Invalid Partial Construction**  
+   Trying to construct a Partial from ambiguous or overlapping fields leads to unexpected behavior.
+
+3. **Inequality with Mismatched Fields**  
+   Comparisons between two ParsedObjects with mismatched field types cause errors like:
+   ```java
+   new Partial(clockhourOfDay(), 1).with(hourOfDay(), 1).isEqual(
+       new Partial(hourOfDay(), 1).with(clockhourOfDay(), 1)
+   );
+   ```
+   This raises:
+   > `objects must have matching field types`
+
+4. **Inefficient & Unsafe Code**  
+   The current implementation uses unsafe logic for inserting new fields, which may lead to invalid states or performance issues.
+
+---
+
+## ✅ Fixes and Improvements
+
+### 🔧 Step 1: Validate Uniqueness Before Construction
+Before constructing a `Partial`, check whether the provided `DateTimeFieldType` list contains duplicates based on their **duration type** (i.e., what they measure).
+
+> Note: A field like `clockhourOfDay()` and `hourOfDay()` may both return the same duration type, so they are not unique for Partial construction purposes.
+
+We'll update the constructor to check for uniqueness **by field type**:
+
+```java
+public Partial(DateTimeFieldType[] types, int[] values) {
+    validateFieldsAreUnique(types);
+
+    // rest of constructor...
+}
+
+private void validateFieldsAreUnique(DateTimeFieldType[] types) {
+    Set<DurationField> seen = new HashSet<>();
+    for (DateTimeFieldType type : types) {
+        DurationField field = type.getDurationType().getField(this.iChronology);
+        if (!seen.add(field)) {
+            throw new IllegalArgumentException("Cannot add duplicate field type.");
+        }
+    }
+}
+```
+
+This will prevent duplicate field type constructions.
+
+---
+
+### 🔧 Step 2: Fix `Partial.with(...)`
+
+Here’s how to improve the `with(...)` method:
+
+- Check that the `fieldType` being added has not already been included.
+- Handle `null` appropriately and avoid overwriting values when they're unchanged.
+- Ensure that the field order is always maintained in a logical way.
+- Avoid building a new Partial directly, instead updating the internal values and returning a new instance where necessary.
+
+Here is the corrected version of the `with` method:
+
+```java
+public Partial with(DateTimeFieldType fieldType, int value) {
+    if (fieldType == null) {
+        throw new IllegalArgumentException("The field type must not be null");
+    }
+
+    int existingIndex = indexOf(fieldType);
+    if (existingIndex != -1) {
+        // Already exists
+        if (getValue(existingIndex) == value) {
+            return this; // no change needed
+        } else {
+            int[] newValues = getValues().clone();
+            newValues[existingIndex] = value;
+            return new Partial(this, newValues);
+        }
+    }
+
+    // Try to insert at appropriate position
+    int insertPosition = findInsertPosition(fieldType);
+
+    if (insertPosition == -1) {
+        // No suitable position found – reject addition
+        throw new IllegalArgumentException("Could not determine valid position for field " + fieldType.getName());
+    }
+
+    // Create new arrays
+    DateTimeFieldType[] newTypes = Arrays.copyOf(iTypes, iTypes.length + 1);
+    int[] newValues = Arrays.copyOf(iValues, iValues.length + 1);
+
+    // Insert the field and its value
+    System.arraycopy(iTypes, insertPosition, newTypes, insertPosition + 1, iTypes.length - insertPosition);
+    System.arraycopy(iValues, insertPosition, newValues, insertPosition + 1, iValues.length - insertPosition);
+
+    newTypes[insertPosition] = fieldType;
+    newValues[insertPosition] = value;
+
+    return new Partial(this.iChronology, newTypes, newValues);
+}
+
+private int indexOf(DateTimeFieldType fieldType) {
+    for (int i = 0; i < iTypes.length; i++) {
+        if (fieldType.equals(iTypes[i])) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+private int findInsertPosition(DateTimeFieldType fieldType) {
+    DurationField field = fieldType.getDurationType().getField(iChronology);
+    for (int i = 0; i < iTypes.length; i++) {
+        DurationField otherField = iTypes[i

@@ -1,0 +1,163 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Statistics.setVarianceImpl makes getStandardDeviation produce NaN
+Invoking SummaryStatistics.setVarianceImpl(new Variance(true/false) makes getStandardDeviation produce NaN. The code to reproduce it:
+
+int[] scores = {1, 2, 3, 4};
+SummaryStatistics stats = new SummaryStatistics();
+stats.setVarianceImpl(new Variance(false)); //use "population variance"
+for(int i : scores) {
+  stats.addValue(i);
+}
+double sd = stats.getStandardDeviation();
+System.out.println(sd);
+
+A workaround suggested by Mikkel is:
+
+  double sd = FastMath.sqrt(stats.getSecondMoment() / stats.getN());
+This is an incorrect Java code (src/main/java/org/apache/commons/math/stat/descriptive/SummaryStatistics.java):
+```java
+public void addValue(double value) {
+    sumImpl.increment(value);
+    sumsqImpl.increment(value);
+    minImpl.increment(value);
+    maxImpl.increment(value);
+    sumLogImpl.increment(value);
+    secondMoment.increment(value);
+    // If mean, variance or geomean have been overridden,
+    // need to increment these
+    if (!(meanImpl instanceof Mean)) {
+        meanImpl.increment(value);
+    }
+    if (!(varianceImpl instanceof Variance)) {
+        varianceImpl.increment(value);
+    }
+    if (!(geoMeanImpl instanceof GeometricMean)) {
+        geoMeanImpl.increment(value);
+    }
+    n++;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+Yes, I can help repair the incorrect Java code.
+
+The issue arises from the way `setVarianceImpl` is being used in conjunction with `getStandardDeviation`. The problem stems from the fact that `SummaryStatistics` does **not** track the sample variance when `setVarianceImpl` is called explicitly with a specific implementation like `Variance`. This leads to inconsistencies between what's expected and what's actually computed when calling `getStandardDeviation()`.
+
+Let me break down the root of the issue and then provide a working solution.
+
+---
+
+### 🧠 Root Cause Analysis
+
+1. **Custom Variance Handling**: 
+   - When `setVarianceImpl(new Variance(false))` is called, it sets up a custom instance of the `Variance` class for computing population variance.
+   - However, `SummaryStatistics` does not automatically update its internal tracking of the second moment (`secondMoment`) when this happens. It still uses the default logic based on `addValue`.
+
+2. **Missing Synchronization**:
+   - The `addValue` method increments the `secondMoment`, but when a custom variance is set via `setVarianceImpl`, it doesn't ensure the `secondMoment` stays synchronized with the updated variance calculation logic.
+
+3. **Inconsistent Standard Deviation Calculation**:
+   - When `getStandardDeviation()` is called, it relies on the formula:  
+     ```
+     standard deviation = sqrt(secondMoment / n)
+     ```
+     But if the variance has already been set as population variance, using this formula may result in division by zero or invalid values due to mismatched computations.
+
+---
+
+### ✅ Recommended Fix
+
+We should synchronize the behavior of `setVarianceImpl` with how the `secondMoment` is tracked. One clean fix would be to use the built-in `getVariance()` method instead of `setVarianceImpl`, since it ensures consistency between all statistics (like mean, variance, and second moment).
+
+#### ✅ Updated Code
+
+Here’s a corrected version of your code:
+
+```java
+import org.apache.commons.math3.stat.descriptive.SummaryStatistics;
+import org.apache.commons.math3.util.FastMath;
+
+public class StatsExample {
+    public static void main(String[] args) {
+        int[] scores = {1, 2, 3, 4};
+        SummaryStatistics stats = new SummaryStatistics();
+
+        for (int score : scores) {
+            stats.addValue(score);
+        }
+
+        // Use built-in variance instead of manually setting it
+        // If you want population variance, we can compute it ourselves
+        double variance = stats.getVariance(); // default is sample variance
+        double standardDeviation = FastMath.sqrt(variance);
+
+        System.out.println("Standard Deviation: " + standardDeviation);
+    }
+}
+```
+
+> 💡 Note: The `getVariance()` method computes the **sample variance**, which divides by `n-1`. If you're trying to compute **population variance**, you can do so manually using:
+>
+> ```java
+> double variance = stats.getSumsq() / stats.getN();
+> ```
+
+---
+
+### 🔧 Optional: Proper Synchronization for Custom Variance
+
+If you must use `setVarianceImpl`, then you should make sure that the `secondMoment` reflects the same computation as your custom variance object. That requires additional synchronization logic.
+
+Here's a **suggested fix** to the `addValue` method inside `SummaryStatistics` (or wherever the method is implemented):
+
+```java
+public void addValue(double value) {
+    sumImpl.increment(value);
+    sumsqImpl.increment(value);
+    minImpl.increment(value);
+    maxImpl.increment(value);
+    sumLogImpl.increment(value);
+    secondMoment.increment(value);
+
+    // If user set their own Variance, we need to sync it with our calculations
+    if (varianceImpl instanceof Variance) {
+        ((Variance) varianceImpl).update(value); // assuming this exists
+    }
+
+    if (!(meanImpl instanceof Mean)) {
+        meanImpl.increment(value);
+    }
+    if (!(varianceImpl instanceof Variance)) {
+        varianceImpl.increment(value);
+    }
+    if (!(geoMeanImpl instanceof GeometricMean)) {
+        geoMeanImpl.increment(value);
+    }
+    n++;
+}
+```
+
+> 🔒 However, this assumes there's an appropriate `update(value)` method in the `Variance` class — something that isn’t present in the vanilla Commons Math library. So this kind of workarounds may require modifying the underlying `Variance` implementation, which isn't ideal.
+
+---
+
+### ✅ Final Recommendation
+
+To avoid such bugs and maintain clean semantics, always use:
+
+- `getVariance()` to retrieve the variance
+- `FastMath.sqrt(getVariance())` for standard deviation
+
+And never call `setVarianceImpl` directly unless you’re confident about managing the synchronization yourself.
+
+---
+
+Would you like me to also provide an updated `Variance` implementation that supports custom variance types?

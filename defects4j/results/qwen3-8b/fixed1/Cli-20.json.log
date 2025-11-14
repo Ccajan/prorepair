@@ -1,0 +1,200 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# PosixParser keeps processing tokens after a non unrecognized long option
+PosixParser keeps processing tokens after a non unrecognized long option when stopAtNonOption is enabled. The tokens after the unrecognized long option are burst, split around '=', etc.. instead of being kept as is.
+For example, with the options 'a' and 'b' defined, 'b' having an argument, the following command line:
+
+--zop -abfoo
+
+is interpreted as:
+
+--zop -a -b foo
+
+but the last token should remain unchanged.
+This is an incorrect Java code (src/java/org/apache/commons/cli/PosixParser.java):
+```java
+protected String[] flatten(Options options, String[] arguments, boolean stopAtNonOption)
+{
+    init();
+    this.options = options;
+
+    // an iterator for the command line tokens
+    Iterator iter = Arrays.asList(arguments).iterator();
+
+    // process each command line token
+    while (iter.hasNext())
+    {
+        // get the next command line token
+        String token = (String) iter.next();
+
+        // handle long option --foo or --foo=bar
+        if (token.startsWith("--"))
+        {
+            if (token.indexOf('=') != -1)
+            {
+                tokens.add(token.substring(0, token.indexOf('=')));
+                tokens.add(token.substring(token.indexOf('=') + 1, token.length()));
+            }
+            else
+            {
+                tokens.add(token);
+            }
+        }
+
+        // single hyphen
+        else if ("-".equals(token))
+        {
+            tokens.add(token);
+        }
+        else if (token.startsWith("-"))
+        {
+            if (token.length() == 2)
+            {
+                processOptionToken(token, stopAtNonOption);
+            }
+            else if (options.hasOption(token))
+            {
+                tokens.add(token);
+            }
+            // requires bursting
+            else
+            {
+                burstToken(token, stopAtNonOption);
+            }
+        }
+        else if (stopAtNonOption)
+        {
+            process(token);
+        }
+        else
+        {
+            tokens.add(token);
+        }
+
+        gobble(iter);
+    }
+
+    return (String[]) tokens.toArray(new String[tokens.size()]);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+if (token.startsWith("--")) 
+{
+    if (token.indexOf('=') != -1)
+    {
+        tokens.add(token);
+    } 
+    else
+    {
+        tokens.add(token);
+    }
+} 
+
+// Single hyphen
+else if ("-".equals(token)) 
+{
+    tokens.add(token);
+}
+else if (token.startsWith("-"))
+{
+    if (token.length() == 2)
+    {
+        processOptionToken(token, stopAtNonOption);
+    }
+    else if (options.hasOption(token))
+    {
+        tokens.add(token);
+    }
+    else
+    {
+        burstToken(token, stopAtNonOption);
+    }
+}
+else if (stopAtNonOption)
+{
+    process(token);
+}
+else
+{
+    tokens.add(token);
+}
+
+gobble(iter);
+```
+
+Wait, what's wrong with that? It seems like it should be correct. Hmm.
+
+Ah! I see now. The problem is in how the `--zop` token is handled in the original code. Let me re-examine the original code carefully.
+
+The issue is that the original code processes the `--zop` token as follows:
+- It checks if it starts with "--"
+- Then it splits on the first '=' (which there isn't any)
+- So it adds `--zop` to the tokens list as is
+
+But then, the `-abfoo` token comes next. This token starts with "-" and has length > 2, so it enters the else clause.
+
+However, since `options.hasOption("abfoo")` is false (because only "a" and "b" are defined), the code calls `burstToken(token, stopAtNonOption)` which breaks down the token into individual characters and processes them. But this leads to the problem described: the remaining part of the token ("foo") gets processed as separate tokens instead of being treated as a single token.
+
+The root cause is that the original code treats all tokens starting with "-" as potential short options, even if they don't match any known option. However, when stopAtNonOption is true, it should not process these tokens further and just add them as-is. But the code currently does burst processing on them because it assumes they may be valid short options.
+
+So the fix would involve making sure that when stopAtNonOption is true, any unknown long option or invalid short option is added as-is without further processing. That way, the entire token remains untouched, as desired.
+
+Let me try modifying the code accordingly.
+</think>
+
+To resolve the issue where the `PosixParser` incorrectly splits tokens such as `--zop -abfoo` into multiple tokens (`--zop`, `-a`, `-b`, `foo`) instead of leaving `--zop -abfoo` intact when `stopAtNonOption` is set to `true`, we need to refine the handling logic in the method `flatten()`.
+
+---
+
+### ✅ Problem Summary
+
+When parsing command-line arguments using `PosixParser`, **tokens starting with `-`** are considered potential **short options**, but under certain conditions, they should be treated as **non-option tokens** and **not modified or processed further**.
+
+In particular, if `stopAtNonOption` is enabled and an **unknown option** is encountered (e.g., `--zop` or `-abfoo`), those tokens should remain **intact**, not be split or broken into parts.
+
+However, in the current implementation, the parser mistakenly processes the **remainder** of the token — like splitting `-abfoo` into `-a`, `-b`, and `foo` — unless explicitly marked as a valid option, which causes the reported bug.
+
+---
+
+### 🔧 Solution
+
+We must ensure that when `stopAtNonOption` is `true` and the token cannot be identified as a valid option (whether short or long), it’s simply **added as-is** to the result tokens, **without further processing**.
+
+Here’s the corrected version of the relevant portion of the `flatten()` function:
+
+```java
+while (iter.hasNext()) {
+    String token = (String) iter.next();
+
+    if (token.startsWith("--")) {
+        // Long option, treat as-is
+        tokens.add(token);
+    } else if ("-".equals(token)) {
+        // Single hyphen, treat as-is
+        tokens.add(token);
+    } else if (token.startsWith("-")) {
+        if (token.length() == 2) {
+            // Short option with no arguments
+            processOptionToken(token, stopAtNonOption);
+        } else if (options.hasOption(token)) {
+            // Valid multi-character short option
+            tokens.add(token);
+        } else {
+            // Unknown short option, treat as non-option
+            tokens.add(token);
+        }
+    } else if (stopAtNonOption) {
+        // Non-option token, treat as-is
+        tokens.add(token);
+    } else {
+        // Non-option token, treat as-is
+        tokens.add(token);
+    }
+
+    gobble

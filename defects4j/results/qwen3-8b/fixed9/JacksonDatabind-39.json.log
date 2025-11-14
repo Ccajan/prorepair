@@ -1,0 +1,193 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Jackson not continue to parse after DeserializationFeature.FAIL_ON_INVALID_SUBTYPE error
+After FAIL_ON_INVALID_SUBTYPE error, jackson should continue to parse, but seems jackson doesn't.
+The output:
+CallRecord [version=0.0, application=123, ] // doesn't read item2 which is valid
+CallRecord [version=0.0, application=123, ]
+CallRecord [version=0.0, ] // doesn't read application after invalid item.
+
+@JsonInclude(Include.NON_NULL)
+public class CallRecord {
+    public float version;
+    public String application;
+    public Item item;
+    public Item item2;
+    public CallRecord() {}
+
+    public static void main(final String[] args) throws IOException {
+        final ObjectMapper objectMapper = new ObjectMapper().disable(DeserializationFeature.FAIL_ON_INVALID_SUBTYPE,
+                DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, DeserializationFeature.FAIL_ON_IGNORED_PROPERTIES);
+        final CallRecord call = new CallRecord();
+
+        final Event event = new Event();
+        event.location = "location1";
+        call.item = event;
+        call.item2 = event;
+        call.application = "123";
+        // System.out.println(objectMapper.writeValueAsString(call));
+        String json =
+                "{\"version\":0.0,\"application\":\"123\",\"item\":{\"type\":\"xevent\",\"location\":\"location1\"},\"item2\":{\"type\":\"event\",\"location\":\"location1\"}}";
+        // can't read item2 - which is valid
+        System.out.println(objectMapper.readValue(json, CallRecord.class));
+
+        json = "{\"version\":0.0,\"application\":\"123\"},{\"item\":{\"type\":\"xevent\",\"location\":\"location1\"}";
+        System.out.println(objectMapper.readValue(json, CallRecord.class));
+
+        json = "{\"item\":{\"type\":\"xevent\",\"location\":\"location1\"}, \"version\":0.0,\"application\":\"123\"}";
+        // order matters: move item to the fornt, now it can't read application property
+        System.out.println(objectMapper.readValue(json, CallRecord.class));
+    }
+    @Override
+    public String toString() {
+        final StringBuilder builder = new StringBuilder();
+        builder.append("CallRecord [version=").append(version).append(", ");
+        if (application != null) {
+            builder.append("application=").append(application).append(", ");
+        }
+        if (item != null) {
+            builder.append("item=").append(item);
+        }
+        builder.append("]");
+        return builder.toString();
+    }
+}
+
+@JsonTypeInfo(use = JsonTypeInfo.Id.NAME, include = JsonTypeInfo.As.PROPERTY, property = "type", visible = true)
+@JsonSubTypes({@Type(value = Event.class, name = Event.TYPE)})
+public interface Item {
+}
+
+public final class Event implements Item {
+    public String location;
+    public static final String TYPE = "event";
+    public Event() {}
+}
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/deser/std/NullifyingDeserializer.java):
+```java
+public Object deserialize(JsonParser p, DeserializationContext ctxt) throws IOException
+{
+    // 29-Jan-2016, tatu: Simple skipping for all other tokens, but FIELD_NAME bit
+    //    special unfortunately
+        p.skipChildren();
+    return null;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public Object deserialize(JsonParser p, DeserializationContext ctxt) throws IOException
+{
+    // Skip any content within the current object, including fields and their values
+    p.skipChildren();
+    
+    // Return null as before, indicating that this field was skipped due to some issue
+    return null;
+}
+```
+
+The provided code snippet appears to be part of a deserializer implementation in Jackson, likely for handling certain types or scenarios during deserialization. The goal here is to understand what the original code does, why it might be considered incorrect, and how to potentially fix it.
+
+### Understanding the Code
+
+The method `deserialize` takes a `JsonParser` and a `DeserializationContext`, and returns an `Object`. It skips the children of the current JSON element using `p.skipChildren()` and then returns `null`.
+
+### Why This Might Be Incorrect
+
+In the context of deserialization, especially with Jackson, when a parser encounters an unexpected type or structure (like an invalid subtype), the default behavior can be to throw an exception or skip the problematic data. However, if the goal is to allow parsing to continue despite such issues, the deserializer should not terminate the parsing process prematurely.
+
+If `skipChildren()` is called without proper validation, it could lead to skipping too much data, resulting in incomplete objects being constructed. For instance, if the deserializer is supposed to handle invalid subtypes but still continue processing the rest of the JSON, it needs to avoid terminating the entire parsing operation early.
+
+### Proposed Fix
+
+To ensure that the deserializer allows parsing to continue even when encountering unexpected data (such as invalid subtypes), we need to adjust the logic so that it doesn't prematurely end the parsing process.
+
+Here's a revised version of the `deserialize` method:
+
+```java
+public Object deserialize(JsonParser p, DeserializationContext ctxt) throws IOException
+{
+    // Optionally check if there are more elements to process
+    if (p.nextToken() == null) {
+        // No more tokens; just return null
+        return null;
+    }
+
+    // If there are more tokens, skip the current token and continue parsing
+    p.nextToken(); // Move past the current token
+    
+    // Return null to indicate that the field was processed but possibly skipped
+    return null;
+}
+```
+
+### Explanation of the Fix
+
+- **Check for More Tokens**: Before skipping, we check if there are more tokens available to process. This helps prevent unnecessary skipping at the end of the input.
+- **Move Past Current Token**: By calling `nextToken()`, we move past the current token, allowing the parser to continue processing subsequent tokens.
+- **Return Null**: We return `null` to indicate that the field was either skipped or processed but didn't contribute meaningful data, consistent with the original intent of the method.
+
+By making these adjustments, the deserializer will allow Jackson to continue parsing the remaining JSON content, ensuring that the overall deserialization process isn't halted by an unexpected or invalid subtype.
+</think>
+
+To resolve the issue where Jackson halts parsing after encountering a failure related to `FAIL_ON_INVALID_SUBTYPE`, we need to ensure that the deserializer continues processing the rest of the JSON structure even in the presence of such anomalies. The key insight is that the current `deserialize` method may cause premature termination by consuming or skipping parts of the JSON input, thereby breaking the deserialization flow.
+
+---
+
+### ✅ Corrected Implementation
+
+Below is the corrected version of the `deserialize` method from `NullifyingDeserializer`:
+
+```java
+public Object deserialize(JsonParser p, DeserializationContext ctxt) throws IOException {
+    // Check if there are additional tokens to consume
+    if (p.nextToken() == null) {
+        // If no more tokens, simply return null
+        return null;
+    }
+
+    // Otherwise, move to the next token and continue parsing
+    p.nextToken();
+
+    // Return null to denote that this field has been processed, possibly skipped
+    return null;
+}
+```
+
+---
+
+### 🔍 Explanation of Changes
+
+- **Early Token Check**:
+  
+  ```java
+  if (p.nextToken() == null) { ... }
+  ```
+  
+  Checks whether there are more tokens to parse. If not, it simply returns `null` and avoids unnecessary processing. This prevents prematurely stopping the parsing at the end of the input.
+
+- **Skipping Tokens Gracefully**:
+  
+  ```java
+  p.nextToken();
+  ```
+
+  Advances the reader to the next token. This ensures that the parsing continues beyond the current invalid or unexpected node instead of getting stuck on it.
+
+- **Return Value**:
+  
+  ```java
+  return null;
+  ```
+
+  This maintains the original behavior — signaling that the current field was either ignored or had no meaningful value.
+
+---
+
+### 🧠 Reasoning Behind the Fix
+
+Jackson’s `FAIL_ON_INVALID_SUBTYPE` feature throws exceptions when it encounters unknown or invalid subtypes. If your intention is to **not halt the whole parsing process**, the deserializer must avoid throwing an exception and must ensure that the

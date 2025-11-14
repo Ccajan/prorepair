@@ -1,0 +1,198 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# anonymous object type inference behavior is different when calling constructors
+The following compiles fine with:
+java -jar build/compiler.jar --compilation_level=ADVANCED_OPTIMIZATIONS --jscomp_error=accessControls --jscomp_error=checkTypes --jscomp_error=checkVars --js ~/Desktop/reverse.js
+
+reverse.js:
+/**
+ * @param {{prop1: string, prop2: (number|undefined)}} parry
+ */
+function callz(parry) {
+  if (parry.prop2 && parry.prop2 < 5) alert('alright!');
+  alert(parry.prop1);
+}
+
+callz({prop1: 'hi'});
+
+However, the following does not:
+/**
+ * @param {{prop1: string, prop2: (number|undefined)}} parry
+ * @constructor
+ */
+function callz(parry) {
+  if (parry.prop2 && parry.prop2 < 5) alert('alright!');
+  alert(parry.prop1);
+}
+
+new callz({prop1: 'hi'});
+
+/Users/dolapo/Desktop/reverse.js:10: ERROR - actual parameter 1 of callz does not match formal parameter
+found   : {prop1: string}
+required: {prop1: string, prop2: (number|undefined)}
+new callz({prop1: 'hi'});
+
+Thanks!
+This is an incorrect Java code (src/com/google/javascript/jscomp/TypeInference.java):
+```java
+private FlowScope traverseNew(Node n, FlowScope scope) {
+
+  Node constructor = n.getFirstChild();
+  scope = traverse(constructor, scope);
+  JSType constructorType = constructor.getJSType();
+  JSType type = null;
+  if (constructorType != null) {
+    constructorType = constructorType.restrictByNotNullOrUndefined();
+    if (constructorType.isUnknownType()) {
+      type = getNativeType(UNKNOWN_TYPE);
+    } else {
+      FunctionType ct = constructorType.toMaybeFunctionType();
+      if (ct == null && constructorType instanceof FunctionType) {
+        // If constructorType is a NoObjectType, then toMaybeFunctionType will
+        // return null. But NoObjectType implements the FunctionType
+        // interface, precisely because it can validly construct objects.
+        ct = (FunctionType) constructorType;
+      }
+      if (ct != null && ct.isConstructor()) {
+        type = ct.getInstanceType();
+      }
+    }
+  }
+  n.setJSType(type);
+  for (Node arg = constructor.getNext(); arg != null; arg = arg.getNext()) {
+    scope = traverse(arg, scope);
+  }
+  return scope;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+Yes, I can help fix this issue in the `traverseNew` method from `TypeInference.java`. The root cause of this problem lies in how the constructor's parameters are being inferred when using `new callz(...)`, which leads to inconsistent type checking between regular function calls and constructor calls.
+
+---
+
+### **Problem Summary**
+
+When constructing a new instance (`new callz(...)`), the compiler incorrectly infers the argument as `{prop1: string}` rather than requiring all parameters that were defined in the function's JSDoc annotation — even when those properties are optional or undefined.
+
+In contrast, a normal function call (`callz(...)`) works correctly because the inferred parameter types include all expected properties.
+
+So, the main issue is:
+
+> When handling `new callz(...)`, we're failing to properly infer the full set of parameters that should be present based on the constructor's JSDoc annotation.
+
+---
+
+### ✅ **Fix Explanation**
+
+To resolve this:
+
+- We need to ensure that **even for constructor calls**, the parameter types are **inferred based on the JSDoc type annotations**.
+- Currently, only the constructor's return type is being checked, but not its **parameters**.
+- Therefore, during traversal, we should:
+  1. Inspect the constructor’s function signature (i.e., its declared parameters).
+  2. Use these parameters to infer the required property names for the object literal used in the constructor call.
+  3. Enforce these properties (including any default values like `undefined`) to avoid mismatches.
+
+Here is the corrected version of the relevant section in `TypeInference.java`:
+
+```java
+private FlowScope traverseNew(Node n, FlowScope scope) {
+  Node constructor = n.getFirstChild();
+
+  // Traverse the constructor expression first to determine its type
+  scope = traverse(constructor, scope);
+
+  JSType constructorType = constructor.getJSType();
+  JSType type = null;
+
+  if (constructorType != null) {
+    constructorType = constructorType.restrictByNotNullOrUndefined();
+    if (constructorType.isUnknownType()) {
+      type = getNativeType(UNKNOWN_TYPE);
+    } else {
+      FunctionType ct = constructorType.toMaybeFunctionType();
+      if (ct == null && constructorType instanceof FunctionType) {
+        // Handle special case where Type may directly implement FunctionType
+        ct = (FunctionType) constructorType;
+      }
+
+      if (ct != null && ct.isConstructor()) {
+        type = ct.getInstanceType();
+
+        // Ensure that constructor arguments are validated against the constructor signature
+        if (!ct.isAbstract() && ct.getNumParameters() > 0) {
+          Node argsList = constructor.getNext();
+          while (argsList != null) {
+            // Infer type from constructor's parameter definition
+            int paramIndex = 0;
+            Node arg = argsList.getFirstChild();
+            while (arg != null) {
+              JSType argType = ct.getParameterType(paramIndex++);
+              JSType argActualType = arg.getJSType();
+
+              if (argActualType == null || !argType.isAssignableFrom(argActualType)) {
+                addTypeError("Argument " + arg.toString() + " has incompatible type");
+              }
+
+              arg = arg.getNext();
+            }
+          }
+        }
+      }
+    }
+  }
+
+  n.setJSType(type);
+  for (Node arg = constructor.getNext(); arg != null; arg = arg.getNext()) {
+    scope = traverse(arg, scope);
+  }
+
+  return scope;
+}
+```
+
+---
+
+### 🔍 Key Fixes Made:
+
+- **Added logic to validate each argument against the constructor's parameter list**.
+- Ensures that the **constructor's parameter types are enforced** even when the constructor is called via `new`.
+- Properly uses the `FunctionType` API to retrieve both the **return type** and **parameter types**.
+- Checks whether each passed value matches the type of the corresponding parameter in the constructor's signature.
+
+---
+
+### 🧪 Test Case That Should Now Work:
+
+```javascript
+/**
+ * @param {{prop1: string, prop2: (number|undefined)}} parry
+ * @constructor
+ */
+function callz(parry) {
+  if (parry.prop2 && parry.prop2 < 5) alert('alright!');
+  alert(parry.prop1);
+}
+
+new callz({prop1: 'hi'});
+```
+
+Now this code should compile without errors, just like the non-constructor form.
+
+---
+
+### ✅ Summary
+
+- The key was to update the logic so that when a **constructor is invoked with `new`**, it enforces the same strict typing rules as a normal function call.
+- This ensures consistency and correctness in type inference across all forms of function invocation.
+- The fix avoids false negatives in type validation when calling constructors with object literals.
+
+Let me know if you'd like this implemented as a pull request or want to integrate it into your existing build system.

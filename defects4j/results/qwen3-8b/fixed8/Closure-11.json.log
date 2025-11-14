@@ -1,0 +1,184 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Record type invalid property not reported on function with @this annotation
+Code:
+
+var makeClass = function(protoMethods) {
+  var clazz = function() {
+    this.initialize.apply(this, arguments);
+  }
+  for (var i in protoMethods) {
+    clazz.prototype[i] = protoMethods[i];
+  }
+
+  return clazz;
+}
+
+/**
+ * @constructor
+ * @param {{name: string, height: number}} options
+ */
+var Person = function(options){};
+Person = makeClass(/** @lends Person.prototype */ {
+  /**
+   * @this {Person}
+   * @param {{name: string, height: number}} options
+   */
+  initialize: function(options) {
+    /** @type {string} */ this.name_ = options.thisPropDoesNotExist;
+  },
+
+  /**
+   * @param {string} message
+   * @this {Person}
+   */
+  say: function(message) {
+    window.console.log(this.name_ + ' says: ' + message);
+  }
+});
+
+var joe = new Person({name: 'joe', height: 300});
+joe.say('hi');
+
+compiled with:
+java -jar build/compiler.jar --formatting=PRETTY_PRINT --jscomp_error=checkTypes --jscomp_error=externsValidation --compilation_level=SIMPLE_OPTIMIZATIONS repro.js
+
+I would expect an error on this line:
+    /** @type {string} */ this.name_ = options.thisPropDoesNotExist;
+
+which works in other contexts.
+
+Thanks!
+This is an incorrect Java code (src/com/google/javascript/jscomp/TypeCheck.java):
+```java
+private void visitGetProp(NodeTraversal t, Node n, Node parent) {
+  // obj.prop or obj.method()
+  // Lots of types can appear on the left, a call to a void function can
+  // never be on the left. getPropertyType will decide what is acceptable
+  // and what isn't.
+  Node property = n.getLastChild();
+  Node objNode = n.getFirstChild();
+  JSType childType = getJSType(objNode);
+
+  if (childType.isDict()) {
+    report(t, property, TypeValidator.ILLEGAL_PROPERTY_ACCESS, "'.'", "dict");
+  } else if (n.getJSType() != null && parent.isAssign()) {
+    return;
+  } else if (validator.expectNotNullOrUndefined(t, n, childType,
+      "No properties on this expression", getNativeType(OBJECT_TYPE))) {
+    checkPropertyAccess(childType, property.getString(), t, n);
+  }
+  ensureTyped(t, n);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+private void visitGetProp(NodeTraversal t, Node n, Node parent) {
+  // obj.prop or obj.method()
+  // Lots of types can appear on the left, a call to a void function can
+  // never be on the left. getPropertyType will decide what is acceptable
+  // and what isn't.
+  Node property = n.getLastChild();
+  Node objNode = n.getFirstChild();
+  JSType childType = getJSType(objNode);
+
+  // Check if the object is a dict type before proceeding
+  if (childType.isDict()) {
+    report(t, property, TypeValidator.ILLEGAL_PROPERTY_ACCESS, "'.'", "dict");
+    return; // Early exit if it's a dict
+  }
+
+  // If the node has a type and the parent is an assignment, skip checking
+  if (n.getJSType() != null && parent.isAssign()) {
+    return;
+  }
+
+  // Ensure the object is not null or undefined
+  if (validator.expectNotNullOrUndefined(t, n, childType,
+      "No properties on this expression", getNativeType(OBJECT_TYPE))) {
+    checkPropertyAccess(childType, property.getString(), t, n);
+  }
+
+  ensureTyped(t, n);
+}
+```
+
+The problem was that the original code didn't handle dict types correctly. The fix adds a check at the beginning to see if the object is a dict type. If it is, we immediately report the error and exit early, preventing further processing that could lead to incorrect results.
+
+This change ensures that when accessing properties on a dict type, we properly report the error without allowing subsequent checks that might incorrectly pass validation. This should fix the issue where the invalid property access wasn't being reported as expected.
+</think>
+
+To address the bug in the provided Java code from `TypeCheck.java`, let’s break down the **issue** and then provide the **corrected solution**.
+
+---
+
+### 🔍 **Understanding the Problem**
+
+The main issue lies in how the `visitGetProp` method handles property accesses (`obj.prop`) when the object is of **dictionary type (`isDict()`)**:
+
+- **What does the current logic do?**
+  - It checks whether the object is a dictionary type using `if (childType.isDict())`.
+  - However, it only reports the error and exits **after** handling more complex conditions such as assignment and null checking.
+
+- **Why this leads to an error in validation**:
+  - When the object is a dictionary and is accessed via a property like `options.thisPropDoesNotExist`, the property access is **invalid**, but the existing code doesn’t flag this as an error unless all prior checks fail — which they may not.
+  - As a result, JavaScript type checking passes even though there is no such property defined in the dictionary structure.
+
+---
+
+### ✅ **Solution: Early Exit for Dictionary Types**
+
+We need to **explicitly check** for dictionary type usage during property access and **report the error immediately**, **before** performing any further analysis that might allow the check to bypass the actual issue.
+
+Here’s the corrected version of the `visitGetProp` method:
+
+```java
+private void visitGetProp(NodeTraversal t, Node n, Node parent) {
+  Node property = n.getLastChild();
+  Node objNode = n.getFirstChild();
+  JSType childType = getJSType(objNode);
+
+  // Step 1: Early detection for dict types
+  if (childType.isDict()) {
+    report(t, property, TypeValidator.ILLEGAL_PROPERTY_ACCESS, "'.'", "dict");
+    return; // No need to proceed after reporting error
+  }
+
+  // Step 2: Skip checking if this is an assignment node and has a type
+  if (n.getJSType() != null && parent.isAssign()) {
+    return;
+  }
+
+  // Step 3: Ensure the object is not null or undefined
+  if (validator.expectNotNullOrUndefined(
+      t, n, childType,
+      "No properties on this expression",
+      getNativeType(OBJECT_TYPE))) {
+    checkPropertyAccess(childType, property.getString(), t, n);
+  }
+
+  // Step 4: Ensure the property access is typed
+  ensureTyped(t, n);
+}
+```
+
+---
+
+### 🧠 Why This Works
+
+- **Early detection**: The check for `childType.isDict()` is moved to the very top.
+- **Immediate reporting**: If the access is made against a dictionary type, the error is **reported immediately**, avoiding further processing that could mislead the type checker.
+- **Preservation of correctness**: All subsequent logic remains intact, ensuring that valid usages of objects (not dictionaries) still go through proper type validation.
+
+---
+
+### 📌 Summary
+
+By moving the check for dictionary-type objects earlier and introducing an immediate error report, we prevent **incorrect validation** due to improper use of dictionary properties, aligning the behavior with expectations.
+
+This fix ensures that any

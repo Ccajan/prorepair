@@ -1,0 +1,162 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Annotation bundles ignored when added to Mixin
+When updating from v 2.4.4 to 2.5.* it appears as though annotation bundles created with @JacksonAnnotationsInside are ignored when placed on a mixin.  Moving the annotation bundel to the actual class seems to resolve the issue.  Below is a simple test that attempts to rename a property.  I have more complicated test cases that are also failing but this should provide some context.
+public class Fun {
+
+    @Test
+    public void test() throws JsonProcessingException {
+        ObjectMapper mapper = new ObjectMapper().addMixIn(Foo.class, FooMixin.class);
+        String result = mapper.writeValueAsString(new Foo("result"));
+        Assert.assertEquals("{\"bar\":\"result\"}", result);
+    }
+
+    @Target(value={ ElementType.CONSTRUCTOR, ElementType.FIELD, ElementType.METHOD })
+    @Retention(value=RetentionPolicy.RUNTIME)
+    @JacksonAnnotationsInside
+    @JsonProperty("bar")
+    public @interface ExposeStuff {
+
+    }
+
+    public abstract class FooMixin {
+        @ExposeStuff
+        public abstract String getStuff();
+    }
+
+    public class Foo {
+
+        private String stuff;
+
+        Foo(String stuff) {
+            this.stuff = stuff;
+        }
+
+        public String getStuff() {
+            return stuff;
+        }
+    }
+}
+I'm expecting the "stuff" property to be serialized as "bar".
+I apologize I haven't been able to identify the culprit (and perhaps it's in my usage).  Let me know your thoughts. I'm always happy to provide more details!
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/introspect/AnnotationMap.java):
+```java
+protected final boolean _add(Annotation ann) {
+    if (_annotations == null) {
+        _annotations = new HashMap<Class<? extends Annotation>,Annotation>();
+    }
+    Annotation previous = _annotations.put(ann.annotationType(), ann);
+    return (previous != null) && previous.equals(ann);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+protected final boolean _add(Annotation ann) {
+    if (_annotations == null) {
+        _annotations = new HashMap<Class<? extends Annotation>, Annotation>();
+    }
+    // Check if the annotation type already exists
+    Class<? extends Annotation> annotationType = ann.annotationType();
+    Annotation existing = _annotations.get(annotationType);
+    
+    // If there is an existing annotation of the same type, check for equality
+    if (existing != null) {
+        // Use equals method to determine if annotations are the same
+        if (existing.equals(ann)) {
+            return false; // No change needed
+        }
+        // If they are not equal, replace the existing one
+        _annotations.put(annotationType, ann);
+        return true; // Annotation was replaced
+    } else {
+        // If no existing annotation, add the new one
+        _annotations.put(annotationType, ann);
+        return true; // Annotation was added
+    }
+}
+```
+
+The original code had a bug where it would only compare references (`previous != null`) and not use the `equals` method. This could lead to situations where two different instances of the same annotation type were considered equal when they weren't.
+
+Here's what the corrected version does:
+
+1. Checks if the `_annotations` map is initialized
+2. Retrieves the existing annotation of the same type, if any
+3. If it exists, uses `equals()` to determine if the new annotation is the same as the existing one:
+   - If they're the same, returns false (no change)
+   - If they're different, replaces the existing one and returns true
+4. If no existing annotation is found, adds the new one and returns true
+
+This ensures that annotations of the same type are properly compared using their `equals()` method rather than just reference checking.
+</think>
+
+The issue you've encountered stems from a subtle but important behavior in how Jackson handles annotations during serialization, especially when working with mixins. The key problem lies in how annotations are merged or overridden, particularly when using `@JacksonAnnotationsInside` with mixins. Here's a breakdown of why the code behaves this way and how to fix it effectively.
+
+---
+
+### 🧠 Root Cause: Behavior of Annotation Merging
+
+The core issue revolves around **how Jackson merges annotations** when resolving them at runtime, especially when using the `@JacksonAnnotationsInside` marker. When you place an annotation bundle (like `@ExposeStuff`) on a mixin instead of the target class, Jackson may fail to merge these annotations correctly. This is because:
+
+- **Mixins don't inherit field-level annotations**, even when annotated with `@JacksonAnnotationsInside`.
+- Jackson expects annotations to be directly present on the object being serialized, and mixins serve more as **metadata helpers** rather than direct annotation providers.
+
+Thus, when you move the annotation from the mixin to the actual class (`Foo`), the serializer can find and apply it correctly. However, if it’s placed on the mixin, it might be treated differently or completely ignored, depending on the internal logic of `AnnotationMap`.
+
+---
+
+### 🔧 Proposed Fix
+
+To make sure your `@ExposeStuff` annotation is applied correctly through a mixin, you need to ensure that:
+
+1. The annotation is **applied directly to the target class** (`Foo`), or
+2. You manually inject the annotation into the class via a custom `BeanSerializerModifier`, which allows fine-grained control over how annotations are handled.
+
+#### ✅ Option 1: Move the annotation to the target class
+
+If possible, simply move the `@ExposeStuff` annotation onto the actual field or getter in the `Foo` class. Since `@JacksonAnnotationsInside` implies that the annotation contains all necessary Jackson annotations, moving it to the target will work seamlessly with the current implementation:
+
+```java
+public class Foo {
+    @ExposeStuff
+    private String stuff;
+
+    public String getStuff() { return stuff; }
+}
+```
+
+This aligns with how Jackson expects annotations to behave—directly attached to the object.
+
+---
+
+### 🛠️ Option 2: Custom Serializer Modifier (Advanced)
+
+If moving the annotation is not feasible (e.g., due to design constraints or external dependencies), you can implement a `BeanSerializerModifier` to manually inject annotations onto fields during serialization setup.
+
+Here’s how you could do it:
+
+```java
+import com.fasterxml.jackson.databind.BeanDescription;
+import com.fasterxml.jackson.databind.JsonSerializer;
+import com.fasterxml.jackson.databind.SerializationConfig;
+import com.fasterxml.jackson.databind.jsontype.TypeResolverBuilder;
+import com.fasterxml.jackson.databind.ser.BeanSerializerFactory;
+import com.fasterxml.jackson.databind.ser.BeanSerializerModifier;
+import java.util.Map;
+
+public class CustomAnnotationInjector extends BeanSerializerModifier {
+
+    @Override
+    public JsonSerializer<?> modifyProperty(SerializationConfig config,
+                                            BeanDescription beanDesc,
+                                            String propertyName,
+                                            JsonSerializer<?> serializer) {
+        if ("stuff".equals(propertyName)) {
+            return new AnnotatedStringSerializer(serializer, @ExposeStuff); // Your custom injector logic here
+        }
+        return serializer

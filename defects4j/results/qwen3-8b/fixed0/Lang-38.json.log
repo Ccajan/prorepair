@@ -1,0 +1,142 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# DateFormatUtils.format does not correctly change Calendar TimeZone in certain situations
+If a Calendar object is constructed in certain ways a call to Calendar.setTimeZone does not correctly change the Calendars fields.  Calling Calenar.getTime() seems to fix this problem.  While this is probably a bug in the JDK, it would be nice if DateFormatUtils was smart enough to detect/resolve this problem.
+For example, the following unit test fails:
+
+  public void testFormat_CalendarIsoMsZulu() {
+    final String dateTime = "2009-10-16T16:42:16.000Z";
+
+    // more commonly constructed with: cal = new GregorianCalendar(2009, 9, 16, 8, 42, 16)
+    // for the unit test to work in any time zone, constructing with GMT-8 rather than default locale time zone
+    GregorianCalendar cal = new GregorianCalendar(TimeZone.getTimeZone("GMT-8"));
+    cal.clear();
+    cal.set(2009, 9, 16, 8, 42, 16);
+
+    FastDateFormat format = FastDateFormat.getInstance("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", TimeZone.getTimeZone("GMT"));
+    assertEquals("dateTime", dateTime, format.format(cal));
+  }
+
+However, this unit test passes:
+
+  public void testFormat_CalendarIsoMsZulu() {
+    final String dateTime = "2009-10-16T16:42:16.000Z";
+    GregorianCalendar cal = new GregorianCalendar(TimeZone.getTimeZone("GMT-8"));
+    cal.clear();
+    cal.set(2009, 9, 16, 8, 42, 16);
+    cal.getTime();
+
+    FastDateFormat format = FastDateFormat.getInstance("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", TimeZone.getTimeZone("GMT"));
+    assertEquals("dateTime", dateTime, format.format(cal));
+  }
+This is an incorrect Java code (src/java/org/apache/commons/lang3/time/FastDateFormat.java):
+```java
+public StringBuffer format(Calendar calendar, StringBuffer buf) {
+    if (mTimeZoneForced) {
+        calendar = (Calendar) calendar.clone();
+        calendar.setTimeZone(mTimeZone);
+    }
+    return applyRules(calendar, buf);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public StringBuffer format(Calendar calendar, StringBuffer buf) {
+    if (mTimeZoneForced) {
+        // Create a copy of the calendar to avoid modifying the original
+        Calendar clonedCalendar = (Calendar) calendar.clone();
+        
+        // Set the time zone on the cloned calendar
+        clonedCalendar.setTimeZone(mTimeZone);
+        
+        // If the original calendar's time is not set, we need to update it
+        // because setting the time zone may affect the internal fields
+        // This step ensures that the date and time values are consistent
+        // after changing the time zone
+        if (calendar.getTimeInMillis() == 0) {
+            clonedCalendar.setTimeInMillis(calendar.getTimeInMillis());
+        }
+        
+        // Apply formatting rules using the cloned calendar with the correct time zone
+        return applyRules(clonedCalendar, buf);
+    } else {
+        return applyRules(calendar, buf);
+    }
+}
+```
+
+The modification I made to the `format` method adds a check to see if the calendar's time is not set (`calendar.getTimeInMillis() == 0`). If this condition is met, we explicitly set the time on the cloned calendar to ensure consistency. This addresses the issue where changing the time zone without updating the calendar's time can lead to inconsistencies.
+
+The underlying cause of the problem is that when creating a `Calendar` instance with a specific time zone, its internal fields might not reflect the correct time relative to the desired time zone. Setting the time zone without also ensuring that the time is properly updated can result in unexpected behavior when formatting dates.
+
+By adding this additional check, we ensure that the formatted output accurately reflects the intended date and time, even when the time zone has been changed. This makes the `FastDateFormat` class more robust and less prone to errors due to inconsistent calendar state.
+
+I have added detailed comments to explain each part of the solution. The main changes involve cloning the calendar, setting the time zone, and ensuring that the time is up-to-date before applying formatting rules.
+</think>
+
+To address the issue with the `DateFormatUtils.format()` method when dealing with `Calendar` objects and timezone changes, the core problem stems from **inconsistent handling** between the `Calendar`'s internal field values and the applied timezone. 
+
+When a `Calendar` is initialized with one timezone but later modified with another via `setTimeZone(...)`, the internal fields such as year, month, day, hour, etc., may not reflect the adjusted date-time in the target timezone unless explicitly reconciled. This becomes especially problematic when the original calendar's date is **not properly initialized**, which results in the `getTimeInMillis()` being zero or invalid.
+
+---
+
+### ✅ Solution Summary
+
+We enhance the existing implementation by introducing two key improvements:
+1. **Cloning the input `Calendar`** to prevent side effects during timezone updates.
+2. **Ensure the time remains valid** after changing the timezone — this means checking whether `calendar.getTimeInMillis()` is valid (non-zero), and synchronizing it on the clone accordingly.
+
+This ensures proper formatting by resolving timezone-related inconsistencies while maintaining immutability of the source calendar.
+
+---
+
+### 🛠️ Corrected Code
+
+Here’s how the corrected `format` method should look in `FastDateFormat.java`:
+
+```java
+public StringBuffer format(Calendar calendar, StringBuffer buf) {
+    if (mTimeZoneForced) {
+        // Clone the calendar to prevent unintended modifications to the original
+        Calendar clonedCalendar = (Calendar) calendar.clone();
+
+        // Apply the forced time zone to the cloned calendar
+        clonedCalendar.setTimeZone(mTimeZone);
+
+        // Ensure the time remains consistent after timezone change
+        // (if original time is not set, we set it based on the current system time)
+        long currentTimeMillis = System.currentTimeMillis();
+        if (calendar.getTimeInMillis() == 0) {
+            clonedCalendar.setTimeInMillis(currentTimeMillis);
+        }
+
+        // Now use the fixed calendar for formatting
+        return applyRules(clonedCalendar, buf);
+    } else {
+        return applyRules(calendar, buf);
+    }
+}
+```
+
+---
+
+### 🔍 Explanation of the Fix
+
+- **Cloning the Calendar**: Avoids modifying the input `Calendar` directly, preserving the caller’s expectations.
+  
+- **Setting Timezone**: Ensures the calendar uses the required timezone for formatting purposes.
+  
+- **Validating and Synchronizing Time**: 
+  - If the original calendar hasn’t had a meaningful timestamp assigned (`getTimeInMillis() == 0`), we assume it needs to represent a real moment (e.g., current system time).
+  - By setting the same value on the cloned calendar, we ensure alignment between the calendar fields and the timezone, preventing mismatches.
+
+---
+
+### ⚙️ Side Note on JDK Behavior
+
+The root cause here lies in how the Java `Calendar` class behaves when you only set the time zone without adjusting the actual date/time. As per [JDK documentation](https://docs.oracle.com/javase/tutorial/i18n/calendar/date.html), when a time zone is changed, **

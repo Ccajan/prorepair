@@ -1,0 +1,190 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Parsing PAX headers fails with NegativeArraySizeException
+The TarArchiveInputStream.parsePaxHeaders method fails with a NegativeArraySizeException when there is an empty line at the end of the headers.
+The inner loop starts reading the length, but it gets a newline (10) and ends up subtracting '0' (48) from it; the result is a negative length that blows up an attempt to allocate the rest array.
+I would say that a check to see if ch is less the '0' and break the loop if it is.
+I used npm pack aws-sdk@2.2.16 to generate a tarball with this issue.
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/tar/TarArchiveInputStream.java):
+```java
+Map<String, String> parsePaxHeaders(final InputStream i)
+    throws IOException {
+    final Map<String, String> headers = new HashMap<String, String>(globalPaxHeaders);
+    // Format is "length keyword=value\n";
+    while(true){ // get length
+        int ch;
+        int len = 0;
+        int read = 0;
+        while((ch = i.read()) != -1) {
+            read++;
+            if (ch == ' '){
+                // Get keyword
+                final ByteArrayOutputStream coll = new ByteArrayOutputStream();
+                while((ch = i.read()) != -1) {
+                    read++;
+                    if (ch == '='){ // end of keyword
+                        final String keyword = coll.toString(CharsetNames.UTF_8);
+                        // Get rest of entry
+                        final int restLen = len - read;
+                        if (restLen == 1) { // only NL
+                            headers.remove(keyword);
+                        } else {
+                            final byte[] rest = new byte[restLen];
+                            final int got = IOUtils.readFully(i, rest);
+                            if (got != restLen) {
+                                throw new IOException("Failed to read "
+                                                      + "Paxheader. Expected "
+                                                      + restLen
+                                                      + " bytes, read "
+                                                      + got);
+                            }
+                            // Drop trailing NL
+                            final String value = new String(rest, 0,
+                                                      restLen - 1, CharsetNames.UTF_8);
+                            headers.put(keyword, value);
+                        }
+                        break;
+                    }
+                    coll.write((byte) ch);
+                }
+                break; // Processed single header
+            }
+            len *= 10;
+            len += ch - '0';
+        }
+        if (ch == -1){ // EOF
+            break;
+        }
+    }
+    return headers;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.Charset;
+import org.apache.commons.compress.utils.IOUtils;
+
+public class PaxHeaderParser {
+
+    private static final Charset UTF_8 = Charset.forName("UTF-8");
+
+    public static Map<String, String> parsePaxHeaders(InputStream inputStream) throws IOException {
+        final Map<String, String> headers = new HashMap<>(globalPaxHeaders);
+
+        // Read until EOF or a valid header is processed
+        while (true) {
+            int ch;
+            int len = 0;
+            int read = 0;
+
+            // Parse the length of the header entry
+            while ((ch = inputStream.read()) != -1) {
+                read++;
+
+                // Check for newline character as a potential separator between entries
+                if (ch == '\n') {
+                    break;
+                }
+
+                // Handle non-digit characters
+                if (ch < '0' || ch > '9') {
+                    break;
+                }
+
+                len *= 10;
+                len += ch - '0';
+
+                // If length becomes negative due to overflow, break out of loop
+                if (len < 0) {
+                    break;
+                }
+            }
+
+            // Check for EOF or end of header
+            if (ch == -1) {
+                break;
+            }
+
+            // After parsing the length, check if we encountered a newline which might indicate a malformed header
+            if (ch == '\n') {
+                // Skip the newline
+                inputStream.mark(1); // Mark position before reading the newline
+                if (inputStream.read() != '\n') {
+                    // Invalid header structure
+                    throw new IOException("Invalid Pax header format");
+                }
+                inputStream.reset(); // Reset to the position after the newline
+                continue; // Continue processing next headers
+            }
+
+            // Now parse the actual header content
+            // Assuming that the keyword follows the length
+            final ByteArrayOutputStream keywordBytes = new ByteArrayOutputStream();
+
+            // Read until '=' is found to extract the keyword
+            while ((ch = inputStream.read()) != -1) {
+                if (ch == '=') {
+                    final String keyword = keywordBytes.toString(UTF_8.name());
+                    keywordBytes.reset();
+
+                    // Read the value part of the header
+                    final int restLen = len - read; // Calculate remaining bytes needed for value
+                    final byte[] rest = new byte[restLen];
+
+                    final int got = IOUtils.readFully(inputStream, rest);
+                    if (got != restLen) {
+                        throw new IOException("Failed to read Pax header. Expected " + restLen + " bytes, read " + got);
+                    }
+
+                    // Extract the value without the trailing newline
+                    final String value = new String(rest, 0, restLen - 1, UTF_8.name());
+
+                    headers.put(keyword, value);
+                    break;
+                }
+
+                keywordBytes.write(ch);
+            }
+
+            // If no '=' was found, consider it as an invalid header
+            if (keywordBytes.size() > 0 && !keywordBytes.toString(UTF_8.name()).contains("=")) {
+                throw new IOException("Invalid Pax header format: missing '=' in keyword");
+            }
+
+            break; // Exit loop after processing one header
+        }
+
+        return headers;
+    }
+}
+```
+
+The code above has been modified to fix the issues causing the `NegativeArraySizeException` when parsing Pax headers. Here's what has changed:
+
+1. **Handling of Non-Digit Characters:** 
+   The original code had a loop where it read characters and attempted to parse them as digits. If a non-digit character like a newline (`\n`) was encountered, it would incorrectly process it as part of the length calculation.
+
+2. **Newline Handling:** 
+   The code now checks if the current character is a newline (`'\n'`). If so, it assumes that this signifies the end of a header block and handles it accordingly by skipping the newline and continuing to process the next header.
+
+3. **Length Overflow Check:** 
+   We've added a check to ensure that if the parsed length becomes negative, the loop breaks, preventing the creation of an array with a negative size.
+
+4. **Proper Header Parsing:** 
+   The code has been restructured to first parse the length correctly, then look for the keyword, and finally read the associated value.
+
+5. **Validation and Error Handling:** 
+   Additional error handling has been implemented to catch malformed headers, such as missing equals signs or unexpected data, ensuring robustness against improperly formatted Pax headers.
+
+These changes should prevent the `NegativeArraySizeException` and improve the reliability of parsing Pax headers from the given input stream.
+</think>
+
+To resolve the issue caused by the `NegativeArraySizeException` when parsing **PAX headers** using `TarArchiveInputStream.parsePaxHeaders`, we need to address several **bugs** and **edge cases** in the original logic, particularly around how numeric values are parsed, newline characters are handled, and how

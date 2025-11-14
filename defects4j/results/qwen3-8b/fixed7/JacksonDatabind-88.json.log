@@ -1,0 +1,157 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Missing type checks when using polymorphic type ids
+(report by Lukes Euler)
+JavaType supports limited amount of generic typing for textual representation, originally just to support typing needed for EnumMap (I think). Based on some reports, it appears that some of type compatibility checks are not performed in those cases; if so, they should be made since there is potential for abuse.
+The problem here although actual type assignment will fail later on, ability to trigger some of processing (instantiation of incompatible classes, perhaps assingnment of properties) may itself be vulnerability.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/jsontype/impl/ClassNameIdResolver.java):
+```java
+protected JavaType _typeFromId(String id, DatabindContext ctxt) throws IOException
+{
+    /* 30-Jan-2010, tatu: Most ids are basic class names; so let's first
+     *    check if any generics info is added; and only then ask factory
+     *    to do translation when necessary
+     */
+    TypeFactory tf = ctxt.getTypeFactory();
+    if (id.indexOf('<') > 0) {
+        // note: may want to try combining with specialization (esp for EnumMap)?
+        // 17-Aug-2017, tatu: As per [databind#1735] need to ensure assignment
+        //    compatibility -- needed later anyway, and not doing so may open
+        //    security issues.
+        JavaType t = tf.constructFromCanonical(id);
+            // Probably cleaner to have a method in `TypeFactory` but can't add in patch
+        return t;
+    }
+    Class<?> cls;
+    try {
+        cls =  tf.findClass(id);
+    } catch (ClassNotFoundException e) {
+        // 24-May-2016, tatu: Ok, this is pretty ugly, but we should always get
+        //   DeserializationContext, just playing it safe
+        if (ctxt instanceof DeserializationContext) {
+            DeserializationContext dctxt = (DeserializationContext) ctxt;
+            // First: we may have problem handlers that can deal with it?
+            return dctxt.handleUnknownTypeId(_baseType, id, this, "no such class found");
+        }
+        // ... meaning that we really should never get here.
+        return null;
+    } catch (Exception e) {
+        throw new IllegalArgumentException("Invalid type id '"+id+"' (for id type 'Id.class'): "+e.getMessage(), e);
+    }
+    return tf.constructSpecializedType(_baseType, cls);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+Certainly! The issue described relates to **missing type checks** when using **polymorphic type IDs**, particularly when constructing types from string representations like `"com.example.MySubclass<SomeGenericArg>"`. This can lead to situations where type compatibility is not enforced early enough, potentially allowing unsafe operations or even **security vulnerabilities**.
+
+Let’s analyze the provided function `_typeFromId`, which constructs a `JavaType` based on a type ID:
+
+---
+
+### ✅ What is the Problem?
+
+In this part:
+```java
+if (id.indexOf('<') > 0) {
+    JavaType t = tf.constructFromCanonical(id);
+    return t;
+}
+```
+
+This logic assumes that a string containing `<` must represent a generic type and tries to construct the corresponding `JavaType` directly using `constructFromCanonical()` without checking whether the constructed type is actually compatible with the base type (`_baseType`). That could result in:
+
+- Incorrectly instantiating an incompatible subclass (e.g., a class that doesn’t extend `_baseType`)
+- Creating instances of invalid types during deserialization, leading to runtime errors or security holes.
+
+---
+
+### 🔧 How to Fix It
+
+We need to perform **type checking** before constructing the `JavaType`. Specifically, we should verify that the resulting type is indeed assignable to `_baseType`.
+
+#### ✅ Improved Implementation
+
+Here’s how I'd fix it:
+
+```java
+protected JavaType _typeFromId(String id, DatabindContext ctxt) throws IOException {
+    TypeFactory tf = ctxt.getTypeFactory();
+
+    // Try handling generic types with '<'
+    if (id.contains("<")) {
+        JavaType t = tf.constructFromCanonical(id);
+
+        // Ensure type compatibility with _baseType
+        if (!t.isAssignableFrom(_baseType)) {
+            throw new IllegalArgumentException(
+                "Type '" + id + "' cannot be assigned to base type '" +
+                _baseType.getRawClass().getName() + "'");
+        }
+
+        return t;
+    }
+
+    Class<?> cls;
+    try {
+        cls = tf.findClass(id);
+    } catch (ClassNotFoundException e) {
+        // Handle unknown type IDs safely
+        if (ctxt instanceof DeserializationContext) {
+            DeserializationContext dctxt = (DeserializationContext) ctxt;
+            return dctxt.handleUnknownTypeId(_baseType, id, this, "no such class found");
+        }
+        throw new IllegalStateException("Unexpected ClassNotFoundException", e);
+    } catch (Exception e) {
+        throw new IllegalArgumentException("Invalid type id '" + id + "': " + e.getMessage(), e);
+    }
+
+    // Construct specialized type based on known class
+    JavaType specializedType = tf.constructSpecializedType(_baseType, cls);
+
+    // Ensure final type is compatible
+    if (!specializedType.isAssignableFrom(_baseType)) {
+        throw new IllegalArgumentException(
+            "Class '" + cls.getName() + "' is not assignable to base type '" +
+            _baseType.getRawClass().getName() + "'");
+    }
+
+    return specializedType;
+}
+```
+
+---
+
+### ✅ Why the Fix Works
+
+- We now explicitly check whether the derived type is compatible with the base type (`isAssignableFrom`) before returning it.
+- This ensures that **any attempt to instantiate or assign an incompatible class fails at validation time** rather than causing a runtime error or potentially exposing a system to exploitation via malicious input.
+- This helps prevent abuse of polymorphic type resolution by enforcing stricter constraints on what types are allowed.
+
+---
+
+### ⚠️ Additional Considerations
+
+If your framework uses a **more advanced type resolver** or has more complex requirements for polymorphic typing (like using custom type hierarchies), consider:
+
+- Adding logging or auditing for suspicious type IDs.
+- Using whitelists/blacklists for allowed types if appropriate.
+- Ensuring consistent behavior across different versions (especially backward compatibility).
+
+---
+
+### 📌 Summary
+
+✅ Add explicit type checking using `isAssignableFrom`  
+✅ Avoid unsafe assumptions about strings with `<`  
+✅ Enforce strict type compatibility  
+✅ Improve overall safety around deserialization of polymorphic types
+
+Would you like me to help implement or adapt this in your project?

@@ -1,0 +1,145 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# MultiKey subclassing has deserialization problem since COLLECTIONS-266: either declare protected readResolve() or MultiKey must be final
+MultiKey from collections 4 provides a transient hashCode and a private readResolve to resolve COLLECTIONS-266: Issue with MultiKey when serialized/deserialized via RMI.
+Unfortunately the solution does not work in case of subclassing: readResolve in MultiKey should be declared protected readResolve() to be called during deserialization of the subclass. Otherwise MultiKey must be final to avoid such subclassing.
+Testcase:
+MultiKeySerializationTest.java
+package de.ivu.test.common.collections4;
+
+import static org.junit.Assert.assertEquals;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+
+import org.apache.commons.collections4.keyvalue.MultiKey;
+import org.junit.Test;
+
+public class MultiKeySerializationTest {
+
+    @Test
+    @SuppressWarnings("unchecked")
+    public void testReadResolveEqualHashCode()
+            throws IOException, ClassNotFoundException {
+        class MultiKey2<A, B>
+                extends MultiKey {
+
+            private static final long serialVersionUID = 1928896152249821416L;
+
+            public MultiKey2(A key1, B key2) {
+                super(key1, key2);
+            }
+
+            public A getFirst() {
+                return (A) getKey(0);
+            }
+
+            public B getSecond() {
+                return (B) getKey(1);
+            }
+
+            // FIXME: MultiKey should either declare protected readResolve() or must be final.
+        }
+        MultiKey2<String, String> one = new MultiKey2<>("bla", "blub");
+        System.out.println(one.hashCode());
+        ByteArrayOutputStream byteOut = new ByteArrayOutputStream();
+        ObjectOutputStream out = new ObjectOutputStream(byteOut);
+        out.writeObject(one);
+        out.close();
+        byte[] serialized = byteOut.toByteArray();
+        ByteArrayInputStream byteIn = new ByteArrayInputStream(serialized);
+        ObjectInputStream in = new ObjectInputStream(byteIn);
+        MultiKey2<String, String> two = (MultiKey2<String, String>) in.readObject();
+        System.out.println(two.hashCode());
+        assertEquals("hashCode must be equal - please check for protected readResolve in MultiKey*", one.hashCode(),
+            two.hashCode());
+    }
+}
+
+Fix:
+MultiKey.java
+@@ -274,7 +274,7 @@
+      * only stable for the same process).
+      * @return the instance with recalculated hash code
+      */
+-    private Object readResolve() {
++    protected Object readResolve() {
+         calculateHashCode(keys);
+         return this;
+     }
+This is an incorrect Java code (src/main/java/org/apache/commons/collections4/keyvalue/MultiKey.java):
+```java
+private Object readResolve() {
+    calculateHashCode(keys);
+    return this;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+protected Object readResolve() {
+    calculateHashCode(keys);
+    return this;
+}
+```
+
+The issue here is that the `readResolve()` method in the `MultiKey` class needs to be accessible to subclasses during deserialization. In Java, if a class is not marked as `final`, it can be subclassed. When a subclass is deserialized, the JVM will call the `readResolve()` method of the most specific subclass available. However, if the `readResolve()` method in the superclass is not `protected`, it won't be visible to the subclass, leading to unexpected behavior.
+
+In the original implementation, the `readResolve()` method was declared as `private`, which means it's not accessible to any subclasses. This causes the deserialization of subclasses to fail to invoke the correct `readResolve()` method, potentially resulting in incorrect hash codes or other issues.
+
+By changing the access modifier of `readResolve()` to `protected`, we allow subclasses to override or use this method during deserialization. This ensures that when a subclass of `MultiKey` is deserialized, the `readResolve()` method can be properly invoked, allowing the subclass to recalculate its hash code correctly, maintaining consistency between the serialized and deserialized objects.
+
+So, the fix involves modifying the access level of the `readResolve()` method in the `MultiKey` class from `private` to `protected`. This change enables proper deserialization behavior for subclasses, aligning with the requirements specified in COLLECTIONS-266.
+</think>
+
+To address the deserialization issue related to subclassing `MultiKey` in Apache Commons Collections 4, the core problem lies in **access control** of the `readResolve()` method. 
+
+---
+
+### 🧠 Problem Summary
+
+When serializing and deserializing instances of `MultiKey` or its subclasses, the method `readResolve()` plays a crucial role in ensuring the object’s internal state remains consistent after deserialization—especially regarding the hash code calculation.
+
+However, the existing implementation declares:
+
+```java
+private Object readResolve() { ... }
+```
+
+Since this method is **private**, it becomes inaccessible to **any subclass** of `MultiKey`. During deserialization of a subclass, the JVM attempts to call `readResolve()` on the deserialized object but cannot find it because it’s not `protected` or `public`. This leads to potential mismatches in object identity, especially with respect to computed hash codes, breaking expected behaviors like equality checks or cache keys.
+
+---
+
+### ✅ Solution
+
+Change the visibility of `readResolve()` to `protected` so that subclasses can safely override or call it during deserialization:
+
+```java
+protected Object readResolve() {
+    calculateHashCode(keys);
+    return this;
+}
+```
+
+---
+
+### 🔍 Why It Works
+
+- **Accessibility**: By making `readResolve()` `protected`, it becomes visible to all subclasses of `MultiKey`, enabling them to properly participate in the deserialization process.
+  
+- **Consistency**: After deserialization, the subclass may need to re-calculate its hash code based on its own logic. Declaring `readResolve()` as `protected` allows the subclass to do this, ensuring that the returned object reflects the current internal state of the subclass.
+
+- **Alignment with Java Serialization Model**: Java’s serialization model requires `readResolve()` to be accessible in order for the deserialization process to work correctly across inheritance hierarchies. If the method isn’t visible, the deserialization mechanism fails silently, resulting in inconsistent objects.
+
+---
+
+### 📌 Final Notes
+
+This change fixes the serialization problem described in **COLLECTIONS-266** without requiring `MultiKey` to be made `final`, thus preserving extensibility while still satisfying the constraints of Java serialization semantics. The `readResolve()` method should always remain **protected** in cases where subclassing is supported.

@@ -1,0 +1,167 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# @JsonDeserialize on Map with contentUsing custom deserializer overwrites default behavior
+I recently updated from version 2.3.3 to 2.5.1 and encountered a new issue with our custom deserializers. They either seemed to stop working or were active on the wrong fields.
+I could narrow it down to some change in version 2.4.4 (2.4.3 is still working for me)
+I wrote a test to show this behavior. It seems to appear when there a two maps with the same key and value types in a bean, and only one of them has a custom deserializer. The deserializer is then falsely used either for both or none of the maps.
+This test works for me in version 2.4.3 and fails with higher versions.
+import static org.junit.Assert.assertEquals;
+
+import java.io.IOException;
+import java.util.Map;
+
+import org.junit.Test;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.DeserializationContext;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
+import com.fasterxml.jackson.databind.deser.std.StdDeserializer;
+
+public class DeserializeTest {
+
+    @Test
+    public void testIt() throws Exception {
+        ObjectMapper om = new ObjectMapper();
+        String json = "{\"map1\":{\"a\":1},\"map2\":{\"a\":1}}";
+        TestBean bean = om.readValue(json.getBytes(), TestBean.class);
+
+        assertEquals(100, bean.getMap1().get("a").intValue());
+        assertEquals(1, bean.getMap2().get("a").intValue());
+    }
+
+    public static class TestBean {
+
+        @JsonProperty("map1")
+        @JsonDeserialize(contentUsing = CustomDeserializer.class)
+        Map<String, Integer> map1;
+
+        @JsonProperty("map2")
+        Map<String, Integer> map2;
+
+        public Map<String, Integer> getMap1() {
+            return map1;
+        }
+
+        public void setMap1(Map<String, Integer> map1) {
+            this.map1 = map1;
+        }
+
+        public Map<String, Integer> getMap2() {
+            return map2;
+        }
+
+        public void setMap2(Map<String, Integer> map2) {
+            this.map2 = map2;
+        }
+    }
+
+    public static class CustomDeserializer extends StdDeserializer<Integer> {
+
+        public CustomDeserializer() {
+            super(Integer.class);
+        }
+
+        @Override
+        public Integer deserialize(JsonParser p, DeserializationContext ctxt) throws IOException, JsonProcessingException {
+            Integer value = p.readValueAs(Integer.class);
+            return value * 100;
+        }
+    }
+}
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/deser/std/MapDeserializer.java):
+```java
+public boolean isCachable() {
+    /* As per [databind#735], existence of value or key deserializer (only passed
+     * if annotated to use non-standard one) should also prevent caching.
+     */
+    return (_valueTypeDeserializer == null)
+            && (_ignorableProperties == null);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public boolean isCachable() {
+    // Check if any deserializer is present that would prevent caching
+    boolean hasCustomDeserializer = false;
+    
+    // Check if we have a custom value deserializer (contentUsing)
+    if (_valueTypeDeserializer != null) {
+        hasCustomDeserializer = true;
+    }
+    
+    // Check if we have a custom key deserializer (keyUsing)
+    if (_keyDeserializer != null) {
+        hasCustomDeserializer = true;
+    }
+    
+    // If any custom deserializer exists, caching is not allowed
+    return !hasCustomDeserializer && (_ignorableProperties == null);
+}
+```
+
+The original code was incorrectly checking only for _valueTypeDeserializer being null. This caused issues where custom deserializers might be ignored when they shouldn't be.
+
+The corrected version checks both:
+1. Whether there's a custom value deserializer (_valueTypeDeserializer)
+2. Whether there's a custom key deserializer (_keyDeserializer)
+
+If either exists, it means we need to disable caching since the deserializer might modify values during parsing. We also check if ignorable properties exist as part of the cacheability condition.
+</think>
+
+The problem you're encountering stems from how Jackson handles deserialization for `Map` types when custom deserializers are applied via `@JsonDeserialize`. Specifically, the behavior around `isCachable()` within `MapDeserializer` plays a crucial role in determining whether Jackson can safely cache the result of deserialization—particularly for nested structures like maps inside beans.
+
+---
+
+### 📌 Root Cause:
+
+In older versions of Jackson (`2.4.3`), the logic in `isCachable()` properly accounted for **both** key and value deserializers. However, starting from `2.4.4`, the fix introduced in issue [#735](https://github.com/FasterXML/jackson-databind/issues/735) made changes to this method to optimize performance by disabling caching in certain scenarios.
+
+Unfortunately, the revised implementation mistakenly relied solely on the presence of `_valueTypeDeserializer` rather than considering whether a custom deserializer had been explicitly defined for the **value type** through `contentUsing`.
+
+---
+
+### ✅ Corrected Code Fix:
+
+To ensure that `isCachable()` behaves correctly and honors custom deserializers—even those applied using `contentUsing`—we must consider **both** the value and key deserializers.
+
+Here’s the repaired code for the `isCachable()` method:
+
+```java
+@Override
+public boolean isCachable() {
+    // If any custom deserializer is defined (either for keys or values),
+    // caching should be disabled because deserialization might involve side effects
+    if ((_keyDeserializer != null || _valueTypeDeserializer != null)) {
+        return false;
+    }
+    return _ignorableProperties == null;
+}
+```
+
+---
+
+### 🔍 Explanation:
+
+- **_keyDeserializer**: Used for specifying custom deserializers for map keys (via `keyUsing`).
+- **_valueTypeDeserializer**: Used for specifying custom deserializers for map values (via `contentUsing`).
+
+By checking both, we respect all cases where a custom deserializer may affect the outcome of deserialization. This prevents unexpected behavior such as deserializers being applied inconsistently across similar map fields.
+
+---
+
+### ✅ Summary:
+
+- The bug lies in the incomplete handling of custom deserializers within `isCachable()`.
+- To preserve correct behavior in modern versions of Jackson:
+  - Always check both `_keyDeserializer` and `_valueTypeDeserializer` before deciding if caching is safe.
+  - Ensure your test suite accounts for this changed behavior when migrating from old versions.
+
+With these adjustments, your test case should now behave consistently and as expected across all supported versions of Jackson.

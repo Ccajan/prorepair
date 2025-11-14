@@ -1,0 +1,160 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# #90 DateTimeZone.getOffsetFromLocal error during DST transition
+This may be a failure of my understanding, but the comments in DateTimeZone.getOffsetFromLocal lead me to believe that if an ambiguous local time is given, the offset corresponding to the later of the two possible UTC instants will be returned - i.e. the greater offset.
+This doesn't appear to tally with my experience. In fall 2009, America/Los_Angeles changed from -7 to -8 at 2am wall time on November 11. Thus 2am became 1am - so 1:30am is ambiguous. I would therefore expect that constructing a DateTime for November 11th, 1:30am would give an instant corresponding with the later value (i.e. 9:30am UTC). This appears not to be the case:
+import org.joda.time.DateTime;
+import org.joda.time.DateTimeZone;
+public class TzTest {
+public static void main(String[] args) throws Exception {
+DateTimeZone zone = DateTimeZone.forID("America/Los_Angeles");
+DateTime when1 = new DateTime(2009, 11, 1, 0, 30, 0, 0, zone);
+DateTime when2 = new DateTime(2009, 11, 1, 1, 30, 0, 0, zone);
+DateTime when3 = new DateTime(2009, 11, 1, 2, 30, 0, 0, zone);
+System.out.println(when1);
+System.out.println(when2);
+System.out.println(when3);
+}
+}
+Results:
+2009-11-01T00:30:00.000-07:00 // Correct
+2009-11-01T01:30:00.000-07:00 // Should be -08:00
+2009-11-01T02:30:00.000-08:00 // Correct
+This is an incorrect Java code (src/main/java/org/joda/time/DateTimeZone.java):
+```java
+public int getOffsetFromLocal(long instantLocal) {
+    // get the offset at instantLocal (first estimate)
+    final int offsetLocal = getOffset(instantLocal);
+    // adjust instantLocal using the estimate and recalc the offset
+    final long instantAdjusted = instantLocal - offsetLocal;
+    final int offsetAdjusted = getOffset(instantAdjusted);
+    // if the offsets differ, we must be near a DST boundary
+    if (offsetLocal != offsetAdjusted) {
+        // we need to ensure that time is always after the DST gap
+        // this happens naturally for positive offsets, but not for negative
+        if ((offsetLocal - offsetAdjusted) < 0) {
+            // if we just return offsetAdjusted then the time is pushed
+            // back before the transition, whereas it should be
+            // on or after the transition
+            long nextLocal = nextTransition(instantAdjusted);
+            long nextAdjusted = nextTransition(instantLocal - offsetAdjusted);
+            if (nextLocal != nextAdjusted) {
+                return offsetLocal;
+            }
+        }
+    }
+    return offsetAdjusted;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public int getOffsetFromLocal(long instantLocal) {
+    final int offsetLocal = getOffset(instantLocal);
+    final long instantAdjusted = instantLocal - offsetLocal;
+    final int offsetAdjusted = getOffset(instantAdjusted);
+
+    if (offsetLocal != offsetAdjusted) {
+        // We're near a DST boundary; handle ambiguity
+        // Determine which offset corresponds to the later UTC time
+        long adjustedInstant1 = instantLocal - offsetLocal;
+        long adjustedInstant2 = instantLocal - offsetAdjusted;
+
+        // Check which adjustment leads to the later UTC time
+        if (adjustedInstant2 > adjustedInstant1) {
+            return offsetAdjusted;
+        } else {
+            return offsetLocal;
+        }
+    }
+
+    return offsetAdjusted;
+}
+```
+
+The original code had an issue with how it handled ambiguous local times during daylight saving time transitions. The key problem was the logic for deciding which offset to return when there's ambiguity.
+
+In the updated version:
+
+1. We first calculate both potential UTC equivalents of the local time:
+   - `adjustedInstant1` assumes the initial offset
+   - `adjustedInstant2` uses the adjusted offset
+
+2. We compare these two UTC timestamps:
+   - If the second one (`adjustedInstant2`) is later than the first (`adjustedInstant1`), it means the local time could correspond to the later UTC time with the adjusted offset
+   - So we return the adjusted offset
+   - Otherwise, we stick with the original offset
+
+This ensures that when there's ambiguity, the code returns the offset that corresponds to the later UTC timestamp, as expected based on the comment in the original code.
+
+The change primarily involves replacing the complex logic involving `nextTransition()` with a simpler comparison of the UTC timestamps derived from both offsets. This directly addresses the core issue of choosing the correct offset for ambiguous local times during DST transitions.
+</think>
+
+The provided Joda-Time implementation of `getOffsetFromLocal` has a flaw in its handling of ambiguous local times during daylight saving time (DST) transitions. Specifically, it does **not** follow the documented behavior described in the comment about returning the offset corresponding to the *later* UTC time for ambiguous moments. Instead, it appears to default to the earlier offset without clearly evaluating which option yields the later UTC moment. 
+
+---
+
+### ✅ Problem Summary
+
+In your test example involving **America/Los_Angeles**, when constructing a `DateTime` object for `November 11, 2009, 1:30 AM`, the resulting offset is still `-07:00` instead of the expected `-08:00`. This discrepancy occurs because the current algorithm fails to properly resolve the ambiguity when transitioning from daylight saving time to standard time, where a local hour is skipped (e.g., **2AM becomes 1AM**).
+
+The existing code snippet:
+
+```java
+if (offsetLocal != offsetAdjusted) {
+    if ((offsetLocal - offsetAdjusted) < 0) {
+        long nextLocal = nextTransition(instantAdjusted);
+        long nextAdjusted = nextTransition(instantLocal - offsetAdjusted);
+        if (nextLocal != nextAdjusted) {
+            return offsetLocal;
+        }
+    }
+}
+return offsetAdjusted;
+```
+
+is overly complex and unclear. It introduces unnecessary checks with `nextTransition()`, which do not effectively distinguish between the "earlier" vs. "later" UTC interpretation for ambiguous local times.
+
+---
+
+### ✅ Solution
+
+To fix this issue, we simplify the logic by explicitly comparing the UTC timestamps generated by each possible offset. When there's ambiguity (i.e., when two different offsets can produce the same local time), we should **choose the offset that corresponds to the later UTC moment**, which matches the description in the original comment.
+
+Here’s the corrected implementation:
+
+```java
+public int getOffsetFromLocal(long instantLocal) {
+    final int offsetLocal = getOffset(instantLocal);
+    final long adjustedInstant1 = instantLocal - offsetLocal;
+    final int offsetAdjusted = getOffset(adjustedInstant1);
+    final long adjustedInstant2 = instantLocal - offsetAdjusted;
+
+    if (offsetLocal != offsetAdjusted) {
+        // We're near a DST boundary; resolve ambiguity
+        // Choose the offset that maps to the later UTC time
+        return (adjustedInstant2 > adjustedInstant1) ? offsetAdjusted : offsetLocal;
+    }
+
+    return offsetAdjusted;
+}
+```
+
+---
+
+### ✅ Explanation of Fix
+
+- **Line 1**: Compute the initial offset for the input `instantLocal`.
+- **Lines 2–4**: Convert the local time to UTC for both the original and adjusted offset.
+- **Line 5–6**: Compare the UTC timestamps produced by each offset.
+- **Line 7**: Return the offset that results in the **later** UTC timestamp, ensuring the correct handling of ambiguous local times during DST transitions.
+
+---
+
+### 🧠 Why This Works
+
+By comparing the actual UTC timestamps derived from both possible interpretations of the local time, we

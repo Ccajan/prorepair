@@ -1,0 +1,145 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Problem resolving locally declared generic type
+(reported by Hal H)
+Case like:
+class Something {
+    public <T extends Ruleform> T getEntity()
+    public <T extends Ruleform> void setEntity(T entity) 
+}
+appears to fail on deserialization.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/type/TypeFactory.java):
+```java
+protected JavaType _fromVariable(TypeVariable<?> type, TypeBindings context)
+{
+    final String name = type.getName();
+    // 19-Mar-2015: Without context, all we can check are bounds.
+    if (context == null) {
+        // And to prevent infinite loops, now need this:
+        return _unknownType();
+    } else {
+        // Ok: here's where context might come in handy!
+        /* 19-Mar-2015, tatu: As per [databind#609], may need to allow
+         *   unresolved type variables to handle some cases where bounds
+         *   are enough. Let's hope it does not hide real fail cases.
+         */
+        JavaType actualType = context.findType(name);
+        if (actualType != null) {
+            return actualType;
+        }
+    }
+
+    /* 29-Jan-2010, tatu: We used to throw exception here, if type was
+     *   bound: but the problem is that this can occur for generic "base"
+     *   method, overridden by sub-class. If so, we will want to ignore
+     *   current type (for method) since it will be masked.
+     */
+    Type[] bounds = type.getBounds();
+
+    // With type variables we must use bound information.
+    // Theoretically this gets tricky, as there may be multiple
+    // bounds ("... extends A & B"); and optimally we might
+    // want to choose the best match. Also, bounds are optional;
+    // but here we are lucky in that implicit "Object" is
+    // added as bounds if so.
+    // Either way let's just use the first bound, for now, and
+    // worry about better match later on if there is need.
+
+    /* 29-Jan-2010, tatu: One more problem are recursive types
+     *   (T extends Comparable<T>). Need to add "placeholder"
+     *   for resolution to catch those.
+     */
+    context._addPlaceholder(name);
+    return _constructType(bounds[0], context);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+The issue described involves **type erasure** and **type variable handling** in generics during Jackson’s deserialization process. In particular, the following scenario is problematic:
+
+### ❌ **Problem**
+When dealing with local generic declarations such as:
+
+```java
+public class Something {
+    public <T extends Ruleform> T getEntity();
+    public <T extends Ruleform> void setEntity(T entity);
+}
+```
+
+Jackson fails to properly resolve these methods during deserialization due to **how `TypeFactory` handles unbound type variables**.
+
+---
+
+## ✅ **Root Cause**
+
+In the given code snippet from `TypeFactory`, the function `_fromVariable()` attempts to resolve type variables using a `TypeBindings` object. However, when `context == null`, it returns `_unknownType()`. This makes it impossible to determine what `T` should be at runtime, especially during deserialization where full typing information isn't available.
+
+Additionally, even when `context` exists, it may not provide sufficient or correct information for nested or parameterized types involving local generic parameters.
+
+---
+
+## ✅ **Solution Overview**
+
+To correctly resolve generic types with local declaration (`<T extends ...>`), the logic in `_fromVariable()` needs to be adjusted to:
+
+1. **Handle unbound type variables gracefully** without throwing errors.
+2. **Allow fallback to bounds**, e.g., use the raw type `<Ruleform>` if no explicit substitution is known.
+3. **Avoid infinite recursion** in case of circular type dependencies (like `T extends Comparable<T>`).
+4. **Properly construct `JavaType` objects** based on bounds or inferred type when necessary.
+
+---
+
+## ✅ **Revised Code Fix**
+
+Here is the corrected version of the method:
+
+```java
+protected JavaType _fromVariable(TypeVariable<?> type, TypeBindings context) {
+    final String name = type.getName();
+    
+    // Check if we have any resolved type in context
+    JavaType actualType = context != null ? context.findType(name) : null;
+
+    if (actualType != null) {
+        return actualType;
+    }
+
+    // Fall back to bounds if no binding is found
+    Type[] bounds = type.getBounds();
+
+    // Use the first bound if possible; default to Object if none is provided
+    Type firstBound = (bounds.length > 0) ? bounds[0] : Object.class;
+
+    // Handle recursive types (e.g., T extends Comparable<T>)
+    // Add placeholder to avoid infinite recursion
+    context._addPlaceholder(name);
+
+    return _constructType(firstBound, context);
+}
+```
+
+---
+
+## ✅ **Explanation**
+
+- **Fallback to bounds**: When `context` doesn’t provide a specific mapping, fall back to the `extends` bound. This ensures that types like `<T extends Ruleform>` can still be resolved to `Ruleform` during deserialization.
+  
+- **Recursive safety**: By adding a placeholder for the type variable before constructing, we ensure that Jackson won't recursively attempt to resolve the same type again, which could lead to infinite loops or stack overflows.
+
+- **Graceful error handling**: Instead of throwing an exception, the fix returns a type that reflects what’s known from the bounds, ensuring compatibility with downstream processing.
+
+---
+
+## ✅ **Recommendation**
+
+If you're working with legacy codebases that contain complex generic constructs (especially in setters and getters), consider wrapping these kinds of method signatures with wrapper classes or using `@JsonCreator` with custom type references — they offer more control over serialization/deserialization behavior than plain generic method signatures.
+
+Let me know if you'd like help writing such a wrapper!

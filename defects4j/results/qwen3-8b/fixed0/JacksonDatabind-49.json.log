@@ -1,0 +1,135 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# JsonIdentityInfo incorrectly serializing forward references
+I wrote this small test program to demonstrate the issue:
+import com.fasterxml.jackson.annotation.JsonIdentityInfo;
+import com.fasterxml.jackson.annotation.JsonIdentityReference;
+import com.fasterxml.jackson.annotation.ObjectIdGenerators;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+public class ObjectIdTest {
+
+    public static class Foo {
+
+        @JsonIdentityReference(alwaysAsId = true)
+        public Bar bar1;
+
+        @JsonIdentityReference()
+        public Bar bar2;
+    }
+
+    @JsonIdentityInfo(generator = ObjectIdGenerators.IntSequenceGenerator.class)
+    public static class Bar {
+
+    }
+
+    public static void main(String[] args) throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+
+        // create structure to serialize
+        Foo mo = new Foo();
+        mo.bar1 = new Bar();
+        mo.bar2 = mo.bar1;
+
+        // serialize it
+        System.out.println(mapper.writeValueAsString(mo));
+    }
+
+}
+When executing this test program in the latest version (2.7.4), the output will be {"bar1":1,"bar2":{"@id":2}} - the second field will be written with a new id even though both fields reference the same object. Because of this, writing forward references is essentially impossible.
+The issue seems to be the fact that BeanSerializerBase will always call WritableObjectId.generateId if the referenced object has not been written in plain format yet (https://github.com/FasterXML/jackson-databind/blob/master/src/main/java/com/fasterxml/jackson/databind/ser/std/BeanSerializerBase.java#L600). This will also happen if an id has been generated before.
+It might also be smarter to only generate a new id in WritableObjectId.generateId if that hasn't happened before; as that method doesn't have a javadoc I can't tell how it is supposed to work.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/ser/impl/WritableObjectId.java):
+```java
+public Object generateId(Object forPojo) {
+    // 04-Jun-2016, tatu: As per [databind#1255], need to consider possibility of
+    //    id being generated for "alwaysAsId", but not being written as POJO; regardless,
+    //    need to use existing id if there is one:
+        id = generator.generateId(forPojo);
+    return id;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public Object generateId(Object forPojo) {
+    // Check if we already have an ID generated for this object
+    if (id != null) {
+        return id;
+    }
+    
+    // Generate a new ID if not already present
+    id = generator.generateId(forPojo);
+    return id;
+}
+```
+
+Yes, this would fix the issue. The current implementation unconditionally calls generator.generateId(), which causes a new ID to be generated even if one was previously generated. The revised code checks if an ID is already present and returns it, preventing unnecessary generation of new IDs.
+
+However, I should note that the original code may have had specific reasons for its behavior, so modifying it could potentially introduce other issues. It's important to thoroughly test any changes to ensure they don't break other functionality.
+</think>
+
+To address the issue of **incorrect serialization of forward references** when using `@JsonIdentityInfo` and `@JsonIdentityReference`, we need to modify the logic of how `WritableObjectId.generateId()` operates.
+
+---
+
+### ✅ Problem Summary:
+
+In the provided example:
+```java
+Foo mo = new Foo();
+mo.bar1 = new Bar();
+mo.bar2 = mo.bar1;
+```
+Both `bar1` and `bar2` refer to the *same* instance of `Bar`. However, due to Jackson's default behavior, `bar1` gets assigned an ID (`1`) while `bar2` receives a different ID (`2`), even though both fields point to the same object. This results in inconsistent ID assignment and makes it impossible to reliably serialize such scenarios where **forward references exist**.
+
+The core problem lies in the `generateId()` method inside `WritableObjectId`, which:
+```java
+public Object generateId(Object forPojo) {
+    id = generator.generateId(forPojo);
+    return id;
+}
+```
+This line **unconditionally** generates a new ID, even if one was previously set — leading to unexpected and inconsistent behavior when dealing with forward-referenced objects.
+
+---
+
+### 🛠️ Solution:
+
+We need to update the `generateId()` method to check whether an ID has already been assigned before generating a new one. Here's the corrected version:
+
+```java
+public Object generateId(Object forPojo) {
+    if (id == null) {
+        id = generator.generateId(forPojo);
+    }
+    return id;
+}
+```
+
+---
+
+### 🔍 Why This Works:
+
+- **Avoids Duplicate Generation:** If an ID was already generated for the object, it avoids calling `generator.generateId()` again, which prevents the assigning of a new ID to the same object in cases like forward referencing.
+- **Respects Existing Identities:** It respects the logic of ID assignment, making sure each object gets exactly one unique ID during the serialization process.
+
+---
+
+### ⚠️ Caveats and Considerations:
+
+While the updated `generateId()` addresses the immediate problem, some additional considerations are worth noting:
+- **Consistency Across Serialization Contexts:** If multiple threads or serializers might be involved, proper synchronization might be required depending on your usage pattern.
+- **Custom Generators:** Ensure that the `generator` used with `@JsonIdentityInfo` behaves correctly and returns stable values across invocations.
+
+---
+
+### ✅ Conclusion:
+
+The key takeaway is that Jackson’s identity handling must respect object identity once assigned. By adjusting the `generateId()` method to **only assign an ID if it's not already present**, you ensure consistent, correct serialization even when forward references are involved.
+
+If you’re encountering similar inconsistencies with `@JsonIdentityReference` or `@JsonIdentityInfo`, consider reviewing how your ID generators behave and whether the current logic conforms to the expected behavior in all edge cases.

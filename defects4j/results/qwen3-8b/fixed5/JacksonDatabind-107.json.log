@@ -1,0 +1,125 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# DeserializationProblemHandler.handleUnknownTypeId() returning Void.class, enableDefaultTyping causing NPE
+Returning Void.class from com.fasterxml.jackson.databind.deser.HandleUnknowTypeIdTest.testDeserializationWithDeserializationProblemHandler().new DeserializationProblemHandler() {...}.handleUnknownTypeId(DeserializationContext, JavaType, String, TypeIdResolver, String) is causing a NPE in jackson 2.9. I'll provide a pull request illustrating the issue in a test.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/jsontype/impl/TypeDeserializerBase.java):
+```java
+protected final JsonDeserializer<Object> _findDeserializer(DeserializationContext ctxt,
+        String typeId) throws IOException
+{
+    JsonDeserializer<Object> deser = _deserializers.get(typeId);
+    if (deser == null) {
+        /* As per [databind#305], need to provide contextual info. But for
+         * backwards compatibility, let's start by only supporting this
+         * for base class, not via interface. Later on we can add this
+         * to the interface, assuming deprecation at base class helps.
+         */
+        JavaType type = _idResolver.typeFromId(ctxt, typeId);
+        if (type == null) {
+            // use the default impl if no type id available:
+            deser = _findDefaultImplDeserializer(ctxt);
+            if (deser == null) {
+                // 10-May-2016, tatu: We may get some help...
+                JavaType actual = _handleUnknownTypeId(ctxt, typeId);
+                if (actual == null) { // what should this be taken to mean?
+                    // 17-Jan-2019, tatu: As per [databind#2221], better NOT return `null` but...
+                    return null;
+                }
+                // ... would this actually work?
+                deser = ctxt.findContextualValueDeserializer(actual, _property);
+            }
+        } else {
+            /* 16-Dec-2010, tatu: Since nominal type we get here has no (generic) type parameters,
+             *   we actually now need to explicitly narrow from base type (which may have parameterization)
+             *   using raw type.
+             *
+             *   One complication, though; cannot change 'type class' (simple type to container); otherwise
+             *   we may try to narrow a SimpleType (Object.class) into MapType (Map.class), losing actual
+             *   type in process (getting SimpleType of Map.class which will not work as expected)
+             */
+            if ((_baseType != null)
+                    && _baseType.getClass() == type.getClass()) {
+                /* 09-Aug-2015, tatu: Not sure if the second part of the check makes sense;
+                 *   but it appears to check that JavaType impl class is the same which is
+                 *   important for some reason?
+                 *   Disabling the check will break 2 Enum-related tests.
+                 */
+                // 19-Jun-2016, tatu: As per [databind#1270] we may actually get full
+                //   generic type with custom type resolvers. If so, should try to retain them.
+                //  Whether this is sufficient to avoid problems remains to be seen, but for
+                //  now it should improve things.
+                if (!type.hasGenericTypes()) {
+                    type = ctxt.getTypeFactory().constructSpecializedType(_baseType, type.getRawClass());
+                }
+            }
+            deser = ctxt.findContextualValueDeserializer(type, _property);
+        }
+        _deserializers.put(typeId, deser);
+    }
+    return deser;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+Certainly! The issue described involves a problem in Jackson's `TypeDeserializerBase._findDeserializer()` method when `handleUnknownTypeId()` returns `Void.class`. This causes a `NullPointerException` later because the code assumes that the returned value (`actual`) is a valid `JavaType`.
+
+### ✅ **Problem Summary**
+In the method:
+
+```java
+if (actual == null) { 
+    return null;
+}
+deser = ctxt.findContextualValueDeserializer(actual, _property);
+```
+
+When `_handleUnknownTypeId()` returns `Void.class`, the `actual` variable becomes `Void.TYPE`, and calling `.findContextualValueDeserializer(actual, _)` results in a `NullPointerException` due to invalid type handling.
+
+---
+
+### 🔧 **Fix Explanation**
+
+The root cause lies in how Jackson handles `Void.TYPE` or other primitive types (like `int.class`, etc.) when resolving deserializers. In such cases, the `ctxt.findContextualValueDeserializer()` expects a valid, non-primitive `JavaType`.
+
+To fix this, we should ensure that any invalid type (like `Void.TYPE`) does **not** proceed further down the chain — instead, return early and log an appropriate message.
+
+Here’s the corrected version of the relevant block of code:
+
+```java
+if (actual == null) { 
+    // Log a warning and skip fallback logic
+    logger.warn("handleUnknownTypeId returned null; unable to resolve deserializer");
+    return null;
+}
+
+// Ensure the actual type is not a primitive wrapper type like Void.TYPE
+if (actual.isPrimitive() || actual.isJavaLangReflectType()) {
+    logger.warn("Ignoring invalid type '{}': cannot resolve deserializer", actual);
+    return null;
+}
+
+deser = ctxt.findContextualValueDeserializer(actual, _property);
+```
+
+---
+
+### 📝 Additional Considerations
+
+- **Logging**: It's crucial to log warnings in these edge cases so developers are aware of potential issues during runtime.
+- **Validation**: Adding checks like `isPrimitive()` or `isJavaLangReflectType()` ensures we don’t attempt to deserialize from invalid or unexpected types.
+- **Backward Compatibility**: The original code behavior was preserved where possible — returning `null` upon failure — but now with more informative failures.
+
+---
+
+### ✅ Final Suggestion
+
+If your application uses `enableDefaultTyping(true)` or similar features, make sure to also validate all input JSON data to prevent malformed or unhandled type IDs.
+
+If needed, I can also provide a full Pull Request patch with unit tests covering this scenario. Let me know how you'd like to proceed!

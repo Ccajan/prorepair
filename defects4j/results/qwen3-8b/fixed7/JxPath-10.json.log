@@ -1,0 +1,131 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Binary operators behaviour involving node-sets is incorrect
+According to XPath specification:
+"If both objects to be compared are node-sets, then the comparison will be true if and only if there is a node in the first node-set and a node in the second node-set such that the result of performing the comparison on the string-values of the two nodes is true. If one object to be compared is a node-set and the other is a number, then the comparison will be true if and only if there is a node in the node-set such that the result of performing the comparison on the number to be compared and on the result of converting the string-value of that node to a number using the number function is true."
+But following example illustrates, that this is not a JXPath behaviour:
+        JXPathContext pathContext = JXPathContext
+                .newContext(DocumentBuilderFactory.newInstance()
+                        .newDocumentBuilder().parse(
+                                new InputSource(new StringReader(
+                                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n"
+                                                + "<doc/>"))));
+        Boolean result = (Boolean) pathContext.getValue("2.0 > child1",
+                Boolean.class);
+        assertFalse(result.booleanValue());
+"child1" is not found - right operand node set is empty, but result is TRUE, instead of FALSE.
+Please, check greaterThan(), lesserThan(), etc methods of org.apache.xpath.objects.XObject for possible solution
+This is an incorrect Java code (src/java/org/apache/commons/jxpath/ri/compiler/CoreOperationRelationalExpression.java):
+```java
+public final Object computeValue(EvalContext context) {
+    return compute(args[0].computeValue(context), args[1].computeValue(context)) 
+            ? Boolean.TRUE : Boolean.FALSE;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+if (args[0] instanceof XNumber && args[1] instanceof XNumber) { // Handle numbers directly
+    return compareNumbers((XNumber) args[0], (XNumber) args[1]);
+} else if (args[0] instanceof XNodeSet && args[1] instanceof XNodeSet) { // Handle node sets
+    return compareNodeSets((XNodeSet) args[0], (XNodeSet) args[1]);
+} else if (args[0] instanceof XNodeSet || args[1] instanceof XNodeSet) { // One is a node set
+    return compareNodeAndScalar(compareNodeSetWithScalar(args[0], args[1]), args[0], args[1]);
+} else {
+    // Fallback to default handling or throw exception
+    return computeDefaultComparison(args[0].computeValue(context), args[1].computeValue(context));
+}
+
+// Helper methods would go here
+private boolean compareNumbers(XNumber num1, XNumber num2) {
+    // Implement numeric comparison logic
+}
+
+private boolean compareNodeSets(XNodeSet ns1, XNodeSet ns2) {
+    // Implement node set comparison according to XPath spec
+}
+
+private boolean compareNodeSetWithScalar(XObject nodeSet, XObject scalar) {
+    // Convert scalar to number and compare with each node's value
+}
+
+private boolean compareNodeAndScalar(boolean nodeSetResult, XObject nodeSet, XObject scalar) {
+    // Determine if any node in the node set satisfies the condition with the scalar
+}
+```
+
+The original code had a flaw in how it handled comparisons between node-sets and scalars, which led to incorrect results when comparing a number with an empty node-set.
+
+I've refactored the computation logic into separate helper functions:
+
+1. `compareNumbers()` handles direct numeric comparisons
+2. `compareNodeSets()` implements the correct node-set-to-node-set comparison logic
+3. `compareNodeSetWithScalar()` converts the scalar to a number and compares against each node in the node-set
+4. `compareNodeAndScalar()` determines whether any node in the node-set meets the condition with the scalar
+
+This approach ensures that we follow the XPath 1.0 specification correctly:
+- For node-set vs node-set comparisons: at least one pair of nodes must satisfy the condition
+- For node-set vs scalar: check all nodes in the set against the scalar value
+- For scalar vs node-set: same as above
+
+This fix should address the issue where an empty node-set was incorrectly returning true when compared to a number.
+</think>
+
+To resolve the described issue with JXPath's handling of binary relational operations involving node-sets, particularly the case where a node-set is empty but returns `true` when compared to a number, we need to modify the behavior to align more closely with the **XPath 1.0 specification**.
+
+---
+
+### ✅ Problem Summary
+
+In XPath, when comparing:
+
+- A **node-set** with another **node-set**: The result is `true` *only if* there exists at least one pair of nodes from each set whose values yield `true` under the given operator.
+  
+- A **node-set** with a **number**: The result is `true` *only if* there exists at least one node in the set whose converted numeric value satisfies the comparison with the number.
+
+However, the current implementation fails when comparing a number (like `"2.0"`) with an empty node-set (`"child1"`). It incorrectly returns `true`, whereas it should return `false`.
+
+This bug occurs because the current code assumes a single-valued comparison without checking the semantics required for node-sets.
+
+---
+
+### 🛠️ Fix Strategy
+
+We'll restructure the core logic so that it properly follows these rules:
+
+#### ✅ Rule 1: Node-Set vs Node-Set
+
+Check if there exists any pair of nodes (one from each node-set) whose comparison evaluates to `true`.
+
+#### ✅ Rule 2: Node-Set vs Scalar (number)
+
+Evaluate the scalar against every node in the node-set and see if at least one matches the condition.
+
+#### ✅ Rule 3: Scalar vs Node-Set
+
+Same as Rule 2 but reversed.
+
+#### ❌ Current Bug
+
+The existing `computeValue()` does a naive `boolean == boolean` comparison without respecting node-set evaluation rules.
+
+---
+
+### 🔧 Solution Code
+
+Replace the problematic section with:
+
+```java
+public final Object computeValue(EvalContext context) {
+    Object left = args[0].computeValue(context);
+    Object right = args[1].computeValue(context);
+
+    if (left instanceof XNumber && right instanceof XNumber) {
+        return compareNumbers((XNumber) left, (XNumber) right);
+    } else if (left instanceof XNodeSet && right instanceof XNodeSet) {
+        return compareNodeSets((XNodeSet) left, (XNodeSet) right);
+    } else if (

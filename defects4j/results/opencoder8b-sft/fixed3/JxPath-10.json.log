@@ -1,0 +1,165 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Binary operators behaviour involving node-sets is incorrect
+According to XPath specification:
+"If both objects to be compared are node-sets, then the comparison will be true if and only if there is a node in the first node-set and a node in the second node-set such that the result of performing the comparison on the string-values of the two nodes is true. If one object to be compared is a node-set and the other is a number, then the comparison will be true if and only if there is a node in the node-set such that the result of performing the comparison on the number to be compared and on the result of converting the string-value of that node to a number using the number function is true."
+But following example illustrates, that this is not a JXPath behaviour:
+        JXPathContext pathContext = JXPathContext
+                .newContext(DocumentBuilderFactory.newInstance()
+                        .newDocumentBuilder().parse(
+                                new InputSource(new StringReader(
+                                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n"
+                                                + "<doc/>"))));
+        Boolean result = (Boolean) pathContext.getValue("2.0 > child1",
+                Boolean.class);
+        assertFalse(result.booleanValue());
+"child1" is not found - right operand node set is empty, but result is TRUE, instead of FALSE.
+Please, check greaterThan(), lesserThan(), etc methods of org.apache.xpath.objects.XObject for possible solution
+This is an incorrect Java code (src/java/org/apache/commons/jxpath/ri/compiler/CoreOperationRelationalExpression.java):
+```java
+public final Object computeValue(EvalContext context) {
+    return compute(args[0].computeValue(context), args[1].computeValue(context)) 
+            ? Boolean.TRUE : Boolean.FALSE;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+package org.apache.commons.jxpath.ri.compiler;
+
+import java.util.HashSet;
+import java.util.Set;
+
+import javax.xml.namespace.NamespaceContext;
+import javax.xml.xpath.XPathFunctionException;
+
+import org.apache.commons.jxpath.ExpressionContext;
+import org.apache.commons.jxpath.JXPathException;
+import org.apache.commons.jxpath.Pointer;
+import org.apache.commons.jxpath.ri.QName;
+import org.apache.commons.jxpath.ri.model.NodePointer;
+import org.apache.xpath.EvaluationContext;
+import org.apache.xpath.XPathVisitor;
+import org.apache.xpath.objects.XNumber;
+import org.apache.xpath.objects.XObject;
+import org.w3c.dom.DocumentFragment;
+
+final class CoreOperationRelationalExpression extends CoreOperation {
+
+    protected CoreOperationRelationalExpression(QName qname) {
+        super(qname);
+    }
+
+    public void call(@SuppressWarnings("hiding") EvaluationContext ec,
+            XObject[] xobjects, int paramStartIndex)
+            throws XPathFunctionException {
+        // This method intentionally left blank
+    }
+
+    @Override
+    protected Object computeValueInternal(Object lObj, Object rObj,
+            EvaluationContext ec) throws XPathFunctionException {
+        if (lObj == null && rObj == null) {
+            return getQName().getLocalPart().equals("=") ? Boolean.TRUE
+                    : Boolean.FALSE;
+        } else if (lObj == null) {
+            return evalComparison(lObj, convertToType(rObj), ec);
+        } else if (rObj == null) {
+            return evalComparison(convertToType(lObj), rObj, ec);
+        }
+        return evalComparison(convertToType(lObj), convertToType(rObj), ec);
+    }
+
+    private Object convertToType(Object obj) {
+        if (obj instanceof NodePointer) {
+            try {
+                obj = ((NodePointer) obj).getNode();
+                if (obj instanceof DocumentFragment) {
+                    return new XNumber(0);
+                }
+            } catch (JXPathException e) {
+                return new XNumber(0);
+            }
+        }
+        return new XNumber(obj.toString());
+    }
+
+    private boolean evalComparison(Object lObj, Object rObj,
+            EvaluationContext ec) {
+        if (lObj instanceof Number && rObj instanceof Number) {
+            double cmpVal = Double.compare(((Number) lObj).doubleValue(),
+                    ((Number) rObj).doubleValue());
+            if ("<".equals(getQName().getLocalPart())) {
+                return cmpVal < 0;
+            } else if ("=".equals(getQName().getLocalPart())) {
+                return cmpVal == 0;
+            } else if (">".equals(getQName().getLocalPart())) {
+                return cmpVal > 0;
+            }
+        }
+        Set<NodePointer> lSet = new HashSet<NodePointer>();
+        Set<NodePointer> rSet = new HashSet<NodePointer>();
+        addNodesFromOperand(lObj, lSet, ec);
+        addNodesFromOperand(rObj, rSet, ec);
+        for (NodePointer pNode : lSet) {
+            try {
+                Object pNodeValue = pNode.getNode();
+                if (!rSet.isEmpty()) {
+                    for (NodePointer rpNode : rSet) {
+                        if (rpNode.isImmediateParentOf(pNode)) {
+                            return false;
+                        }
+                    }
+                }
+                return true;
+            } catch (JXPathException e) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    @Override
+    public boolean deepEquals(CoreOperation op) {
+        return (op instanceof CoreOperationRelationalExpression
+                && super.deepEquals(op));
+    }
+
+    @Override
+    public void accept(XPathVisitor visitor) {
+        visitor.visit(this);
+    }
+
+    private static void addNodesFromOperand(Object o, Set<NodePointer> c,
+            EvaluationContext ec) {
+        if (o instanceof NodePointer) {
+            try {
+                Pointer pointer = (Pointer) o;
+                Object node = pointer.getNode();
+                if (!(node instanceof DocumentFragment)) {
+                    c.add((NodePointer) pointer);
+                }
+            } catch (JXPathException ex) {
+            }
+        }
+    }
+
+    public void postfixVisit(XPathVisitor visitor) {
+        for (int i = 0; i < args.length; i++) {
+            args[i].accept(visitor);
+        }
+    }
+
+    @Override
+    public void applyNamespace(NamespaceContext nscontext) {
+        namespace = nscontext;
+    }
+
+}
+
+```
+

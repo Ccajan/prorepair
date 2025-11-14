@@ -1,0 +1,203 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# anonymous object type inference behavior is different when calling constructors
+The following compiles fine with:
+java -jar build/compiler.jar --compilation_level=ADVANCED_OPTIMIZATIONS --jscomp_error=accessControls --jscomp_error=checkTypes --jscomp_error=checkVars --js ~/Desktop/reverse.js
+
+reverse.js:
+/**
+ * @param {{prop1: string, prop2: (number|undefined)}} parry
+ */
+function callz(parry) {
+  if (parry.prop2 && parry.prop2 < 5) alert('alright!');
+  alert(parry.prop1);
+}
+
+callz({prop1: 'hi'});
+
+However, the following does not:
+/**
+ * @param {{prop1: string, prop2: (number|undefined)}} parry
+ * @constructor
+ */
+function callz(parry) {
+  if (parry.prop2 && parry.prop2 < 5) alert('alright!');
+  alert(parry.prop1);
+}
+
+new callz({prop1: 'hi'});
+
+/Users/dolapo/Desktop/reverse.js:10: ERROR - actual parameter 1 of callz does not match formal parameter
+found   : {prop1: string}
+required: {prop1: string, prop2: (number|undefined)}
+new callz({prop1: 'hi'});
+
+Thanks!
+This is an incorrect Java code (src/com/google/javascript/jscomp/TypeInference.java):
+```java
+private FlowScope traverseNew(Node n, FlowScope scope) {
+
+  Node constructor = n.getFirstChild();
+  scope = traverse(constructor, scope);
+  JSType constructorType = constructor.getJSType();
+  JSType type = null;
+  if (constructorType != null) {
+    constructorType = constructorType.restrictByNotNullOrUndefined();
+    if (constructorType.isUnknownType()) {
+      type = getNativeType(UNKNOWN_TYPE);
+    } else {
+      FunctionType ct = constructorType.toMaybeFunctionType();
+      if (ct == null && constructorType instanceof FunctionType) {
+        // If constructorType is a NoObjectType, then toMaybeFunctionType will
+        // return null. But NoObjectType implements the FunctionType
+        // interface, precisely because it can validly construct objects.
+        ct = (FunctionType) constructorType;
+      }
+      if (ct != null && ct.isConstructor()) {
+        type = ct.getInstanceType();
+      }
+    }
+  }
+  n.setJSType(type);
+  for (Node arg = constructor.getNext(); arg != null; arg = arg.getNext()) {
+    scope = traverse(arg, scope);
+  }
+  return scope;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+To address this issue, we need to understand what's going on in the `traverseNew` method and why it fails to infer types correctly when a constructor is used.
+
+### The Root Cause:
+When using the `new` keyword to invoke a constructor, the JavaScript compiler expects that the constructor may create an instance of some type. This often includes a default initialization of properties — even if they're not explicitly defined.
+
+In your case, the function is marked as `@constructor`, which changes how TypeScript/JSCompiler (Closure Compiler) infers the shape of the object being constructed. It assumes that the **constructor** takes parameters matching its declared type, but **when you pass an object literal**, the JS Compiler doesn't always infer the full object structure unless all expected fields are included.
+
+This becomes more problematic when the constructor is called via `new`.
+
+---
+
+### Correcting the Logic
+
+Let’s walk through the critical logic within the `traverseNew` method:
+
+```java
+private FlowScope traverseNew(Node n, FlowScope scope) {
+    ...
+    for (Node arg = constructor.getNext(); arg != null; arg = arg.getNext()) {
+        scope = traverse(arg, scope);
+    }
+    return scope;
+}
+```
+
+Here, `arg` iterates over arguments passed to the constructor. However, in the context of a `new callz(...)`, the **object literal `{prop1: "hi"}` is actually the argument**, not the constructor itself.
+
+So, instead of trying to determine the object's type from the constructor, we should focus on the object literal and its inferred type.
+
+---
+
+### Fix Proposal:
+
+Modify the logic to better handle the argument types of the constructor. Specifically, when handling new expressions, we must:
+
+1. Identify the constructor function.
+2. Determine the argument node list (the object literal or value passed).
+3. Infer the appropriate type based on those arguments.
+
+Let's rewrite the relevant part:
+
+#### ✅ Revised Code Snippet:
+```java
+private FlowScope traverseNew(Node n, FlowScope scope) {
+    Node constructor = n.getFirstChild();
+    scope = traverse(constructor, scope);
+
+    JSType constructorType = constructor.getJSType();
+    JSType type = null;
+
+    if (constructorType != null) {
+        constructorType = constructorType.restrictByNotNullOrUndefined();
+
+        if (constructorType.isUnknownType()) {
+            type = getNativeType(UNKNOWN_TYPE);
+        } else {
+            FunctionType ct = constructorType.toMaybeFunctionType();
+            if (ct == null && constructorType instanceof FunctionType) {
+                // Handle cases where the type was boxed into a non-function object
+                ct = (FunctionType) constructorType;
+            }
+
+            if (ct != null && ct.isConstructor()) {
+                type = ct.getInstanceType();
+
+                // Now find the arguments passed to the constructor
+                Node argsListNode = constructor.getNext();
+                if (argsListNode != null && argsListNode.isLiteralObject()) {
+                    JSType argType = argsListNode.getJSType();
+                    if (argType != null && !argType.isTrue()) {
+                        // Compare against the constructor's expected arguments
+                        List<JSType> expectedArgTypes = ct.getParameterTypes();
+                        List<JSType> providedArgTypes = collectParameterTypes(argsListNode);
+
+                        for (int i = 0; i < Math.min(expectedArgTypes.size(), providedArgTypes.size()); i++) {
+                            JSType expected = expectedArgTypes.get(i);
+                            JSType provided = providedArgTypes.get(i);
+                            checkTypeMatch(n, expected, provided, i);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    n.setJSType(type);
+    return scope;
+}
+```
+
+---
+
+### Additional Support Functions
+
+Implement the helper functions used above:
+
+#### `collectParameterTypes(Node argsListNode)`
+```java
+private List<JSType> collectParameterTypes(Node argsListNode) {
+    List<JSType> types = new ArrayList<>();
+    Node arg = argsListNode.getFirstChild();
+    while (arg != null) {
+        types.add(arg.getJSType());
+        arg = arg.getNext();
+    }
+    return types;
+}
+```
+
+#### `checkTypeMatch(Node expr, JSType expected, JSType actual, int index)`
+```java
+private void checkTypeMatch(Node expr, JSType expected, JSType actual, int index) {
+    String msg = "Argument %d of '%s' has incompatible type." +
+                 " Expected %s but found %s.";
+    errorMsg(expr, msg, index + 1, expr.toString(), expected.toString(), actual.toString());
+}
+```
+
+---
+
+### Summary
+
+- The original problem arises due to how JSCompiler infers types for object literals passed as arguments to constructors.
+- When a function is annotated as a constructor (`@constructor`), the tool expects specific typed parameters.
+- In the revised logic:
+  - We distinguish between the constructor and the argument.
+  - We perform proper type checking

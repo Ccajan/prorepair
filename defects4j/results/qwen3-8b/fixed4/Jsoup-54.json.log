@@ -1,0 +1,148 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# INVALID_CHARACTER_ERR when converting Document to W3C
+A recent ClearQuest version has an HTML generation bug, which is ignored by both Chrome and Internet Explorer. Jsoup.parse is also successful:
+org.jsoup.nodes.Document doc = Jsoup.parse("<html><head></head><body style=\"color: red\" \"></body></html>");
+(Please note the single quotation mark at the end of the body start tag.)
+But trying to convert this to a W3C document fails:
+new W3CDom().fromJsoup(doc);
+Exception in thread "main" org.w3c.dom.DOMException: INVALID_CHARACTER_ERR: An invalid or illegal XML character is specified. 
+    at org.apache.xerces.dom.CoreDocumentImpl.createAttribute(Unknown Source)
+    at org.apache.xerces.dom.ElementImpl.setAttribute(Unknown Source)
+    at org.jsoup.helper.W3CDom$W3CBuilder.copyAttributes(W3CDom.java:124)
+    at org.jsoup.helper.W3CDom$W3CBuilder.head(W3CDom.java:92)
+    at org.jsoup.select.NodeTraversor.traverse(NodeTraversor.java:31)
+    at org.jsoup.helper.W3CDom.convert(W3CDom.java:66)
+    at org.jsoup.helper.W3CDom.fromJsoup(W3CDom.java:46)
+
+Perhaps copyAttributes() should ignore invalid attributes, or catch exactly this error, and ignore it, or W3CDom could have flags to ignore such errors...
+This is an incorrect Java code (src/main/java/org/jsoup/helper/W3CDom.java):
+```java
+private void copyAttributes(org.jsoup.nodes.Node source, Element el) {
+    for (Attribute attribute : source.attributes()) {
+        // valid xml attribute names are: ^[a-zA-Z_:][-a-zA-Z0-9_:.]
+        String key = attribute.getKey().replaceAll("[^-a-zA-Z0-9_:.]", "");
+            el.setAttribute(key, attribute.getValue());
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public class W3CDom {
+    private static final Pattern VALID_ATTRIBUTE_NAME_PATTERN = Pattern.compile("^[a-zA-Z_:][-a-zA-Z0-9_:.]*$");
+
+    private void copyAttributes(org.jsoup.nodes.Node source, Element el) {
+        for (Attribute attribute : source.attributes()) {
+            String attrName = attribute.getKey();
+            if (isValidAttributeName(attrName)) {
+                // Validate value as well (optional, but can be done similarly)
+                String attrValue = attribute.getValue();
+                // Optionally validate attribute value if needed
+                // For now, assume values are safe unless they contain problematic characters
+                try {
+                    el.setAttribute(attrName, attrValue);
+                } catch (DOMException e) {
+                    // Handle specific exceptions like INVALID_CHARACTER_ERR
+                    if (e.code == DOMException.INVALID_CHARACTER_ERR) {
+                        // Log warning or handle accordingly
+                        System.err.println("Skipping invalid attribute: " + attrName + "=" + attrValue);
+                    } else {
+                        throw e; // Re-throw other exceptions
+                    }
+                }
+            } else {
+                // Log invalid attribute name
+                System.err.println("Invalid attribute name: " + attrName);
+            }
+        }
+    }
+
+    private boolean isValidAttributeName(String attributeName) {
+        return VALID_ATTRIBUTE_NAME_PATTERN.matcher(attributeName).matches();
+    }
+}
+```
+
+The problem here is that the original `copyAttributes()` method tries to clean up attribute names using regular expressions but doesn't account for cases where attribute values might still contain invalid XML/HTML characters.
+
+In the provided example, the issue stems from an extra closing single quote (`'`) in the HTML. While browsers may silently ignore this, the W3CDom conversion process throws an exception because the parser is strict about XML validity.
+
+To fix this, we've enhanced the method with the following changes:
+
+1. **Pattern Matching**: We use a more accurate regex pattern to validate attribute names against the allowed format.
+2. **Exception Handling**: We added a try-catch block around the `setAttribute` call to specifically catch `INVALID_CHARACTER_ERR`.
+3. **Logging**: Added logging statements to help identify problematic attributes without causing the entire conversion to fail.
+
+Now, even if there are invalid characters in attribute values, the conversion will skip them instead of throwing an exception, making the process more robust and compatible with various input formats.
+</think>
+
+To resolve the `INVALID_CHARACTER_ERR` thrown during the conversion of a JSoup `Document` into a W3C-compliant `Document`, we need to address how invalid characters are handled—particularly in malformed or non-standard HTML input, such as in your example:
+
+```html
+<body style="color: red" '
+```
+
+Here's what causes the issue:
+
+---
+
+### 📌 Root Cause
+
+The W3CDom library assumes all inputs are well-formed XML and does not include logic to filter out or sanitize invalid or malformed attributes.
+
+Your input contains a trailing apostrophe `'` after the closing body tag, which isn’t valid in standard XML/HTML. When converted to a W3C DOM via `W3CDom.fromJsoup(doc)`:
+
+- It triggers a `DOMException` with `INVALID_CHARACTER_ERR` — indicating an illegal XML/HTML character.
+- This happens during `setAttribute()` calls on the DOM API, which is stricter than browser parsing.
+
+---
+
+### ✅ Solution Approach
+
+We can improve the reliability of the conversion by:
+
+1. **Validating attribute names** before setting them.
+2. **Handling specific DOM exceptions**, especially `INVALID_CHARACTER_ERR`.
+3. **Providing meaningful feedback**, such as logging warnings for skipped attributes.
+4. **Allowing optional validation of attribute values** too, depending on needs.
+
+---
+
+### 🛠️ Updated Code
+
+Below is a corrected version of the `W3CDom.copyAttributes()` method, along with supporting utilities:
+
+```java
+import java.util.regex.Pattern;
+
+// Inside the W3CDom class
+private static final Pattern VALID_ATTRIBUTE_NAME_PATTERN = Pattern.compile("^[a-zA-Z_:][-a-zA-Z0-9_:.]*$");
+
+private void copyAttributes(org.jsoup.nodes.Node source, Element el) {
+    for (Attribute attribute : source.attributes()) {
+        String attrName = attribute.getKey();
+
+        // Step 1: Validate attribute name
+        if (!isValidAttributeName(attrName)) {
+            System.err.println("Invalid attribute name: " + attrName + ", skipping.");
+            continue;
+        }
+
+        // Step 2: Optionally validate attribute value (you can add similar regex checks here)
+        String attrValue = attribute.getValue();
+
+        try {
+            el.setAttribute(attrName, attrValue); // Try to set the attribute
+        } catch (DOMException e) {
+            // Step 3: Handle the specific error - INVALID_CHARACTER_ERR
+            if (e.code == DOMException.INVALID_CHARACTER_ERR) {
+                System.err.println(
+                    "Skipping invalid attribute value: " + attrName + "=" + attrValue + ". Reason: " + e.getMessage()
+                );
+            } else {
+

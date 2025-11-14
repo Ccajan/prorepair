@@ -1,0 +1,152 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# StringUtils methods do not handle Unicode 2.0+ supplementary characters correctly.
+StringUtils.containsAny methods incorrectly matches Unicode 2.0+ supplementary characters.
+For example, define a test fixture to be the Unicode character U+20000 where U+20000 is written in Java source as "\uD840\uDC00"
+	private static final String CharU20000 = "\uD840\uDC00";
+	private static final String CharU20001 = "\uD840\uDC01";
+You can see Unicode supplementary characters correctly implemented in the JRE call:
+	assertEquals(-1, CharU20000.indexOf(CharU20001));
+But this is broken:
+	assertEquals(false, StringUtils.containsAny(CharU20000, CharU20001));
+	assertEquals(false, StringUtils.containsAny(CharU20001, CharU20000));
+This is fine:
+	assertEquals(true, StringUtils.contains(CharU20000 + CharU20001, CharU20000));
+	assertEquals(true, StringUtils.contains(CharU20000 + CharU20001, CharU20001));
+	assertEquals(true, StringUtils.contains(CharU20000, CharU20000));
+	assertEquals(false, StringUtils.contains(CharU20000, CharU20001));
+because the method calls the JRE to perform the match.
+More than you want to know:
+
+http://java.sun.com/developer/technicalArticles/Intl/Supplementary/
+This is an incorrect Java code (src/main/java/org/apache/commons/lang3/StringUtils.java):
+```java
+public static boolean containsAny(CharSequence cs, char[] searchChars) {
+	if (isEmpty(cs) || ArrayUtils.isEmpty(searchChars)) {
+		return false;
+	}
+	int csLength = cs.length();
+	int searchLength = searchChars.length;
+	for (int i = 0; i < csLength; i++) {
+		char ch = cs.charAt(i);
+		for (int j = 0; j < searchLength; j++) {
+			if (searchChars[j] == ch) {
+					// ch is a supplementary character
+					// ch is in the Basic Multilingual Plane
+					return true;
+			}
+		}
+	}
+	return false;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import org.apache.commons.lang3.ArrayUtils;
+
+public class StringUtils {
+
+    public static boolean containsAny(CharSequence cs, char[] searchChars) {
+        if (isEmpty(cs) || ArrayUtils.isEmpty(searchChars)) {
+            return false;
+        }
+        int csLength = cs.length();
+        int searchLength = searchChars.length;
+        for (int i = 0; i < csLength; i++) {
+            // Check if current character is a surrogate pair (supplementary character)
+            char ch = cs.charAt(i);
+            if (Character.isHighSurrogate(ch)) {
+                // If it's a high surrogate, check if there's a low surrogate following it
+                if (i + 1 < csLength) {
+                    char nextCh = cs.charAt(i + 1);
+                    if (Character.isLowSurrogate(nextCh)) {
+                        // Form the supplementary character
+                        int supplementaryChar = Character.toCodePoint(ch, nextCh);
+                        // Now check if any of the searchChars equals this supplementary character
+                        for (int j = 0; j < searchLength; j++) {
+                            if (searchChars[j] == supplementaryChar) {
+                                return true;
+                            }
+                        }
+                        i++; // Skip the next character since we've processed the surrogate pair
+                    }
+                }
+            } else {
+                // Regular character (BMP or low surrogate)
+                for (int j = 0; j < searchLength; j++) {
+                    if (searchChars[j] == ch) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean isEmpty(CharSequence cs) {
+        return cs == null || cs.length() == 0;
+    }
+}
+```
+
+The issue lies in how `containsAny` handles Unicode supplementary characters (those with code points above U+FFFF). The original implementation only compares individual `char` values, which are 16 bits and cannot represent these supplementary characters.
+
+### Fix Steps:
+1. **Detect Surrogate Pairs**: Java uses surrogate pairs to represent supplementary characters. A high surrogate (U+D800–U+DBFF) followed by a low surrogate (U+DC00–U+DFFF) forms a single supplementary character.
+2. **Convert Surrogates to Code Point**: When encountering a high surrogate, check if it is part of a surrogate pair. If so, convert it into its corresponding code point using `Character.toCodePoint(high, low)`.
+3. **Check Against Search Characters**: Once we have the full code point of the supplementary character, compare it against the search characters array.
+
+This fix ensures that the `containsAny` method correctly identifies and processes Unicode supplementary characters, aligning the behavior with the standard Java string handling mechanisms.
+</think>
+
+To address the issue where `StringUtils.containsAny()` fails to properly detect **Unicode 2.0+ supplementary characters**, we need to modify the logic of the method to support **surrogate pairs** — the mechanism Java uses to represent Unicode code points outside the Basic Multilingual Plane (BMP), such as those above U+FFFF.
+
+---
+
+## ✅ Problem Summary
+
+In Java, Unicode characters **above U+FFFF** (the BMP range) are encoded using **two 16-bit surrogate characters**. These surrogate pairs are represented in Java strings as two separate `char` values. For instance:
+
+- `U+20000` is represented as the surrogate pair `\uD840\uDC00`.
+
+However, the original `containsAny()` method checks for equality between individual `char` values rather than recognizing and decoding surrogate pairs. This results in incorrect detection when dealing with supplementary characters like `U+20000`.
+
+---
+
+## 🔧 Solution: Support Surrogate Pairs in `containsAny()`
+
+We will update the `containsAny()` method to process **surrogate pairs** explicitly and convert them to their corresponding **code point** using `Character.toCodePoint(high, low)`.
+
+### ✅ Fixed Method
+
+```java
+import org.apache.commons.lang3.ArrayUtils;
+
+public class StringUtils {
+
+    /**
+     * Checks whether any character in the given CharSequence exists in the provided searchChars array,
+     * including handling Unicode supplementary characters (surrogate pairs).
+     */
+    public static boolean containsAny(CharSequence cs, char[] searchChars) {
+        if (isEmpty(cs) || ArrayUtils.isEmpty(searchChars)) {
+            return false;
+        }
+
+        int csLength = cs.length();
+        int searchLength = searchChars.length;
+
+        for (int i = 0; i < csLength;) {
+            char ch = cs.charAt(i);
+
+            // Check if current character is a high surrogate (part of a surrogate pair)
+            if (Character.isHighSurrogate(ch)) {
+                // Ensure there's a following low surrogate
+                if (i + 1 < csLength && Character.isLowSurrogate(cs.charAt(i + 1))) {
+                    // Convert surrogate pair to actual code point
+                    int code

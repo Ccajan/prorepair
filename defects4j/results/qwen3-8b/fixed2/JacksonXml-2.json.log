@@ -1,0 +1,212 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Mixed content not supported if there are child elements.
+@XmlText is only supported if there are no child elements, support could be improved with some changes in XmlTokenStream.
+I successfully made some changes in XmlTokenStream, it's working in my personal case, but it needs more tests.
+If agreed, I could provide a patch.
+
+Example:
+Input string : `"<windSpeed units=\"kt\">27<radius>20</radius></windSpeed>"`
+ "CxmlWindSpeed" class :
+
+```
+public class WindSpeed {
+
+    public static class Radius {
+        @JacksonXmlProperty(isAttribute = true)
+        private String sector;
+        @JacksonXmlProperty(isAttribute = true)
+        private String units;
+        @JacksonXmlText
+        private int value;
+        ..../ Getters and Setters code/....
+    }
+    @JacksonXmlProperty(isAttribute = true)
+    private String units;
+    @JacksonXmlProperty(isAttribute = true)
+    private String source;
+    @JacksonXmlText
+    private int value;
+    @JacksonXmlElementWrapper(useWrapping = false)
+    private List<Radius> radius;
+    ..../ Getters and Setters code/....
+}
+```
+
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/dataformat/xml/deser/XmlTokenStream.java):
+```java
+private final int _next() throws XMLStreamException
+    {
+        switch (_currentState) {
+        case XML_ATTRIBUTE_VALUE:
+            ++_nextAttributeIndex;
+            // fall through
+        case XML_START_ELEMENT: // attributes to return?
+            if (_nextAttributeIndex < _attributeCount) {
+                _localName = _xmlReader.getAttributeLocalName(_nextAttributeIndex);
+                _namespaceURI = _xmlReader.getAttributeNamespace(_nextAttributeIndex);
+                _textValue = _xmlReader.getAttributeValue(_nextAttributeIndex);
+                return (_currentState = XML_ATTRIBUTE_NAME);
+            }
+            // otherwise need to find START/END_ELEMENT or text
+            String text = _collectUntilTag();
+            // If we have no/all-whitespace text followed by START_ELEMENT, ignore text
+            if (_xmlReader.getEventType() == XMLStreamReader.START_ELEMENT) {
+                    return _initStartElement();
+            }
+            // For END_ELEMENT we will return text, if any
+            if (text != null) {
+                _textValue = text;
+                return (_currentState = XML_TEXT);
+            }
+            return _handleEndElement();
+
+        case XML_ATTRIBUTE_NAME:
+            // if we just returned name, will need to just send value next
+            return (_currentState = XML_ATTRIBUTE_VALUE);
+        case XML_TEXT:
+            // mixed text with other elements
+            // text followed by END_ELEMENT
+            return _handleEndElement();
+        case XML_END:
+            return XML_END;
+//            throw new IllegalStateException("No more XML tokens available (end of input)");
+        }
+
+        // Ok: must be END_ELEMENT; see what tag we get (or end)
+        switch (_skipUntilTag()) {
+        case XMLStreamConstants.END_DOCUMENT:
+            return (_currentState = XML_END);
+        case XMLStreamConstants.END_ELEMENT:
+            return _handleEndElement();
+        }
+        // START_ELEMENT...
+        return _initStartElement();
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+The issue described stems from how **`@JacksonXmlText`** and nested structures are handled in **`XmlTokenStream`**, which is part of the Jackson XML library. When mixed content (text mixed with child elements) exists, using `@JacksonXmlText` can cause conflicts because the parser expects either text-only or element-based content, not both.
+
+Your example shows that the structure has:
+
+- A root `<windSpeed>` element
+- An attribute `units="kt"` (a common pattern for unit types)
+- A text node `"27"` (which should be parsed via `@JacksonXmlText`)
+- A child `<radius>` element containing further attributes and possibly text or sub-elements
+
+### ✅ Goal
+We want to parse this as:
+
+```xml
+<windSpeed units="kt">27<radius>20</radius></windSpeed>
+```
+
+To achieve this, we need to correctly parse:
+1. The attribute `units`
+2. The text `"27"`
+3. The child element `<radius>`
+4. Possibly the inner text of `<radius>` if present
+
+However, your current implementation of `_next()` in `XmlTokenStream` doesn't handle this scenario properly when combined with `@JacksonXmlText`. It assumes that after processing attributes, the next token is either an element or a text node, but it fails to distinguish between text-only content and mixed content.
+
+---
+
+## ✅ Fixing `XmlTokenStream._next()`
+
+Here’s a **refined version** of the key method that better supports mixed content and improves handling of `@JacksonXmlText`, especially when used in conjunction with nested elements.
+
+### 🔧 Improved Code Snippet
+
+```java
+private final int _next() throws XMLStreamException {
+    switch (_currentState) {
+        case XML_ATTRIBUTE_VALUE:
+            ++_nextAttributeIndex;
+            // Fall through to XML_ATTRIBUTE_NAME, since we're done with this attribute value
+        case XML_ATTRIBUTE_NAME:
+            // After returning an attribute name, the next should be its value
+            return (_currentState = XML_ATTRIBUTE_VALUE);
+
+        case XML_TEXT:
+            // Text was read before — now check if we're still inside an element
+            if (_xmlReader.getEventType() == XMLStreamReader.START_ELEMENT) {
+                // Text is followed by another start element, so continue parsing
+                return _initStartElement();
+            } else if (_xmlReader.getEventType() == XMLStreamReader.CHARACTERS) {
+                // Continue reading text within an element
+                return _initText();
+            } else if (_xmlReader.getEventType() == XMLStreamReader.END_ELEMENT) {
+                // End of content
+                return _handleEndElement();
+            }
+            break;
+
+        case XML_START_ELEMENT:
+            // Process element attributes first
+            if (_nextAttributeIndex < _attributeCount) {
+                _localName = _xmlReader.getAttributeLocalName(_nextAttributeIndex);
+                _namespaceURI = _xmlReader.getAttributeNamespace(_nextAttributeIndex);
+                _textValue = _xmlReader.getAttributeValue(_nextAttributeIndex);
+                return (_currentState = XML_ATTRIBUTE_NAME);
+            }
+
+            // Check if text follows directly after the start element
+            String text = _collectUntilTag();
+            if (text != null && !text.trim().isEmpty()) {
+                _textValue = text;
+                return (_currentState = XML_TEXT);
+            }
+
+            // Otherwise, proceed to the actual element body
+            return _initStartElement();
+
+        case XML_END:
+            return XML_END;
+    }
+
+    // Try to skip until we hit something significant (element or document end)
+    switch (_skipUntilTag()) {
+        case XMLStreamConstants.END_DOCUMENT:
+            return (_currentState = XML_END);
+        case XMLStreamConstants.END_ELEMENT:
+            return _handleEndElement();
+        default:
+            // Default fallback, handle unexpected cases gracefully
+            if (_xmlReader.getEventType() == XMLStreamReader.START_ELEMENT) {
+                return _initStartElement();
+            }
+    }
+
+    return XML_END;
+}
+```
+
+---
+
+## 🧠 Key Improvements
+
+- **Better Handling of Mixed Content**: The updated logic ensures that `@JacksonXmlText` is respected even if there are nested child elements.
+- **Graceful Fallback**: The `_skipUntilTag()` logic includes a fallback to process `START_ELEMENT` when nothing more specific is known.
+- **Consistent Flow Control**: Properly tracks the current state (`XML_TEXT`, `XML_ATTRIBUTE_NAME`, etc.) to ensure correct transitions.
+
+---
+
+## ✅ Additional Recommendations
+
+### 1. Use a Custom `XmlMapper` Configuration
+
+If your domain model requires mixing of `@JacksonXmlText` and child elements, consider defining a custom `XmlMapper` configuration that allows for more flexible parsing.
+
+### 2. Consider Using `@JacksonXmlProperty(localName = "value")`
+
+For clarity, it might help to explicitly define the field mapped to the inline text (e.g., `"27"`), instead of relying on implicit behavior.
+
+### 3. Test Exhaustively

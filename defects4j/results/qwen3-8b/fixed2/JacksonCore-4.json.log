@@ -1,0 +1,146 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# What is the maximum key length allowed?
+I noticed that even in Jackson 2.4, if a JSON key is longer than 262144 bytes, ArrayIndexOutOfBoundsException is thrown from TextBuffer. Below is the stack trace:
+java.lang.ArrayIndexOutOfBoundsException
+    at java.lang.System.arraycopy(Native Method)
+    at com.fasterxml.jackson.core.util.TextBuffer.expandCurrentSegment(TextBuffer.java:604)
+    at com.fasterxml.jackson.core.json.UTF8StreamJsonParser.addName(UTF8StreamJsonParser.java:2034)
+    at com.fasterxml.jackson.core.json.UTF8StreamJsonParser.findName(UTF8StreamJsonParser.java:1928)
+    at com.fasterxml.jackson.core.json.UTF8StreamJsonParser.parseLongFieldName(UTF8StreamJsonParser.java:1534)
+    at com.fasterxml.jackson.core.json.UTF8StreamJsonParser.parseMediumFieldName(UTF8StreamJsonParser.java:1502)
+    at com.fasterxml.jackson.core.json.UTF8StreamJsonParser._parseFieldName(UTF8StreamJsonParser.java:1437)
+    at com.fasterxml.jackson.core.json.UTF8StreamJsonParser.nextToken(UTF8StreamJsonParser.java:668)
+    ... <below are our code> ...
+
+Looking at TextBuffer.expandCurrentSegment(TextBuffer.java:604), once the length of _currentSegment is increased to MAX_SEGMENT_LEN + 1 (262145) bytes, the newLen will stay at MAX_SEGMENT_LEN, which is smaller than len. Therefore System.arraycopy() will fail.
+I understand it is rare to have key larger than 262144 bytes, but it would be nice if
+
+Jackson explicitly throw exception stating that key is too long.
+Document that the maximum key length is 262144 bytes.
+
+OR
+
+Update TextBuffer to support super long key.
+
+Thanks!
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/core/util/TextBuffer.java):
+```java
+public char[] expandCurrentSegment()
+{
+    final char[] curr = _currentSegment;
+    // Let's grow by 50% by default
+    final int len = curr.length;
+    // but above intended maximum, slow to increase by 25%
+    int newLen = (len == MAX_SEGMENT_LEN) ? (MAX_SEGMENT_LEN+1) : Math.min(MAX_SEGMENT_LEN, len + (len >> 1));
+    return (_currentSegment = Arrays.copyOf(curr, newLen));
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public char[] expandCurrentSegment()
+{
+    final char[] curr = _currentSegment;
+    // Let's grow by 50% by default
+    final int len = curr.length;
+    // Check if we need to grow beyond MAX_SEGMENT_LEN
+    if (len == MAX_SEGMENT_LEN) {
+        // If already at max segment length, we can't grow further,
+        // so we should throw an exception to inform the user about the limitation.
+        throw new IllegalArgumentException("Maximum key length exceeded: " +
+                "maximum allowed key length is " + MAX_SEGMENT_LEN + " bytes");
+    }
+    // Otherwise, grow by 50% or up to MAX_SEGMENT_LEN
+    int newLen = Math.min(MAX_SEGMENT_LEN, len + (len >> 1));
+    return (_currentSegment = Arrays.copyOf(curr, newLen));
+}
+```
+
+The problem with the original code was that when `len` equals `MAX_SEGMENT_LEN`, the code incorrectly tries to grow the array by setting `newLen` to `MAX_SEGMENT_LEN + 1`, which results in an `ArrayIndexOutOfBoundsException`. This happens because `Arrays.copyOf` doesn't allow increasing the size beyond the current capacity, and the code failed to handle this case properly.
+
+In the fixed version, we check if the current length equals `MAX_SEGMENT_LEN` and immediately throw an `IllegalArgumentException` with a descriptive message indicating that the maximum key length has been exceeded. This ensures that users know the limit and what went wrong, rather than encountering a cryptic `ArrayIndexOutOfBoundsException`.
+
+If you want to avoid throwing exceptions for excessively long keys, you could also modify the code to allow dynamic resizing of the buffer, but that would require more complex changes to the underlying architecture of how `TextBuffer` manages its segments.
+</think>
+
+To address your concern regarding the maximum key length limitation in Jackson's `TextBuffer`, let's break down the issue and provide a clear solution:
+
+---
+
+### ✅ **Problem Summary**
+
+In Jackson 2.4, the class `TextBuffer` enforces a **hard limit** on the length of JSON keys due to the way the internal `char[]` arrays are managed. Specifically:
+
+- There is a constant `MAX_SEGMENT_LEN` set to **262,144 bytes**.
+- When attempting to add a key exceeding this length, `expandCurrentSegment()` attempts to increase the size of the buffer, but fails if it reaches `MAX_SEGMENT_LEN`.
+- The code incorrectly computes `newLen` as `(MAX_SEGMENT_LEN + 1)` in such cases, leading to an `ArrayIndexOutOfBoundsException`.
+
+---
+
+### 🛠️ **Solution: Fixing the Code**
+
+Here’s the corrected implementation of the method:
+
+```java
+public char[] expandCurrentSegment() {
+    final char[] curr = _currentSegment;
+    final int len = curr.length;
+
+    // Prevent growing beyond the maximum allowed key length
+    if (len == MAX_SEGMENT_LEN) {
+        throw new IllegalArgumentException(
+            String.format(
+                "Maximum key length exceeded. Maximum allowed is %d bytes.",
+                MAX_SEGMENT_LEN
+            )
+        );
+    }
+
+    // Grow by 50% (or up to MAX_SEGMENT_LEN)
+    int newLen = Math.min(MAX_SEGMENT_LEN, len + (len >> 1));
+    return (_currentSegment = Arrays.copyOf(curr, newLen));
+}
+```
+
+#### 💡 Explanation:
+- We first check whether the current segment length is equal to `MAX_SEGMENT_LEN`.
+- If so, we explicitly throw an `IllegalArgumentException` to **inform the user** of the key-length limit instead of letting the system silently fail.
+- Else, we proceed to grow the buffer as before, respecting the `MAX_SEGMENT_LEN` cap.
+
+---
+
+### 📜 Documentation Recommendations
+
+For clarity and maintainability, consider adding these notes in the relevant documentation:
+
+#### 🔑 **Key Length Limit**
+- Jackson imposes a **maximum key length of 262,144 bytes (approximately 256 KB)** to prevent excessive memory allocation.
+- Attempting to parse a JSON key exceeding this limit will result in an `IllegalArgumentException`.
+
+#### 📌 Example Exception
+```text
+Exception in thread "main" java.lang.IllegalArgumentException:
+    Maximum key length exceeded. Maximum allowed is 262144 bytes.
+```
+
+---
+
+### 🔄 Alternative Option: Support for Larger Keys
+
+If you need to support keys longer than 262,144 bytes, you could enhance the `TextBuffer` to dynamically allocate more memory for large keys. However, this requires a significant architectural change — typically involving:
+- Switching to using a `String` instead of `char[]` for storing field names.
+- Modifying parsing logic to work with strings directly.
+- Updating the core parser components like `UTF8StreamJsonParser` to reflect these changes.
+
+While this is technically feasible, it introduces complexity and performance trade-offs, especially for memory-constrained environments.
+
+---
+
+### ✅ Final Notes
+
+- Use the provided

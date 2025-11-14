@@ -1,0 +1,151 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# 1.10 regression (StackOverflowError) with interface where generic type has itself as upper bound
+Add this to GenericMetadataSupportTest:
+    interface GenericsSelfReference<T extends GenericsSelfReference<T>> {
+        T self();
+    }
+
+    @Test
+    public void typeVariable_of_self_type() {
+        GenericMetadataSupport genericMetadata = inferFrom(GenericsSelfReference.class).resolveGenericReturnType(firstNamedMethod("self", GenericsSelfReference.class));
+
+        assertThat(genericMetadata.rawType()).isEqualTo(GenericsSelfReference.class);
+    }
+It fails on master and 1.10.8 with this:
+java.lang.StackOverflowError
+    at sun.reflect.generics.reflectiveObjects.TypeVariableImpl.hashCode(TypeVariableImpl.java:201)
+    at java.util.HashMap.hash(HashMap.java:338)
+    at java.util.HashMap.get(HashMap.java:556)
+    at org.mockito.internal.util.reflection.GenericMetadataSupport.getActualTypeArgumentFor(GenericMetadataSupport.java:193)
+    at org.mockito.internal.util.reflection.GenericMetadataSupport.getActualTypeArgumentFor(GenericMetadataSupport.java:196)
+    at org.mockito.internal.util.reflection.GenericMetadataSupport.getActualTypeArgumentFor(GenericMetadataSupport.java:196)
+
+It worked on 1.9.5. May be caused by the changes in ab9e9f3 (cc @bric3).
+(Also note that while the above interface looks strange, it is commonly used for builder hierarchies, where base class methods want to return this with a more specific type.)
+This is an incorrect Java code (src/org/mockito/internal/util/reflection/GenericMetadataSupport.java):
+```java
+protected void registerTypeVariablesOn(Type classType) {
+    if (!(classType instanceof ParameterizedType)) {
+        return;
+    }
+    ParameterizedType parameterizedType = (ParameterizedType) classType;
+    TypeVariable[] typeParameters = ((Class<?>) parameterizedType.getRawType()).getTypeParameters();
+    Type[] actualTypeArguments = parameterizedType.getActualTypeArguments();
+    for (int i = 0; i < actualTypeArguments.length; i++) {
+        TypeVariable typeParameter = typeParameters[i];
+        Type actualTypeArgument = actualTypeArguments[i];
+
+        if (actualTypeArgument instanceof WildcardType) {
+            contextualActualTypeParameters.put(typeParameter, boundsOf((WildcardType) actualTypeArgument));
+        } else {
+            contextualActualTypeParameters.put(typeParameter, actualTypeArgument);
+        }
+        // logger.log("For '" + parameterizedType + "' found type variable : { '" + typeParameter + "(" + System.identityHashCode(typeParameter) + ")" + "' : '" + actualTypeArgument + "(" + System.identityHashCode(typeParameter) + ")" + "' }");
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import junit.framework.Assert;
+import junit.framework.TestCase;
+
+public class GenericMetadataSupportTest extends TestCase {
+
+    interface GenericsSelfReference<T extends GenericsSelfReference<T>> {
+        T self();
+    }
+
+    public void testTypeVariableOfSelfType() {
+        GenericMetadataSupport genericMetadata = inferFrom(GenericsSelfReference.class).resolveGenericReturnType(firstNamedMethod("self", GenericsSelfReference.class));
+
+        Assert.assertEquals(GenericsSelfReference.class, genericMetadata.rawType());
+    }
+
+    private static Method firstNamedMethod(String name, Class<?> type) {
+        try {
+            return type.getDeclaredMethods()[0]; // Assuming there's only one declared method named "self"
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private GenericMetadataSupport inferFrom(Class<?> type) {
+        try {
+            Field field = type.getField("INSTANCE"); // Assuming there's a field named "INSTANCE" representing the instance of the interface
+            Object instance = field.get(null);
+            Method method = type.getMethod("self"); // Assuming the "self" method exists
+            GenericMetadataSupport genericMetadata = new GenericMetadataSupport(instance.getClass(), method.getName());
+            return genericMetadata;
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+}
+
+// Original code for reference
+import org.mockito.internal.util.reflection.GenericMetadataSupport;
+import java.lang.reflect.Method;
+import java.lang.reflect.Type;
+import java.util.ArrayList;
+import java.util.List;
+
+class GenericMetadataSupport {
+    private final Class<?> rawType;
+    private final List<Type> typeArgs = new ArrayList<>();
+
+    public GenericMetadataSupport(Class<?> rawType) {
+        this(rawType, "<init>");
+    }
+
+    public GenericMetadataSupport(Class<?> rawType, String methodName) {
+        this.rawType = rawType;
+        Method method = findMethodByName(methodName); // Replace with actual implementation
+        registerTypeVariablesOn(method.getGenericReturnType()); // Replace with actual implementation
+    }
+
+    private Method findMethodByName(String methodName) {
+        try {
+            return rawType.getMethod(methodName);
+        } catch (NoSuchMethodException e) {
+            throw new IllegalArgumentException("No such method: " + methodName);
+        }
+    }
+
+    private void registerTypeVariablesOn(Type returnType) {
+        if (returnType instanceof Class && ((Class<?>) returnType).getEnclosingClass() == rawType) {
+            typeArgs.add(returnType);
+            return;
+        }
+        if (!(returnType instanceof ParameterizedType)) {
+            return;
+        }
+        ParameterizedType parameterizedType = (ParameterizedType) returnType;
+        Type[] actualTypeArguments = parameterizedType.getActualTypeArguments();
+        for (Type actualTypeArgument : actualTypeArguments) {
+            registerTypeVariablesOn(actualTypeArgument);
+        }
+    }
+
+    public Class<?> rawType() {
+        return rawType;
+    }
+
+    public List<Type> getTypeArgs() {
+        return typeArgs;
+    }
+}
+
+class MockClass {
+    public static MockClass INSTANCE = new MockClass();
+
+    public MockClass self() {
+        return this;
+    }
+}
+```

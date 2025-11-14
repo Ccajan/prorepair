@@ -1,0 +1,150 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Closure removes needed code.
+What steps will reproduce the problem?
+1. Try the following code, in Simple mode
+Math.blah = function(test) { test.a = 5; };
+var test = new Object();
+Math.blah(test); 
+2. The output is
+Math.blah=function(a){a.a=5};var test={};
+
+What is the expected output? What do you see instead?
+Note that Math.blah(test) was removed. It should not be. It issues a warning: JSC_USELESS_CODE: Suspicious code. This code lacks side-effects. Is there a bug? at line 4 character 9
+
+What version of the product are you using? On what operating system?
+Tested on Google hosted Closure service.
+
+Please provide any additional information below.
+Closure seems to be protective about Math in particular, and doesn't like people messing around with her? So, when I try the following code:-
+var n = {};
+n.blah = function(test) { test.a = 5; };
+var test = new Object();
+n.blah(test);
+
+It works. When I replace n by Math, then again, Closure kicks out blah. I need that poor fellow. Please talk some sense into it.
+This is an incorrect Java code (src/com/google/javascript/jscomp/NodeUtil.java):
+```java
+static boolean functionCallHasSideEffects(
+    Node callNode, @Nullable AbstractCompiler compiler) {
+  if (callNode.getType() != Token.CALL) {
+    throw new IllegalStateException(
+        "Expected CALL node, got " + Token.name(callNode.getType()));
+  }
+
+  if (callNode.isNoSideEffectsCall()) {
+    return false;
+  }
+
+  Node nameNode = callNode.getFirstChild();
+
+  // Built-in functions with no side effects.
+  if (nameNode.getType() == Token.NAME) {
+    String name = nameNode.getString();
+    if (BUILTIN_FUNCTIONS_WITHOUT_SIDEEFFECTS.contains(name)) {
+      return false;
+    }
+  } else if (nameNode.getType() == Token.GETPROP) {
+    if (callNode.hasOneChild()
+        && OBJECT_METHODS_WITHOUT_SIDEEFFECTS.contains(
+              nameNode.getLastChild().getString())) {
+      return false;
+    }
+
+    if (callNode.isOnlyModifiesThisCall()
+        && evaluatesToLocalValue(nameNode.getFirstChild())) {
+      return false;
+    }
+
+    // Functions in the "Math" namespace have no side effects.
+
+    if (compiler != null && !compiler.hasRegExpGlobalReferences()) {
+      if (nameNode.getFirstChild().getType() == Token.REGEXP
+          && REGEXP_METHODS.contains(nameNode.getLastChild().getString())) {
+        return false;
+      } else if (nameNode.getFirstChild().getType() == Token.STRING
+          && STRING_REGEXP_METHODS.contains(
+              nameNode.getLastChild().getString())) {
+        Node param = nameNode.getNext();
+        if (param != null &&
+            (param.getType() == Token.STRING
+                || param.getType() == Token.REGEXP))
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+Okay, let's look at this problem. The user is encountering an issue with the Closure Compiler where calling a method on Math is being flagged as useless code because it's assumed to have no side effects. The user provided code examples where Math.blah is removed, but they want to keep it. They also showed some Java code from NodeUtil.java which seems to be responsible for determining if a function call has side effects.
+
+First, I need to understand why the Closure Compiler is removing Math.blah. Looking at the Java code, there's a section that checks if the function is in the "Math" namespace. If so, it assumes no side effects. That's probably causing the issue here. 
+
+The user's example has Math.blah(test), which modifies the 'test' object. But the compiler thinks this has no side effect and thus removes it. However, the user wants to keep the code, indicating that their usage does involve side effects.
+
+So, the problem is in how the Closure Compiler handles methods in the Math namespace. The current logic treats any call to Math methods as having no side effects, which isn't always accurate. The user's case shows that even though they're modifying an object, the compiler still flags it as useless.
+
+Looking at the code snippet, the relevant part is:
+
+if (nameNode.getFirstChild().getType() == Token.STRING
+    && STRING_REGEXP_METHODS.contains(
+        nameNode.getLastChild().getString())) {
+  Node param = nameNode.getNext();
+  if (param != null &&
+      (param.getType() == Token.STRING
+          || param.getType() == Token.REGEXP))
+  return false;
+}
+
+Wait, maybe the actual check for Math methods is in another part. Let me re-examine the code. Oh right, there's a comment saying: "// Functions in the "Math" namespace have no side effects." So that's where the assumption comes from. But that's incorrect in cases where the method actually does have side effects, like modifying objects.
+
+So the solution would be to modify the code to not assume all Math methods have no side effects. Instead, it should check if the method is known to have no side effects. For example, Math.random(), Math.floor(), etc., don't have side effects, but others might. So perhaps the code should only consider certain Math methods as having no side effects, rather than all.
+
+In the given code, the line that says "// Functions in the "Math" namespace have no side effects." is likely the culprit. To fix this, we can change that condition to check against a predefined set of Math methods that are known to have no side effects. This way, other Math methods that do have side effects won't be incorrectly flagged.
+
+For instance, the code could check if the method is in a list like BUILTIN_FUNCTIONS_WITHOUT_SIDEEFFECTS or similar, and only then mark it as having no side effects. Alternatively, the code could ignore the Math namespace check unless the method is explicitly listed as safe.
+
+Another approach is to remove the Math namespace check altogether and instead rely on more precise checks, such as checking if the method is one of the standard ones without side effects. This would prevent false positives for methods that do have side effects.
+
+Therefore, the fix involves modifying the Java code to not automatically assume all Math methods have no side effects. Instead, it should check if the specific method is known to be side-effect-free. This requires updating the logic to handle Math methods correctly based on their names, not just the namespace.
+</think>
+
+To address the issue where **Closure Compiler** incorrectly marks calls to `Math` methods as *useless* due to its internal logic assuming all `Math` methods lack side effects, we need to **refactor the code in `NodeUtil.java`** to make the analysis more precise and avoid overgeneralization.
+
+---
+
+### 🔍 **Root Cause**
+The existing logic in `functionCallHasSideEffects` includes a rule:
+```java
+// Functions in the "Math" namespace have no side effects.
+```
+
+This blanket assumption leads the compiler to treat **any** method call on `Math`—even those with side effects—as non-essential. However, your use case (`Math.blah(test)` mutating `test`) clearly has a **side effect**, so this logic is flawed.
+
+---
+
+### ✅ **Fix Strategy**
+
+Instead of assuming all `Math` methods have no side effects, the fix should:
+1. **Remove the blanket assumption** about the `Math` namespace.
+2. Only flag `Math` methods as side-effect-free if they are explicitly in a white-list of known pure methods (e.g., `Math.random`, `Math.pow`, etc.).
+
+This allows users to define custom `Math` methods (like `Math.blah`) that may have side effects while keeping valid optimizations for genuine pure methods.
+
+---
+
+### 🛠️ **Proposed Code Fix**
+
+Update the method logic as follows:
+
+#### ❌ Before (problematic)
+```java
+// Functions in the "Math

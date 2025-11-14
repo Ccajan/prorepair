@@ -1,0 +1,138 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# smartNameRemoval causing compiler crash
+What steps will reproduce the problem?
+Compiler the following code in advanced mode:
+
+{{{
+var goog = {};
+goog.inherits = function(x, y) {};
+var ns = {};
+/** @constructor */ ns.PageSelectionModel = function(){};
+
+/** @constructor */ 
+ns.PageSelectionModel.FooEvent = function() {};
+/** @constructor */ 
+ns.PageSelectionModel.SelectEvent = function() {};
+goog.inherits(ns.PageSelectionModel.ChangeEvent, ns.PageSelectionModel.FooEvent);
+}}}
+
+What is the expected output? What do you see instead?
+The compiler will crash. The last var check throws an illegal state exception because it knows something is wrong.
+
+The crash is caused by smartNameRemoval. It has special logic for counting references in class-defining function calls (like goog.inherits), and it isn't properly creating a reference to PageSelectionModel.
+This is an incorrect Java code (src/com/google/javascript/jscomp/NameAnalyzer.java):
+```java
+public void visit(NodeTraversal t, Node n, Node parent) {
+
+  // Record global variable and function declarations
+  if (t.inGlobalScope()) {
+    if (NodeUtil.isVarDeclaration(n)) {
+      NameInformation ns = createNameInformation(t, n, parent);
+      Preconditions.checkNotNull(ns);
+      recordSet(ns.name, n);
+    } else if (NodeUtil.isFunctionDeclaration(n)) {
+      Node nameNode = n.getFirstChild();
+      NameInformation ns = createNameInformation(t, nameNode, n);
+      if (ns != null) {
+        JsName nameInfo = getName(nameNode.getString(), true);
+        recordSet(nameInfo.name, nameNode);
+      }
+    } else if (NodeUtil.isObjectLitKey(n, parent)) {
+      NameInformation ns = createNameInformation(t, n, parent);
+      if (ns != null) {
+        recordSet(ns.name, n);
+      }
+    }
+  }
+
+  // Record assignments and call sites
+  if (n.isAssign()) {
+    Node nameNode = n.getFirstChild();
+
+    NameInformation ns = createNameInformation(t, nameNode, n);
+    if (ns != null) {
+      if (ns.isPrototype) {
+        recordPrototypeSet(ns.prototypeClass, ns.prototypeProperty, n);
+      } else {
+        recordSet(ns.name, nameNode);
+      }
+    }
+  } else if (n.isCall()) {
+    Node nameNode = n.getFirstChild();
+    NameInformation ns = createNameInformation(t, nameNode, n);
+    if (ns != null && ns.onlyAffectsClassDef) {
+      JsName name = getName(ns.name, false);
+      if (name != null) {
+      refNodes.add(new ClassDefiningFunctionNode(
+          name, n, parent, parent.getParent()));
+      }
+    }
+  }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+Okay, I need to figure out how to fix the Java code that's causing a compiler crash when using smartNameRemoval with certain inheritance patterns. Let me start by understanding what's going on here.
+
+So, the user provided some JavaScript code that's triggering a crash. The key part is the use of goog.inherits between two classes within the same namespace. The crash happens because the NameAnalyzer.java code is not correctly handling the case where a class is being inherited from another class inside the same namespace. 
+
+Looking at the relevant Java code, there's a section where they process function calls (isCall). When a call is made, they check if it affects a class definition (onlyAffectsClassDef). If so, they add a ClassDefiningFunctionNode. But in this case, the call is to goog.inherits, which is used for inheritance. However, the current code isn't properly capturing the references to the classes involved in the inheritance chain.
+
+The issue seems to be that the NameAnalyzer is not tracking the prototype chains or the class definitions correctly when the inheritance is set up through a method like goog.inherits. Specifically, the problem is that the code is not recognizing that the class being inherited from (ns.PageSelectionModel.FooEvent) is actually a constructor function, and thus needs to be tracked as a reference.
+
+In the existing code, the 'recordSet' method is called for variables and functions, but when dealing with class inheritance, especially through methods like goog.inherits, the references aren't being captured correctly. This leads to an invalid state later on during the analysis phase, resulting in a crash.
+
+To fix this, the code should ensure that any class referenced via goog.inherits is treated as a reference, even if it's not explicitly assigned. The 'recordSet' method is used for assignments, but in the case of inheritance, the 'FooEvent' class is being used as a base class, so its usage should be tracked as a reference, not just a set.
+
+Another point is that the 'onlyAffectsClassDef' flag might not be correct. The goog.inherits method is setting up an inheritance relationship, which involves adding properties to the prototype chain. Therefore, the code should recognize that this call affects the class definitions and track those references appropriately.
+
+So, possible fixes include:
+
+1. Ensuring that when goog.inherits is called, both the child and parent classes are recorded as references. This means modifying the code to handle the parameters of the goog.inherits call specifically, identifying the child and parent classes and adding them as references.
+
+2. Adjusting the logic in the 'visit' method to capture all instances where a class is used as a base in an inheritance setup, not just assignments. This would involve checking if the function being called is goog.inherits, then inspecting the arguments to determine the child and parent classes, and recording those as references.
+
+3. Possibly adjusting the 'createNameInformation' method or the way references are tracked to correctly identify class names used in inheritance contexts, ensuring they are added to the reference list even if they're not directly assigned.
+
+4. Ensuring that when a class is defined with a constructor (using @constructor), the name is properly registered as a reference, allowing the analyzer to track all necessary dependencies for correct renaming and removal.
+
+By addressing these points, the code can correctly track the references involved in the inheritance hierarchy, preventing the illegal state exception and allowing the compiler to proceed without crashing.
+</think>
+
+To resolve the **crash caused by `smartNameRemoval`** in the Closure Compiler when processing inheritance chains involving `goog.inherits`, we must address the improper handling of class references in `NameAnalyzer.java`.
+
+---
+
+### 🧠 Root Cause
+- **Problem**: The `visit()` method in `NameAnalyzer.java` fails to treat class constructors (e.g., `ns.PageSelectionModel`) as valid references when they are used in `goog.inherits` chains.
+- **Crash Triggers**:
+  - `goog.inherits(...)` is used with inner classes (`FooEvent`, `SelectEvent`, etc.).
+  - These inner classes are referenced as **base classes**, but their names are not recorded as **references**.
+  - Later checks (e.g., `refNodes.add(...)`) fail due to missing data, leading to an `IllegalStateException`.
+
+---
+
+### ✅ Solution Summary
+Modify the `visit()` method to:
+1. **Detect `goog.inherits` calls**.
+2. **Extract and record both the child and parent classes** in the inheritance chain.
+3. **Ensure these classes are tracked as references** (via `recordReference(...)`).
+
+---
+
+### 🔧 Modified Code
+Here’s the corrected version of the critical part of `NameAnalyzer.java`:
+
+```java
+private final List<RefNode> refNodes = new ArrayList<>();
+
+@Override
+public void visit(NodeTraversal t, Node n, Node parent) {
+  if (n.isCall()) {
+    Node callee = n.getArgument(0); //

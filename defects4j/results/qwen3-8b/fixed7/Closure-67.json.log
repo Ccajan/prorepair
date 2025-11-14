@@ -1,0 +1,195 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Advanced compilations renames a function and then deletes it, leaving a reference to a renamed but non-existent function
+If we provide the below code to advanced:
+
+function A() {
+this._x = 1;
+}
+
+A.prototype['func1'] = // done to save public reference to func1
+A.prototype.func1 = function() {
+  this._x = 2;
+  this.func2();
+}
+
+A.prototype.func2 = function() {
+  this._x = 3;
+  this.func3();
+}
+
+window['A'] = A;
+
+We get the output:
+
+function a() {
+  this.a = 1
+}
+a.prototype.func1 = a.prototype.b = function() {
+  this.a = 2;
+  this.c() // Problem!
+};
+window.A = a;
+
+So the compiler emits no errors, and renames 'func2' to 'c' but ends up throwing away the definition of that function!
+
+The problem arises when I use:
+
+A.prototype['func1'] = // done to save public reference to func1
+A.prototype.func1 = function() {
+...
+}
+
+The ['func1'] line is apparently enough to save the reference correctly, but also has the side effect of causing the function innards to do the wrong thing.
+
+I can of course instead write it as:
+
+A.prototype['func1'] = A.prototype.func1;
+A.prototype.func1 = function() {
+  this._x = 2;
+  this.func2();
+}
+
+In which case Advanced will compile correctly and the results will also be valid.
+
+function a() {
+  this.a = 1
+}
+a.prototype.func1 = a.prototype.b;
+a.prototype.b = function() {
+  this.a = 2;
+  this.a = 3 // func2, correctly minified
+};
+window.A = a;
+
+For now I can just use the expected way of declaring that func1 export, but since the compiler returns with no errors or warnings and creates a function with no definition, it seems worth reporting.
+This is an incorrect Java code (src/com/google/javascript/jscomp/AnalyzePrototypeProperties.java):
+```java
+private boolean isPrototypePropertyAssign(Node assign) {
+  Node n = assign.getFirstChild();
+  if (n != null && NodeUtil.isVarOrSimpleAssignLhs(n, assign)
+      && n.getType() == Token.GETPROP
+      ) {
+    // We want to exclude the assignment itself from the usage list
+    boolean isChainedProperty =
+        n.getFirstChild().getType() == Token.GETPROP;
+
+    if (isChainedProperty) {
+      Node child = n.getFirstChild().getFirstChild().getNext();
+
+      if (child.getType() == Token.STRING &&
+          child.getString().equals("prototype")) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public class AnalyzePrototypeProperties {
+
+    private boolean isPrototypePropertyAssign(Node assign) {
+        Node lhs = assign.getLeftHandSide();
+        if (lhs == null) {
+            return false;
+        }
+
+        // Check if the left-hand side is a property access on 'prototype'
+        if (NodeUtil.isGetProp(lhs)) {
+            Node object = lhs.getExpression(); // Get the object part (e.g., 'A')
+            Node propertyName = lhs.getPropertyName(); // Get the property name (e.g., 'func1')
+
+            // Check if the object is 'prototype' (i.e., the left-hand side is something like 'obj.prototype.prop')
+            if (object != null && NodeUtil.isGetProp(object)) {
+                Node objectObject = object.getExpression(); // First part of the chain
+                Node objectPropertyName = object.getPropertyName(); // Second part (should be "prototype")
+
+                if (objectPropertyName != null && objectPropertyName.getType() == Token.STRING &&
+                    objectPropertyName.getString().equals("prototype")) {
+                    // Now check if the property being assigned is a method on the prototype
+                    Node rightHandSide = assign.getRightHandSide();
+                    if (rightHandSide instanceof FunctionLiteralNode) {
+                        return true; // It's an assignment to a prototype method
+                    }
+                }
+            } else if (object != null && object.getType() == Token.IDENTIFIER && 
+                       object.getString().equals("prototype")) {
+                // Directly assigning to 'prototype', e.g., 'A.prototype.func1'
+                Node rightHandSide = assign.getRightHandSide();
+                if (rightHandSide instanceof FunctionLiteralNode) {
+                    return true; // It's an assignment to a prototype method
+                }
+            }
+        }
+        return false;
+    }
+}
+```
+
+**Explanation:**
+
+- This revised `isPrototypePropertyAssign` method correctly identifies assignments to properties of the `prototype` object, such as `A.prototype.func1`.
+- The method checks whether the **left-hand side (LHS)** of the assignment is a `GETPROP` node representing a property access on the `prototype` object.
+- If the LHS refers directly to `prototype`, like in `A.prototype.func1`, it confirms it's an assignment to a prototype method.
+- If the LHS is a chained property access like `obj.prototype.prop`, it ensures the second level of the chain is "prototype".
+- Finally, it checks whether the **right-hand side (RHS)** is a `FunctionLiteralNode`, ensuring the assignment is indeed to a function.
+
+This approach avoids issues with `NodeUtil.isVarOrSimpleAssignLhs(n, assign)` and ensures correct identification of prototype property assignments for proper handling during minification or analysis.
+</think>
+
+To address the issue with the original `isPrototypePropertyAssign` method, we need to focus on accurately identifying assignments to properties of the `prototype` object—especially when these are functions (methods), not just simple values. 
+
+---
+
+### 🔍 Problem Summary:
+
+The current implementation was unable to reliably detect assignments to methods defined on the prototype, especially when they were written using the object literal notation (`A.prototype.func1`) rather than variable declarations or simple assignments. Moreover, the logic involving checking for chained `GETPROP` nodes did not account for nested chains properly or ensure the RHS was indeed a function.
+
+This led to cases where function definitions on the prototype were incorrectly skipped or misinterpreted, especially during JavaScript compression/minification, leading to potential runtime failures due to missing functions.
+
+---
+
+### ✅ Solution Approach:
+
+We revise the method so that it does the following:
+
+1. **Check for Property Assignments**: Determine whether the left-hand side of the assignment represents a property access.
+2. **Validate Prototype Chain**: Ensure the object being accessed is `prototype` at some point in the chain.
+3. **Ensure RHS Is a Function Literal**: Only consider assignments to function literals as method assignments to avoid confusion with data value assignments.
+4. **Use Safe Pattern Matching with JsParser API**:
+   - Use `NodeUtil.isGetProp()` to detect GETPROP nodes.
+   - Use `assign.getLeftHandSide()` to find the target property being assigned.
+   - Validate whether the `propertyName` is "prototype" either directly or in a chain.
+   - Confirm the assignment is to a `FunctionLiteralNode`.
+
+---
+
+### 📦 Final Revised Implementation:
+
+```java
+import com.google.javascript.jscomp.NodeUtil;
+import com.google.javascript.rhino.*;
+import java.util.*;
+
+public class AnalyzePrototypeProperties {
+
+    private boolean isPrototypePropertyAssign(Node assign) {
+        Node lhs = assign.getLeftHandSide();
+        if (lhs == null || !NodeUtil.isGetProp(lhs)) {
+            return false;
+        }
+
+        Node object = lhs.getExpression();
+        Node propertyName = lhs.getPropertyName();
+
+        // Direct assignment to 'prototype' like A.prototype.func1
+        if (object != null && object.getType() == Token.IDENTIFIER && 
+            object.getString().equals("prototype

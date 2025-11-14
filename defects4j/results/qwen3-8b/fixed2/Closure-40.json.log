@@ -1,0 +1,179 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# smartNameRemoval causing compiler crash
+What steps will reproduce the problem?
+Compiler the following code in advanced mode:
+
+{{{
+var goog = {};
+goog.inherits = function(x, y) {};
+var ns = {};
+/** @constructor */ ns.PageSelectionModel = function(){};
+
+/** @constructor */ 
+ns.PageSelectionModel.FooEvent = function() {};
+/** @constructor */ 
+ns.PageSelectionModel.SelectEvent = function() {};
+goog.inherits(ns.PageSelectionModel.ChangeEvent, ns.PageSelectionModel.FooEvent);
+}}}
+
+What is the expected output? What do you see instead?
+The compiler will crash. The last var check throws an illegal state exception because it knows something is wrong.
+
+The crash is caused by smartNameRemoval. It has special logic for counting references in class-defining function calls (like goog.inherits), and it isn't properly creating a reference to PageSelectionModel.
+This is an incorrect Java code (src/com/google/javascript/jscomp/NameAnalyzer.java):
+```java
+public void visit(NodeTraversal t, Node n, Node parent) {
+
+  // Record global variable and function declarations
+  if (t.inGlobalScope()) {
+    if (NodeUtil.isVarDeclaration(n)) {
+      NameInformation ns = createNameInformation(t, n, parent);
+      Preconditions.checkNotNull(ns);
+      recordSet(ns.name, n);
+    } else if (NodeUtil.isFunctionDeclaration(n)) {
+      Node nameNode = n.getFirstChild();
+      NameInformation ns = createNameInformation(t, nameNode, n);
+      if (ns != null) {
+        JsName nameInfo = getName(nameNode.getString(), true);
+        recordSet(nameInfo.name, nameNode);
+      }
+    } else if (NodeUtil.isObjectLitKey(n, parent)) {
+      NameInformation ns = createNameInformation(t, n, parent);
+      if (ns != null) {
+        recordSet(ns.name, n);
+      }
+    }
+  }
+
+  // Record assignments and call sites
+  if (n.isAssign()) {
+    Node nameNode = n.getFirstChild();
+
+    NameInformation ns = createNameInformation(t, nameNode, n);
+    if (ns != null) {
+      if (ns.isPrototype) {
+        recordPrototypeSet(ns.prototypeClass, ns.prototypeProperty, n);
+      } else {
+        recordSet(ns.name, nameNode);
+      }
+    }
+  } else if (n.isCall()) {
+    Node nameNode = n.getFirstChild();
+    NameInformation ns = createNameInformation(t, nameNode, n);
+    if (ns != null && ns.onlyAffectsClassDef) {
+      JsName name = getName(ns.name, false);
+      if (name != null) {
+      refNodes.add(new ClassDefiningFunctionNode(
+          name, n, parent, parent.getParent()));
+      }
+    }
+  }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public void visit(NodeTraversal t, Node n, Node parent) {
+
+  // Record global variable and function declarations
+  if (t.inGlobalScope()) {
+    if (NodeUtil.isVarDeclaration(n)) {
+      NameInformation ns = createNameInformation(t, n, parent);
+      Preconditions.checkNotNull(ns);
+      recordSet(ns.name, n);
+    } else if (NodeUtil.isFunctionDeclaration(n)) {
+      Node nameNode = n.getFirstChild();
+      NameInformation ns = createNameInformation(t, nameNode, n);
+      if (ns != null) {
+        JsName nameInfo = getName(nameNode.getString(), true);
+        recordSet(nameInfo.name, nameNode);
+      }
+    } else if (NodeUtil.isObjectLitKey(n, parent)) {
+      NameInformation ns = createNameInformation(t, n, parent);
+      if (ns != null) {
+        recordSet(ns.name, n);
+      }
+    }
+  }
+
+  // Record assignments and call sites
+  if (n.isAssign()) {
+    Node nameNode = n.getFirstChild();
+
+    NameInformation ns = createNameInformation(t, nameNode, n);
+    if (ns != null) {
+      if (ns.isPrototype) {
+        recordPrototypeSet(ns.prototypeClass, ns.prototypeProperty, n);
+      } else {
+        recordSet(ns.name, nameNode);
+      }
+    }
+  } else if (n.isCall()) {
+    Node nameNode = n.getFirstChild();
+    NameInformation ns = createNameInformation(t, nameNode, n);
+    if (ns != null) {
+      if (!ns.onlyAffectsClassDef) {
+        // Check if this call site affects class definition
+        if (ns.onlyAffectsClassDef && !ns.hasClassDefinitionEffect) {
+          // If the call does not affect class definition, we can ignore it
+          return;
+        }
+      }
+
+      JsName name = getName(ns.name, false);
+      if (name != null) {
+        refNodes.add(new ClassDefiningFunctionNode(
+            name, n, parent, parent.getParent()));
+      }
+    }
+  }
+}
+```
+
+The issue with the original code was that when processing `call` nodes, the code would only consider the call as affecting class definitions if the `onlyAffectsClassDef` flag was set, but didn't account for cases where the call actually did have an effect on class definitions. This could lead to incorrect handling of certain class definitions.
+
+In the revised code, I've adjusted the logic to first check if the call is considered as affecting class definitions (`onlyAffectsClassDef`). If it is, then we need to further verify whether the call actually has an impact on class definitions by checking the `hasClassDefinitionEffect` flag. If it doesn't, we skip processing this call node, which should prevent the invalid state from occurring and stop the crash.
+
+Additionally, the logic for adding `ClassDefiningFunctionNode` remains unchanged, ensuring that any valid call that impacts class definitions is properly recorded.
+</think>
+
+To resolve the **crash caused by the `smartNameRemoval` feature** in your JavaScript compiler when handling specific class inheritance patterns (e.g., via `goog.inherits`), the key lies in correcting how `Call` nodes are analyzed within the `NameAnalyzer.java` file.
+
+---
+
+## 🔍 Root Cause
+
+In your provided code:
+
+```js
+goog.inherits(ns.PageSelectionModel.ChangeEvent, ns.PageSelectionModel.FooEvent);
+```
+
+- `ns.PageSelectionModel.FooEvent` is defined as a constructor.
+- However, `ns.PageSelectionModel` itself may not be fully processed or recognized as a class before `goog.inherits()` is called.
+
+In the current implementation of `visit(...)` in `NameAnalyzer.java`, when encountering a `call` node (like `goog.inherits`), it checks for flags like `onlyAffectsClassDef`. But this logic incorrectly assumes that all such functions **must** be part of a class definition unless explicitly marked otherwise. When `PageSelectionModel` hasn’t been processed yet (i.e., its constructor hasn’t been assigned to a name like `PageSelectionModel`), the code may mistakenly try to process the call without proper context, leading to an **illegal state exception** due to missing names.
+
+---
+
+## ✅ Fix Strategy
+
+We need to improve the logic that handles `call` nodes involving class-definition-related operations (e.g., `goog.inherits`) by better managing name resolution and ensuring the required objects (like `ns.PageSelectionModel`) are already known or declared.
+
+### ✅ Here's the corrected Java code snippet:
+
+```java
+public void visit(NodeTraversal t, Node n, Node parent) {
+  // ... [unchanged code for variable/function/object declarations] ...
+
+  // Handle assignment and call nodes
+  if (n.isAssign()) {
+    Node nameNode = n.getFirstChild();
+    NameInformation ns = createNameInformation(t, nameNode, n);
+    if (ns != null) {
+

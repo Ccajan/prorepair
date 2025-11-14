@@ -1,0 +1,199 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# Annotation bundles ignored when added to Mixin
+When updating from v 2.4.4 to 2.5.* it appears as though annotation bundles created with @JacksonAnnotationsInside are ignored when placed on a mixin.  Moving the annotation bundel to the actual class seems to resolve the issue.  Below is a simple test that attempts to rename a property.  I have more complicated test cases that are also failing but this should provide some context.
+public class Fun {
+
+    @Test
+    public void test() throws JsonProcessingException {
+        ObjectMapper mapper = new ObjectMapper().addMixIn(Foo.class, FooMixin.class);
+        String result = mapper.writeValueAsString(new Foo("result"));
+        Assert.assertEquals("{\"bar\":\"result\"}", result);
+    }
+
+    @Target(value={ ElementType.CONSTRUCTOR, ElementType.FIELD, ElementType.METHOD })
+    @Retention(value=RetentionPolicy.RUNTIME)
+    @JacksonAnnotationsInside
+    @JsonProperty("bar")
+    public @interface ExposeStuff {
+
+    }
+
+    public abstract class FooMixin {
+        @ExposeStuff
+        public abstract String getStuff();
+    }
+
+    public class Foo {
+
+        private String stuff;
+
+        Foo(String stuff) {
+            this.stuff = stuff;
+        }
+
+        public String getStuff() {
+            return stuff;
+        }
+    }
+}
+I'm expecting the "stuff" property to be serialized as "bar".
+I apologize I haven't been able to identify the culprit (and perhaps it's in my usage).  Let me know your thoughts. I'm always happy to provide more details!
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/introspect/AnnotationMap.java):
+```java
+protected final boolean _add(Annotation ann) {
+    if (_annotations == null) {
+        _annotations = new HashMap<Class<? extends Annotation>,Annotation>();
+    }
+    Annotation previous = _annotations.put(ann.annotationType(), ann);
+    return (previous != null) && previous.equals(ann);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.databind.*;
+import com.fasterxml.jackson.databind.introspect.AnnotationMap;
+import org.junit.Assert;
+import org.junit.Test;
+
+public class Fun {
+
+    @Test
+    public void test() throws JsonProcessingException {
+        ObjectMapper mapper = new ObjectMapper().addMixIn(Foo.class, FooMixin.class);
+        String result = mapper.writeValueAsString(new Foo("result"));
+        Assert.assertEquals("{\"bar\":\"result\"}", result);
+    }
+
+    @Target(value={ ElementType.CONSTRUCTOR, ElementType.FIELD, ElementType.METHOD })
+    @Retention(value=RetentionPolicy.RUNTIME)
+    @JacksonAnnotationsInside
+    @JsonProperty("bar")
+    public @interface ExposeStuff {
+
+    }
+
+    public abstract class FooMixin {
+        @ExposeStuff
+        public abstract String getStuff();
+    }
+
+    public class Foo {
+
+        private String stuff;
+
+        Foo(String stuff) {
+            this.stuff = stuff;
+        }
+
+        public String getStuff() {
+            return stuff;
+        }
+    }
+}
+```
+assistant
+```java
+package com.example;
+
+import com.fasterxml.jackson.annotation.JacksonAnnotation;
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.annotation.JsonPropertyOrder;
+import com.fasterxml.jackson.annotation.JsonUnwrapped;
+import com.fasterxml.jackson.databind.*;
+import com.fasterxml.jackson.databind.introspect.AnnotationMap;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Test;
+
+import java.util.Map;
+
+@Data
+@AllArgsConstructor
+class ParentWithChild {
+
+    private Child child;
+
+}
+
+@Data
+@AllArgsConstructor
+class Child {
+    @JsonIgnore
+    private int id;
+
+    @JsonUnwrapped
+    private Map<String, Object> data;
+}
+
+@Test
+void jsonPropertyOrderShouldOverrideImplicitBeanPropertyOrder() throws JsonProcessingException {
+    final var parent = new ParentWithChild(new Child(1, Map.of(
+            "name", "foo",
+            "email", "foo@example.com"
+    )));
+
+    final var objectMapper = new ObjectMapper()
+            .registerModule(new JacksonAnnotationsInsideModule());
+
+    final var writer = objectMapper.writer();
+
+    Assertions.assertEquals("{\"child\":{\"data\":{\"email\":\"foo@example.com\",\"name\":\"foo\"},\"id\":1}}", writer.writeValueAsString(parent));
+}
+
+
+private static class JacksonAnnotationsInsideModule extends SimpleModule {
+    JacksonAnnotationsInsideModule() {
+        super("JacksonAnnotationsInsideModule", Version.unknownVersion());
+        setDeserializerModifier(new DeserializerModifier() {
+            @Override
+            public JsonDeserializer<?> modifyReaderInstance(Annotated annotated,
+                                                              Class<?> type,
+                                                              BeanDescription beanDesc,
+                                                              JsonDeserializer<?> deserializer) {
+                AnnotationMap amap = beanDesc.getDeserializationConfig().getAnnotationIntrospector().forClass(type);
+                return new JacksonAnnotationsInsideReader(amap, deserializer);
+            }
+        });
+
+        setSerializerModifier(new SerializerModifier() {
+            @Override
+            public JsonSerializer<?> modifySerializer(SerializationConfig config,
+                                                          BeanDescription beanDesc,
+                                                          JsonSerializer<?> serializer) {
+                AnnotationMap amap = config.getAnnotationIntrospector().forClass(beanDesc.getBeanClass());
+                return new JacksonAnnotationsInsideWriter(amap, serializer);
+            }
+        });
+    }
+}
+
+
+private static class JacksonAnnotationsInsideReader extends DelegatingDeserializer {
+    protected JacksonAnnotationsInsideReader(AnnotationMap amap, JsonDeserializer<?> dser) {
+        super(dser);
+        // set up annotations
+        for (Map.Entry<Class<? extends Annotation>, Annotation> entry : amap) {
+            addOrReplaceVirtualAnnotation(entry.getKey(), entry.getValue());
+        }
+    }
+}
+
+private static class JacksonAnnotationsInsideWriter extends DelegateSerializer {
+    protected JacksonAnnotationsInsideWriter(AnnotationMap amap, JsonSerializer<?> ser) {
+        super(ser);
+        // set up annotations
+        for (Map.Entry<Class<? extends Annotation>, Annotation> entry : amap) {
+            addOrReplaceVirtualAnnotation(entry.getKey(), entry.getValue());
+        }
+    }
+}
+```

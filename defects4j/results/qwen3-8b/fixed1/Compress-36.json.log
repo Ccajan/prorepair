@@ -1,0 +1,112 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Calling SevenZFile.read() on empty SevenZArchiveEntry throws IllegalStateException
+I'm pretty sure COMPRESS-340 breaks reading empty archive entries. When calling getNextEntry() and that entry has no content, the code jumps into the first block at line 830 (SevenZFile.class), clearing the deferredBlockStreams. When calling entry.read(...) afterwards an IllegalStateException ("No current 7z entry (call getNextEntry() first).") is thrown. IMHO, there should be another check for entry.getSize() == 0.
+This worked correctly up until 1.10.
+This is an incorrect Java code (src/main/java/org/apache/commons/compress/archivers/sevenz/SevenZFile.java):
+```java
+private InputStream getCurrentStream() throws IOException {
+    if (deferredBlockStreams.isEmpty()) {
+        throw new IllegalStateException("No current 7z entry (call getNextEntry() first).");
+    }
+    
+    while (deferredBlockStreams.size() > 1) {
+        // In solid compression mode we need to decompress all leading folder'
+        // streams to get access to an entry. We defer this until really needed
+        // so that entire blocks can be skipped without wasting time for decompression.
+        final InputStream stream = deferredBlockStreams.remove(0);
+        IOUtils.skip(stream, Long.MAX_VALUE);
+        stream.close();
+    }
+
+    return deferredBlockStreams.get(0);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+Yes, I understand the issue. The problem arises when trying to read from a `SevenZArchiveEntry` that has zero size. The current logic in `getCurrentStream()` does not account for this case, and as a result, it incorrectly throws an exception even when the entry exists but has no data.
+
+---
+
+### ✅ **Problem Summary**
+- An empty `SevenZArchiveEntry` (i.e., one with `entry.getSize() == 0`) can still exist in a `.7z` archive.
+- The method `getCurrentStream()` checks whether `deferredBlockStreams` is non-empty, which could be true even for a zero-sized entry.
+- However, after `getNextEntry()` returns such an entry, trying to call `read(...)` will trigger an `IllegalStateException`, because `getCurrentStream()` assumes an active entry.
+
+---
+
+### 🛠️ **Fix Approach**
+We need to:
+1. **Check for `getSize() == 0`** before attempting to read any data.
+2. If the entry is empty, immediately return an empty `InputStream`.
+3. Otherwise proceed with the current logic.
+
+Here's how to fix the problematic part of the code:
+
+---
+
+### 🔧 Fixed Code Snippet
+
+Replace the following section in `SevenZFile.java`:
+
+```java
+private InputStream getCurrentStream() throws IOException {
+    if (deferredBlockStreams.isEmpty()) {
+        throw new IllegalStateException("No current 7z entry (call getNextEntry() first).");
+    }
+
+    while (deferredBlockStreams.size() > 1) {
+        final InputStream stream = deferredBlockStreams.remove(0);
+        IOUtils.skip(stream, Long.MAX_VALUE);
+        stream.close();
+    }
+
+    return deferredBlockStreams.get(0);
+}
+```
+
+with:
+
+```java
+private InputStream getCurrentStream() throws IOException {
+    if (deferredBlockStreams.isEmpty()) {
+        throw new IllegalStateException("No current 7z entry (call getNextEntry() first).");
+    }
+
+    // Check if the current entry is empty
+    if (currentEntry != null && currentEntry.getSize() == 0) {
+        return new ByteArrayInputStream(new byte[0]);
+    }
+
+    while (deferredBlockStreams.size() > 1) {
+        final InputStream stream = deferredBlockStreams.remove(0);
+        IOUtils.skip(stream, Long.MAX_VALUE);
+        stream.close();
+    }
+
+    return deferredBlockStreams.get(0);
+}
+```
+
+---
+
+### 📌 Additional Notes
+
+- Ensure that `currentEntry` is properly set in `getNextEntry()` — typically, it's stored somewhere like a member variable (`this.currentEntry`).
+- This change ensures that even if an entry is completely empty, the reader won't fail due to an invalid state, and instead returns an empty input stream.
+- This behavior aligns with other archiver implementations (e.g., ZIP or TAR), where empty entries can exist and be read normally.
+
+---
+
+### ✅ Summary
+
+The fix involves adding a condition to handle empty entries in the `getCurrentStream()` method. This prevents an unnecessary exception and allows proper handling of zero-length entries within a `.7z` file.
+
+Let me know if you'd like a version of the entire `SevenZFile.java` class with this change incorporated!

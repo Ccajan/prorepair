@@ -1,0 +1,123 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Regression in 2.7.0-rc2, for schema/introspection for BigDecimal
+(found via Avro module, but surprisingly json schema module has not test to catch it)
+Looks like schema type for BigDecimal is not correctly produced, due to an error in refactoring (made to simplify introspection for simple serializers): it is seen as BigInteger (and for Avro, for example, results in long getting written).
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/ser/std/NumberSerializer.java):
+```java
+public void acceptJsonFormatVisitor(JsonFormatVisitorWrapper visitor, JavaType typeHint) throws JsonMappingException
+{
+    if (_isInt) {
+        visitIntFormat(visitor, typeHint, JsonParser.NumberType.BIG_INTEGER);
+    } else {
+        Class<?> h = handledType();
+        if (h == BigDecimal.class) {
+            visitFloatFormat(visitor, typeHint, JsonParser.NumberType.BIG_INTEGER);
+        } else {
+            // otherwise bit unclear what to call... but let's try:
+            /*JsonNumberFormatVisitor v2 =*/ visitor.expectNumberFormat(typeHint);
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public void acceptJsonFormatVisitor(JsonFormatVisitorWrapper visitor, JavaType typeHint) throws JsonMappingException
+{
+    if (_isInt) {
+        visitIntFormat(visitor, typeHint, JsonParser.NumberType.BIG_INTEGER);
+    } else {
+        Class<?> h = handledType();
+        if (h == BigDecimal.class) {
+            visitFloatFormat(visitor, typeHint, JsonParser.NumberType.FLOAT);
+        } else {
+            // otherwise bit unclear what to call... but let's try:
+            /*JsonNumberFormatVisitor v2 =*/ visitor.expectNumberFormat(typeHint);
+        }
+    }
+}
+```
+
+The issue was that when handling `BigDecimal` types, the code incorrectly used `BIG_INTEGER` instead of `FLOAT`. This led to incorrect schema generation where `BigDecimal` was treated as `BigInteger`, causing issues with serialization, particularly in Avro.
+
+### Explanation:
+- **Problem**: The original code used `JsonParser.NumberType.BIG_INTEGER` for `BigDecimal`, which misleads the JSON schema generator into treating it as a big integer.
+- **Solution**: Changing it to `JsonParser.NumberType.FLOAT` correctly indicates that `BigDecimal` should be represented as a floating-point number in JSON schemas.
+
+### Why this fix works:
+- Jackson's schema introspection relies on these types to generate correct JSON Schema definitions. By using `FLOAT`, we ensure that `BigDecimal` values are serialized as numbers (which can handle decimal points), aligning with their intended usage and avoiding conflicts with other numeric types like `BigInteger`.
+
+This correction ensures that the generated JSON schema accurately reflects the data types being serialized, preventing issues during deserialization or validation against schemas, especially in frameworks like Avro where precise type handling is crucial.
+
+If there's more context about how this affects specific workflows or integrations (like Avro), I can provide further refinements or considerations.
+</think>
+
+To address the issue in the provided Java code snippet from `NumberSerializer.java`, we need to ensure that the JSON format visitor correctly identifies `BigDecimal` as a floating-point number rather than a big integer. The current implementation mistakenly assigns the wrong number type (`BIG_INTEGER`) to `BigDecimal`, leading to incorrect schema generation and improper serialization behavior—particularly when working with Avro or similar tools that require strict type fidelity.
+
+---
+
+### ✅ Problem Summary:
+
+- **Issue**: The method `acceptJsonFormatVisitor()` treats `BigDecimal` as `BIG_INTEGER` instead of `FLOAT`.
+- **Result**: When generating JSON schemas, `BigDecimal` is classified as a big integer, leading to misuse of numerical formats (e.g., loss of decimal precision or failure to parse fractional parts).
+- **Impact**: In Avro or similar serialization systems, such incorrect classification causes serialization errors because those systems rely heavily on schema accuracy.
+
+---
+
+### 🛠️ Corrected Code:
+
+```java
+public void acceptJsonFormatVisitor(JsonFormatVisitorWrapper visitor, JavaType typeHint) throws JsonMappingException
+{
+    if (_isInt) {
+        visitIntFormat(visitor, typeHint, JsonParser.NumberType.BIG_INTEGER);
+    } else {
+        Class<?> h = handledType();
+        if (h == BigDecimal.class) {
+            visitFloatFormat(visitor, typeHint, JsonParser.NumberType.FLOAT);
+        } else {
+            // If the type is unknown, fallback to expecting a general number format
+            visitor.expectNumberFormat(typeHint);
+        }
+    }
+}
+```
+
+---
+
+### 🔍 Explanation:
+
+- **Line 1–3**:
+  - `_isInt` checks whether the serializer is expected to handle integers only.
+  - If true, it calls `visitIntFormat(...)` with `BIG_INTEGER`, which is appropriate for integer types like `Long` or `Integer`.
+
+- **Lines 4–8**:
+  - For non-integer types, it retrieves the actual class (`handledType()`) of the object.
+  - If it's `BigDecimal`, the correct number type is `FLOAT`, so we call `visitFloatFormat(...)` with `FLOAT`.
+
+- **Fallback Behavior**:
+  - For any other type (not covered by above logic), the code defaults to calling `visitor.expectNumberFormat(...)`, ensuring the visitor expects a standard number format.
+
+---
+
+### 🧠 Why This Fix Works:
+
+- **Correct Classification**:
+  - By assigning `JsonParser.NumberType.FLOAT` to `BigDecimal`, we inform Jackson’s schema introspection engine to treat `BigDecimal` as a float-like number, preserving its ability to represent decimal fractions.
+
+- **Schema Accuracy**:
+  - Properly classified `BigDecimal` will now produce accurate JSON schemas (e.g., `type: "number"` instead of `type: "integer"`) and avoid mismatches with downstream systems like Avro, which might expect certain type representations.
+
+- **Consistency Across Systems**:
+  - Ensures compatibility with all clients consuming the serialized data, including tools and libraries that validate data based on schema types.
+
+---
+
+### 📌 Additional Recommendations:
+
+If your application uses **Avro** in conjunction with Jackson

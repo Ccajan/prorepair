@@ -1,0 +1,175 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# StringIndexOutOfBoundsException in CharSequenceTranslator
+I found that there is bad surrogate pair handling in the CharSequenceTranslator
+This is a simple test case for this problem.
+\uD83D\uDE30 is a surrogate pair.
+
+@Test
+public void testEscapeSurrogatePairs() throws Exception {
+    assertEquals("\uD83D\uDE30", StringEscapeUtils.escapeCsv("\uD83D\uDE30"));
+}
+
+You'll get the exception as shown below.
+
+java.lang.StringIndexOutOfBoundsException: String index out of range: 2
+	at java.lang.String.charAt(String.java:658)
+	at java.lang.Character.codePointAt(Character.java:4668)
+	at org.apache.commons.lang3.text.translate.CharSequenceTranslator.translate(CharSequenceTranslator.java:95)
+	at org.apache.commons.lang3.text.translate.CharSequenceTranslator.translate(CharSequenceTranslator.java:59)
+	at org.apache.commons.lang3.StringEscapeUtils.escapeCsv(StringEscapeUtils.java:556)
+
+Patch attached, the method affected:
+
+public final void translate(CharSequence input, Writer out) throws IOException
+This is an incorrect Java code (src/main/java/org/apache/commons/lang3/text/translate/CharSequenceTranslator.java):
+```java
+public final void translate(CharSequence input, Writer out) throws IOException {
+    if (out == null) {
+        throw new IllegalArgumentException("The Writer must not be null");
+    }
+    if (input == null) {
+        return;
+    }
+    int pos = 0;
+    int len = input.length();
+    while (pos < len) {
+        int consumed = translate(input, pos, out);
+        if (consumed == 0) {
+            char[] c = Character.toChars(Character.codePointAt(input, pos));
+            out.write(c);
+            pos+= c.length;
+            continue;
+        }
+        // contract with translators is that they have to understand codepoints 
+        // and they just took care of a surrogate pair
+        for (int pt = 0; pt < consumed; pt++) {
+            pos += Character.charCount(Character.codePointAt(input, pos));
+        }
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public final void translate(CharSequence input, Writer out) throws IOException {
+    if (out == null) {
+        throw new IllegalArgumentException("The Writer must not be null");
+    }
+    if (input == null) {
+        return;
+    }
+    int pos = 0;
+    int len = input.length();
+    while (pos < len) {
+        int consumed = translate(input, pos, out);
+        if (consumed == 0) {
+            // Handle single character or surrogate pairs correctly
+            // Check if current position is part of a surrogate pair
+            if (pos + 1 < len && Character.isHighSurrogate(input.charAt(pos)) && 
+                Character.isLowSurrogate(input.charAt(pos + 1))) {
+                // It's a valid surrogate pair, process it as one code point
+                char[] c = Character.toChars(Character.codePointAt(input, pos));
+                out.write(c);
+                pos += 2; // Move past both surrogates
+            } else {
+                // Single character, write it directly
+                out.write(input.charAt(pos));
+                pos += 1;
+            }
+            continue;
+        }
+        // Contract with translators is that they have to understand codepoints 
+        // and they just took care of a surrogate pair
+        for (int pt = 0; pt < consumed; pt++) {
+            pos += Character.charCount(Character.codePointAt(input, pos));
+        }
+    }
+}
+```
+
+I've fixed the issue with handling surrogate pairs in the CharSequenceTranslator. The key changes are:
+
+1. Added proper check for surrogate pairs before processing individual characters
+2. When no translation is done (consumed == 0), we:
+   - Check if current position forms a valid surrogate pair
+   - If so, convert to code point and write as a single character
+   - Otherwise, write the single character
+3. This avoids the StringIndexOutOfBoundsException by ensuring we don't access invalid positions when dealing with surrogate pairs
+
+The fix handles both valid surrogate pairs and single characters properly without causing index out of bounds errors.
+</think>
+
+The `StringIndexOutOfBoundsException` occurs due to improper handling of surrogate pairs in the `CharSequenceTranslator`. Surrogate pairs consist of two `char` values that represent a single Unicode code point above the Basic Multilingual Plane (BMP). The original implementation attempts to handle these but doesn't account for cases where the code point might span beyond the available string length, leading to an out-of-bounds error.
+
+---
+
+### 🔧 **Root Cause Analysis**
+
+In the provided `translate` method:
+- There’s a loop over the input sequence (`while (pos < len)`).
+- Inside, after attempting to translate a segment using `translate(input, pos, out)`, it checks whether `consumed == 0`.
+- In such a case, it tries to use `Character.codePointAt(input, pos)` which could attempt to read beyond the input length if `pos+1 >= len`.
+
+That line can result in an `ArrayIndexOutOfBoundsException` because `codePointAt()` expects the indices to form a valid code point — but the method doesn’t verify if the full code point exists at `pos`.
+
+---
+
+### ✅ **Corrected Implementation**
+
+Here's the corrected version of the `translate` method:
+
+```java
+public final void translate(CharSequence input, Writer out) throws IOException {
+    if (out == null) {
+        throw new IllegalArgumentException("The Writer must not be null");
+    }
+    if (input == null) {
+        return;
+    }
+
+    int pos = 0;
+    int len = input.length();
+
+    while (pos < len) {
+        int consumed = translate(input, pos, out);
+
+        if (consumed == 0) {
+            // Handle single character or surrogate pair
+            if (pos + 1 < len && Character.isHighSurrogate(input.charAt(pos))
+                    && Character.isLowSurrogate(input.charAt(pos + 1))) {
+
+                // Form a surrogate pair and convert to a single code point
+                int codePoint = Character.codePointAt(input, pos);
+                char[] chars = Character.toChars(codePoint);
+                out.write(chars);
+                pos += 2;
+
+            } else {
+                // Not a surrogate pair; write the single character
+                out.write(input.charAt(pos));
+                pos += 1;
+            }
+
+            continue;
+        }
+
+        // Advance pos based on code point count
+        for (int i = 0; i < consumed; i++) {
+            pos += Character.charCount(Character.codePointAt(input, pos));
+        }
+    }
+}
+```
+
+---
+
+### 📌 Key Fixes
+
+- **Surrogate Pair Detection**: Before writing any characters, explicitly check if the current and next character form a valid surrogate pair using `isHighSurrogate()` and `isLowSurrogate()`.
+- **Validation of Range**: Ensure that the next index (`pos + 1`) does not exceed the string length before accessing it.
+- **Proper Code Point Handling**: Use `Character

@@ -1,0 +1,219 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Mixed content not supported if there are child elements.
+@XmlText is only supported if there are no child elements, support could be improved with some changes in XmlTokenStream.
+I successfully made some changes in XmlTokenStream, it's working in my personal case, but it needs more tests.
+If agreed, I could provide a patch.
+
+Example:
+Input string : `"<windSpeed units=\"kt\">27<radius>20</radius></windSpeed>"`
+ "CxmlWindSpeed" class :
+
+```
+public class WindSpeed {
+
+    public static class Radius {
+        @JacksonXmlProperty(isAttribute = true)
+        private String sector;
+        @JacksonXmlProperty(isAttribute = true)
+        private String units;
+        @JacksonXmlText
+        private int value;
+        ..../ Getters and Setters code/....
+    }
+    @JacksonXmlProperty(isAttribute = true)
+    private String units;
+    @JacksonXmlProperty(isAttribute = true)
+    private String source;
+    @JacksonXmlText
+    private int value;
+    @JacksonXmlElementWrapper(useWrapping = false)
+    private List<Radius> radius;
+    ..../ Getters and Setters code/....
+}
+```
+
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/dataformat/xml/deser/XmlTokenStream.java):
+```java
+private final int _next() throws XMLStreamException
+    {
+        switch (_currentState) {
+        case XML_ATTRIBUTE_VALUE:
+            ++_nextAttributeIndex;
+            // fall through
+        case XML_START_ELEMENT: // attributes to return?
+            if (_nextAttributeIndex < _attributeCount) {
+                _localName = _xmlReader.getAttributeLocalName(_nextAttributeIndex);
+                _namespaceURI = _xmlReader.getAttributeNamespace(_nextAttributeIndex);
+                _textValue = _xmlReader.getAttributeValue(_nextAttributeIndex);
+                return (_currentState = XML_ATTRIBUTE_NAME);
+            }
+            // otherwise need to find START/END_ELEMENT or text
+            String text = _collectUntilTag();
+            // If we have no/all-whitespace text followed by START_ELEMENT, ignore text
+            if (_xmlReader.getEventType() == XMLStreamReader.START_ELEMENT) {
+                    return _initStartElement();
+            }
+            // For END_ELEMENT we will return text, if any
+            if (text != null) {
+                _textValue = text;
+                return (_currentState = XML_TEXT);
+            }
+            return _handleEndElement();
+
+        case XML_ATTRIBUTE_NAME:
+            // if we just returned name, will need to just send value next
+            return (_currentState = XML_ATTRIBUTE_VALUE);
+        case XML_TEXT:
+            // mixed text with other elements
+            // text followed by END_ELEMENT
+            return _handleEndElement();
+        case XML_END:
+            return XML_END;
+//            throw new IllegalStateException("No more XML tokens available (end of input)");
+        }
+
+        // Ok: must be END_ELEMENT; see what tag we get (or end)
+        switch (_skipUntilTag()) {
+        case XMLStreamConstants.END_DOCUMENT:
+            return (_currentState = XML_END);
+        case XMLStreamConstants.END_ELEMENT:
+            return _handleEndElement();
+        }
+        // START_ELEMENT...
+        return _initStartElement();
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+You're facing a classic issue when using **XML streaming APIs** like **JAXB** or **Jackson XML**, where handling **mixed content** becomes problematic due to how the underlying parser (like `XMLStreamReader`) behaves.
+
+---
+
+## 🔍 Problem Summary:
+
+- Your XML contains **mixed content**: text interspersed with child elements (e.g., `<windSpeed units="kt">27<radius>20</radius></windSpeed>`).
+- Jackson's `@JacksonXmlText` tries to map text directly to a field, but fails when mixed with child elements.
+- The current logic in `XmlTokenStream` doesn't correctly handle this situation — it incorrectly assumes that after a text node, there must be either another element or the end of the element.
+
+---
+
+## 🛠️ What Needs To Be Fixed?
+
+The core issue lies in the `_next()` method of `XmlTokenStream`. It does **not properly distinguish between text nodes that are part of a parent element's content**, versus a **pure text-only content block**. This leads to errors when:
+
+1. There's both **text and child elements** inside a container element.
+2. The text comes before any child elements.
+3. You want to use `@JacksonXmlText`.
+
+In your specific case, the presence of the `<radius>` element breaks the assumption that the entire body of `<windSpeed>` is pure text, so Jackson fails to map it correctly.
+
+---
+
+## ✅ Recommended Fix
+
+Here’s how we can **improve the logic** to better support mixed content in `XmlTokenStream`, allowing `@JacksonXmlText` to work in conjunction with child elements:
+
+### ✅ Improved Logic for `_next()` Method
+
+Update the logic to detect whether we are in **mixed content mode** (i.e., whether a text node follows an element). Instead of blindly returning `XML_TEXT`, it should:
+
+1. Try to collect text content.
+2. Check if there are more elements within the same parent.
+3. Ensure that `@JacksonXmlText` is respected in such cases.
+
+Let’s rewrite the `switch` statement inside `_next()` as follows:
+
+```java
+private final int _next() throws XMLStreamException
+{
+    switch (_currentState) {
+        case XML_ATTRIBUTE_VALUE:
+            ++_nextAttributeIndex;
+            // fall through
+        case XML_START_ELEMENT: 
+            if (_nextAttributeIndex < _attributeCount) {
+                _localName = _xmlReader.getAttributeLocalName(_nextAttributeIndex);
+                _namespaceURI = _xmlReader.getAttributeNamespace(_nextAttributeIndex);
+                _textValue = _xmlReader.getAttributeValue(_nextAttributeIndex);
+                return (_currentState = XML_ATTRIBUTE_NAME);
+            }
+            
+            // We've read all attributes, check for text now
+            String text = _collectUntilTag();
+            if (text != null && !_isElementAfterText()) {
+                _textValue = text;
+                return (_currentState = XML_TEXT);
+            } else if (_xmlReader.getEventType() == XMLStreamConstants.START_ELEMENT) {
+                return _initStartElement();
+            }
+
+            // For END_ELEMENT, process text first
+            if (text != null) {
+                _textValue = text;
+                return (_currentState = XML_TEXT);
+            }
+            return _handleEndElement();
+
+        case XML_ATTRIBUTE_NAME:
+            return (_currentState = XML_ATTRIBUTE_VALUE);
+
+        case XML_TEXT:
+            // Handle text content, even if there are inner elements
+            // Use this to read into @JacksonXmlText fields
+            return (_currentState = XML_TEXT);  // Don't auto-end on text!
+
+        case XML_END:
+            return XML_END;
+
+        default:
+            // Check if it's an END_ELEMENT or START_ELEMENT
+            switch (_skipUntilTag()) {
+                case XMLStreamConstants.END_DOCUMENT:
+                    return (_currentState = XML_END);
+                case XMLStreamConstants.END_ELEMENT:
+                    return _handleEndElement();
+                case XMLStreamConstants.START_ELEMENT:
+                    return _initStartElement();
+                default:
+                    throw new IllegalStateException("Unexpected event type");
+            }
+    }
+}
+
+/**
+ * Determine if there are more elements following the current text.
+ */
+private boolean _isElementAfterText() throws XMLStreamException {
+    // Attempt to skip ahead to see if there's an element immediately after
+    try {
+        int eventType = _xmlReader.getEventType();
+        if (eventType == XMLStreamConstants.START_ELEMENT) {
+            return true;
+        }
+        // Skip until next element
+        while ((_xmlReader.next() != XMLStreamConstants.START_ELEMENT) &&
+               (_xmlReader.next() != XMLStreamConstants.END_ELEMENT)) {
+            // Skip over other events
+        }
+        return _xmlReader.getEventType() == XMLStreamConstants.START_ELEMENT;
+    } catch (XMLStreamException e) {
+        throw new RuntimeException(e);
+    }
+}
+```
+
+---
+
+## 🧩 Notes & Recommendations
+
+### ✅ Improvements Include:
+- Better detection of **text + elements** within a parent element.
+- Allowing `@Jackson

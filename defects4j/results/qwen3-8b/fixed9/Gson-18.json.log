@@ -1,0 +1,121 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Gson deserializes wildcards to LinkedHashMap
+This issue is a successor to #1101.
+Models:
+// ? extends causes the issue
+class BigClass { Map<String, ? extends List<SmallClass>> inBig; }
+
+class SmallClass { String inSmall; }
+Json:
+{
+  "inBig": {
+    "key": [
+      { "inSmall": "hello" }
+    ]
+  }
+}
+Gson call:
+SmallClass small = new Gson().fromJson(json, BigClass.class).inBig.get("inSmall").get(0);
+This call will fail with a ClassCastException exception –
+com.google.gson.internal.LinkedTreeMap cannot be cast to Entry. If we remove ? extends then everything works fine.
+This is an incorrect Java code (gson/src/main/java/com/google/gson/internal/$Gson$Types.java):
+```java
+static Type getSupertype(Type context, Class<?> contextRawType, Class<?> supertype) {
+    // wildcards are useless for resolving supertypes. As the upper bound has the same raw type, use it instead
+  checkArgument(supertype.isAssignableFrom(contextRawType));
+  return resolve(context, contextRawType,
+      $Gson$Types.getGenericSupertype(context, contextRawType, supertype));
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+The provided code seems to have an issue when handling wildcard types like `? extends List<SmallClass>`. The problem arises because the method `getSupertype` isn't correctly resolving the generic type information when dealing with bounded wildcards. Here's how we can fix this:
+
+1. **Understand the Issue**: The current implementation attempts to find a supertype but fails when there's a wildcard involved. Specifically, the line `checkArgument(supertype.isAssignableFrom(contextRawType));` might not hold true for wildcards, leading to incorrect type resolution.
+
+2. **Modify the Method**:
+   - Instead of directly using `supertype`, consider the actual generic type that should be used during deserialization.
+   - When dealing with wildcards (`? extends T`), we need to extract the upper bound and use that as the target type for resolution.
+
+3. **Implement the Fix**:
+   - Use `$Gson$Types.getUpperBound` to handle cases where the type is a wildcard.
+   - This ensures that even if the type is a wildcard, we get the correct upper bound for resolving the generic type.
+
+Here's the corrected code:
+
+```java
+static Type getSupertype(Type context, Class<?> contextRawType, Class<?> supertype) {
+    // Handle wildcards by extracting the upper bound
+    Type upperBound = $Gson$Types.getUpperBound(context, contextRawType, supertype);
+    // Check if the upper bound is assignable from the contextRawType
+    checkArgument(upperBound != null && ((Class<?>) upperBound).isAssignableFrom(contextRawType));
+    return resolve(context, contextRawType,
+        $Gson$Types.getGenericSupertype(context, contextRawType, upperBound));
+}
+```
+
+By making these changes, we ensure that the method properly handles wildcard types and resolves their generic information accurately, preventing the `ClassCastException` mentioned earlier.
+</think>
+
+To address the issue with Gson incorrectly handling wildcard types such as `? extends List<SmallClass>` during deserialization, let’s break down what needs to change and why the current implementation is flawed.
+
+---
+
+### 🔍 **Problem Summary**
+
+When deserializing a JSON into a field of type `Map<String, ? extends List<SmallClass>>`, Gson tries to infer the exact generic type at runtime. However, due to the use of wildcards (`? extends ...`), the reflection system becomes unable to determine the concrete type to instantiate. In doing so, Gson ends up returning a `LinkedHashMap` instead of the expected list of `SmallClass` objects, which leads to a `ClassCastException`.
+
+This is especially problematic when you attempt to access elements inside the map via `.get("key").get(0)` — Gson returns a `LinkedTreeMap` object, not a `List<SmallClass>`, causing the cast failure.
+
+---
+
+### 🛠️ **Root Cause**
+
+In the method responsible for determining the type hierarchy (`getSupertype`), the following line:
+```java
+checkArgument(supertype.isAssignableFrom(contextRawType));
+```
+fails when `supertype` is itself a wildcard. The static typing doesn't account for the dynamic nature of generics involving wildcards, and therefore doesn't assign the correct type.
+
+---
+
+### ✅ **Fix Proposal**
+
+We need to enhance the logic within `getSupertype` to accommodate bounded wildcards more accurately by retrieving their *upper bounds*. That is, when the input type is a wildcard like `? extends List<T>`, we must first obtain the `List<T>` type to continue processing.
+
+Here’s the updated version of the method:
+
+```java
+static Type getSupertype(Type context, Class<?> contextRawType, Class<?> supertype) {
+    // Extract the upper bound of any wildcard type
+    Type upperBound = $Gson$Types.getUpperBound(context, contextRawType, supertype);
+    
+    // Ensure the upper bound is valid and can be assigned from the context class
+    if (upperBound == null || !((Class<?>) upperBound).isAssignableFrom(contextRawType)) {
+        throw new IllegalArgumentException("Cannot resolve supertype: " + supertype.getSimpleName());
+    }
+
+    return resolve(context, contextRawType, 
+        $Gson$Types.getGenericSupertype(context, contextRawType, upperBound));
+}
+```
+
+---
+
+### 🧠 Why This Works
+
+- **Handling Wildcards Correctly**: Using `$Gson$Types.getUpperBound()` allows us to identify the actual list type associated with a wildcard. For example, `? extends List<SmallClass>` would yield `List<SmallClass>`.
+- **Validating Assignment**: Ensures we're only working with compatible types, avoiding invalid type assignments that lead to `ClassCastException`.
+- **Maintaining Flexibility**: Preserves Gson’s ability to manage multiple generic forms while being robust against wildcard misinterpretations.
+
+---
+
+### ✅ Summary
+
+Updating the `getSupertype` function to extract and validate the upper bound of wildcard types makes Gson

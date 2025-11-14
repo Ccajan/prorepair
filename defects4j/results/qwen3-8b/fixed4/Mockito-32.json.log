@@ -1,0 +1,185 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Mockito can't create mock on public class that extends package-private class
+I created simple project to demonstrate this:
+https://github.com/astafev/mockito-package-private-class/
+
+Please take a look. Even if it can't be implemented, I think that mockito should throw some normal exception at time of creation.
+In my variant on first creation it returns wrong-working mock (invokes real method instead of stubbed). On second creation throws exception that doesn't really connected with problem.
+
+Everything works fine if you mock package-private parent.
+
+This is an incorrect Java code (src/org/mockito/internal/configuration/SpyAnnotationEngine.java):
+```java
+@SuppressWarnings("deprecation")
+    public void process(Class<?> context, Object testClass) {
+        Field[] fields = context.getDeclaredFields();
+        for (Field field : fields) {
+            if (field.isAnnotationPresent(Spy.class)) {
+                assertNoAnnotations(Spy.class, field, Mock.class, org.mockito.MockitoAnnotations.Mock.class, Captor.class);
+                boolean wasAccessible = field.isAccessible();
+                field.setAccessible(true);
+                try {
+                    Object instance = field.get(testClass);
+                    if (instance == null) {
+                        throw new MockitoException("Cannot create a @Spy for '" + field.getName() + "' field because the *instance* is missing\n" +
+                        		  "The instance must be created *before* initMocks();\n" +
+                                  "Example of correct usage of @Spy:\n" +
+                            	  "   @Spy List mock = new LinkedList();\n" +
+                            	  "   //also, don't forget about MockitoAnnotations.initMocks();");
+
+                    }
+                    if (new MockUtil().isMock(instance)) { 
+                        // instance has been spied earlier
+                        Mockito.reset(instance);
+                    } else {
+                        field.set(testClass, Mockito.spy(instance));
+                    }
+                } catch (IllegalAccessException e) {
+                    throw new MockitoException("Problems initiating spied field " + field.getName(), e);
+                } finally {
+                    field.setAccessible(wasAccessible);
+                }
+            }
+        }
+    }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+You're absolutely right — **this is a critical issue in Mockito** when dealing with **package-private (default access)** classes and their subclasses. The root of the problem lies in how Mockito handles mocking and spying of fields during initialization, especially when accessibility isn't properly managed due to access modifiers.
+
+---
+
+## ✅ Summary of the Problem
+
+- When `@Spy` is used on a **field**, Mockito tries to initialize it using `Mockito.spy()` or by calling the constructor.
+- If the **parent class is package-private**, and the **child class is public**, Mockito may not correctly handle the **accessibility** of the constructor or the mocked object.
+- This leads to two possible issues:
+  1. It returns a **non-stubbed object** (calls actual methods).
+  2. Later, it throws unrelated exceptions like `"Cannot create a @Spy..."`.
+
+---
+
+## 🔧 Fix Strategy
+
+### 📌 Key Fixes Required:
+
+1. **Ensure field accessibility** before attempting to create/spy objects.
+2. **Check if the field's type (the target class)** is accessible via reflection (i.e., whether it’s public).
+3. **Handle cases where the type is not publicly accessible** correctly, such as throwing a clear error message.
+4. **Avoid creating mocks of non-public types unless explicitly allowed** (e.g., via `mockito-core`'s configuration).
+
+---
+
+## ✅ Fixed Code
+
+Here's a revised version of your problematic method from `SpyAnnotationEngine.java`:
+
+```java
+import java.lang.reflect.Field;
+import org.mockito.exceptions.base.MockitoException;
+import org.mockito.internal.util.MockitoUtil;
+
+public class SpyAnnotationEngine {
+
+    @SuppressWarnings("deprecation")
+    public void process(Class<?> context, Object testClass) {
+        Field[] fields = context.getDeclaredFields();
+        for (Field field : fields) {
+            if (field.isAnnotationPresent(Spy.class)) {
+                assertNoAnnotations(field, Spy.class);
+
+                boolean wasAccessible = field.isAccessible();
+                field.setAccessible(true);
+
+                try {
+                    Object instance = field.get(testClass);
+                    if (instance == null) {
+                        throw new MockitoException(
+                            String.format(
+                                "Cannot create a @Spy for '%s' field because the *instance* is missing.\n" +
+                                "The instance must be created *before* initMocks();\n" +
+                                "Example of correct usage of @Spy:\n" +
+                                "   @Spy List mock = new LinkedList();\n" +
+                                "   // also, don't forget about MockitoAnnotations.initMocks();"
+                            ),
+                            field.getName()
+                        );
+                    }
+
+                    Class<?> targetType = field.getType();
+
+                    // Check if targetType is accessible (public)
+                    if (!Modifier.isPublic(targetType.getModifiers())) {
+                        throw new MockitoException(
+                            String.format(
+                                "Cannot create a @Spy for field %s with type %s because it's not public.",
+                                field.getName(),
+                                targetType.getSimpleName()
+                            )
+                        );
+                    }
+
+                    if (MockitoUtil.isMock(instance)) {
+                        // If already mocked, reset it
+                        Mockito.reset(instance);
+                    } else {
+                        // Create a spy of the existing instance
+                        field.set(testClass, Mockito.spy(instance));
+                    }
+                } catch (IllegalAccessException e) {
+                    throw new MockitoException(
+                        String.format(
+                            "Problems initiating spied field %s",
+                            field.getName()
+                        ), e
+                    );
+                } finally {
+                    field.setAccessible(wasAccessible);
+                }
+            }
+        }
+    }
+
+    private static void assertNoAnnotations(Field field, Class<? extends Annotation> annotationClass) {
+        if (field.isAnnotationPresent(annotationClass)) {
+            throw new MockitoException("Invalid use of @Spy: Cannot apply @Spy to a field that is already annotated with @Mock");
+        }
+    }
+}
+```
+
+---
+
+## ✅ Additional Improvements
+
+1. **Use `java.lang.reflect.Modifier`** to check for `public` modifier of the type.
+2. **Explicitly reject non-public classes** as targets for `@Spy`, providing a meaningful error message.
+3. **Refactor helper methods** for clarity and maintainability.
+
+---
+
+## ⚠️ Note
+
+If you're encountering the issue even with **public types**, then there might be deeper problems, such as:
+- The class being loaded improperly.
+- Inheritance issues between the parent (package-private) and child (public).
+- Use of internal APIs which are not designed to be mocked directly.
+
+For more robust behavior, consider using:
+- `@InjectMocks` with a builder pattern or dependency injection.
+- `@Mock` only on public fields.
+- Ensure the base class is either public or has proper visibility modifiers.
+
+---
+
+## ✅ Final Thoughts
+
+This fix improves reliability and clarity by ensuring that `@Spy` can only be applied to **public classes**, and provides better diagnostics in case something goes wrong. Mockito can still handle this scenario, but it requires clearer constraints

@@ -1,0 +1,140 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# #90 DateTimeZone.getOffsetFromLocal error during DST transition
+This may be a failure of my understanding, but the comments in DateTimeZone.getOffsetFromLocal lead me to believe that if an ambiguous local time is given, the offset corresponding to the later of the two possible UTC instants will be returned - i.e. the greater offset.
+This doesn't appear to tally with my experience. In fall 2009, America/Los_Angeles changed from -7 to -8 at 2am wall time on November 11. Thus 2am became 1am - so 1:30am is ambiguous. I would therefore expect that constructing a DateTime for November 11th, 1:30am would give an instant corresponding with the later value (i.e. 9:30am UTC). This appears not to be the case:
+import org.joda.time.DateTime;
+import org.joda.time.DateTimeZone;
+public class TzTest {
+public static void main(String[] args) throws Exception {
+DateTimeZone zone = DateTimeZone.forID("America/Los_Angeles");
+DateTime when1 = new DateTime(2009, 11, 1, 0, 30, 0, 0, zone);
+DateTime when2 = new DateTime(2009, 11, 1, 1, 30, 0, 0, zone);
+DateTime when3 = new DateTime(2009, 11, 1, 2, 30, 0, 0, zone);
+System.out.println(when1);
+System.out.println(when2);
+System.out.println(when3);
+}
+}
+Results:
+2009-11-01T00:30:00.000-07:00 // Correct
+2009-11-01T01:30:00.000-07:00 // Should be -08:00
+2009-11-01T02:30:00.000-08:00 // Correct
+This is an incorrect Java code (src/main/java/org/joda/time/DateTimeZone.java):
+```java
+public int getOffsetFromLocal(long instantLocal) {
+    // get the offset at instantLocal (first estimate)
+    final int offsetLocal = getOffset(instantLocal);
+    // adjust instantLocal using the estimate and recalc the offset
+    final long instantAdjusted = instantLocal - offsetLocal;
+    final int offsetAdjusted = getOffset(instantAdjusted);
+    // if the offsets differ, we must be near a DST boundary
+    if (offsetLocal != offsetAdjusted) {
+        // we need to ensure that time is always after the DST gap
+        // this happens naturally for positive offsets, but not for negative
+        if ((offsetLocal - offsetAdjusted) < 0) {
+            // if we just return offsetAdjusted then the time is pushed
+            // back before the transition, whereas it should be
+            // on or after the transition
+            long nextLocal = nextTransition(instantAdjusted);
+            long nextAdjusted = nextTransition(instantLocal - offsetAdjusted);
+            if (nextLocal != nextAdjusted) {
+                return offsetLocal;
+            }
+        }
+    }
+    return offsetAdjusted;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+package org.joda.time;
+
+import java.util.TimeZone;
+import org.joda.time.format.DateTimeFormat;
+import org.joda.time.format.DateTimeFormatter;
+
+
+/**
+ * A strict interpretation of what should be happening.
+ * There's some conflicting information out there about how to handle these times,
+ * I've chosen to follow the principle that it is better to push forward the time
+ * rather than adjusting backwards, as seems more common.
+ */
+public class MyTimeZone extends DateTimeZone {
+
+    public MyTimeZone(final String id) {
+        super(id);
+    }
+
+    @Override
+    public int getOffsetFromLocal(long instantLocal) {
+        // Get the offset at instantLocal (first estimate)
+        int offsetLocal = super.getOffset(instantLocal);
+
+        // Adjust the instant to avoid ambiguity due to DST transitions
+        long adjustedInstant = adjustInstantForDST(instantLocal, offsetLocal);
+
+        // Recalculate the offset for the adjusted instant
+        int offsetAdjusted = super.getOffset(adjustedInstant);
+
+        // If the offsets differ, we're at a DST transition point
+        if (offsetLocal != offsetAdjusted) {
+            // Calculate the time of the next DST transition
+            long nextTransitionTime = nextTransition(instantLocal);
+
+            // Check if we are at the last moment before the DST transition
+            if (instantLocal == nextTransitionTime - 1) {
+                // Return the original offset since we're right on the line between the two
+                return offsetLocal;
+            } else {
+                // We're either after the transition or right on the line; return the adjusted offset
+                return offsetAdjusted;
+            }
+        }
+
+        // If no DST adjustment was needed, return the original offset
+        return offsetLocal;
+    }
+
+    /**
+     * Adjusts the given instant to avoid ambiguity due to DST transitions.
+     *
+     * @param instant  The instant in question.
+     * @param baseOffset The initial offset at the given instant.
+     * @return An adjusted instant that avoids DST transition ambiguities.
+     */
+    private long adjustInstantForDST(long instant, int baseOffset) {
+        TimeZone tz = getTimeZone();
+        boolean isDst = tz.inDaylightTime(new java.util.Date(instant));
+        int dstOffset = isDst ? tz.getRawOffset() + tz.getDSTSavings() : tz.getRawOffset();
+
+        // Avoid pushing time backward due to daylight saving changes
+        if (baseOffset > dstOffset) {
+            return instant + Math.abs(baseOffset - dstOffset);
+        } else {
+            return instant - Math.abs(dstOffset - baseOffset);
+        }
+    }
+}
+
+class MainClass{
+    public static void main(String[] args) throws Exception {
+        DateTimeZone.setDefault(new MyTimeZone("America/Los_Angeles"));
+        
+        DateTime when1 = new DateTime(2009, 11, 1, 0, 30, 0, 0);
+        DateTime when2 = new DateTime(2009, 11, 1, 1, 30, 0, 0);
+        DateTime when3 = new DateTime(2009, 11, 1, 2, 30, 0, 0);
+        
+        System.out.println(when1);
+        System.out.println(when2);
+        System.out.println(when3);
+    }
+}
+```
+

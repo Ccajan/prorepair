@@ -1,0 +1,162 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Annotation bundles ignored when added to Mixin
+When updating from v 2.4.4 to 2.5.* it appears as though annotation bundles created with @JacksonAnnotationsInside are ignored when placed on a mixin.  Moving the annotation bundel to the actual class seems to resolve the issue.  Below is a simple test that attempts to rename a property.  I have more complicated test cases that are also failing but this should provide some context.
+public class Fun {
+
+    @Test
+    public void test() throws JsonProcessingException {
+        ObjectMapper mapper = new ObjectMapper().addMixIn(Foo.class, FooMixin.class);
+        String result = mapper.writeValueAsString(new Foo("result"));
+        Assert.assertEquals("{\"bar\":\"result\"}", result);
+    }
+
+    @Target(value={ ElementType.CONSTRUCTOR, ElementType.FIELD, ElementType.METHOD })
+    @Retention(value=RetentionPolicy.RUNTIME)
+    @JacksonAnnotationsInside
+    @JsonProperty("bar")
+    public @interface ExposeStuff {
+
+    }
+
+    public abstract class FooMixin {
+        @ExposeStuff
+        public abstract String getStuff();
+    }
+
+    public class Foo {
+
+        private String stuff;
+
+        Foo(String stuff) {
+            this.stuff = stuff;
+        }
+
+        public String getStuff() {
+            return stuff;
+        }
+    }
+}
+I'm expecting the "stuff" property to be serialized as "bar".
+I apologize I haven't been able to identify the culprit (and perhaps it's in my usage).  Let me know your thoughts. I'm always happy to provide more details!
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/introspect/AnnotationMap.java):
+```java
+protected final boolean _add(Annotation ann) {
+    if (_annotations == null) {
+        _annotations = new HashMap<Class<? extends Annotation>,Annotation>();
+    }
+    Annotation previous = _annotations.put(ann.annotationType(), ann);
+    return (previous != null) && previous.equals(ann);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+protected final boolean _add(Annotation ann) {
+    if (_annotations == null) {
+        _annotations = new HashMap<>();
+    }
+    // Check if the annotation type already exists and if the existing one is the same as the new one
+    Annotation previous = _annotations.get(ann.annotationType());
+    if (previous != null) {
+        // If the existing annotation is not the same as the new one, replace it
+        if (!previous.equals(ann)) {
+            _annotations.put(ann.annotationType(), ann);
+            return true; // Indicates that the annotation was replaced
+        }
+        return false; // No change since they are the same
+    } else {
+        _annotations.put(ann.annotationType(), ann);
+        return true; // Indicates that the annotation was added
+    }
+}
+```
+
+The error is due to using `HashMap<Class<? extends Annotation>, Annotation>` which could lead to unexpected behavior when dealing with annotations. The key is of type `Class<? extends Annotation>`, which may not correctly represent the actual annotation type when working with mixins or other dynamic scenarios.
+
+The fix involves:
+1. Using a `HashMap` without explicitly specifying the generic types to allow for better type inference.
+2. Checking whether the existing annotation is different before replacing it, ensuring we only update when there's a difference.
+3. Returning appropriate values based on whether the annotation was added or replaced.
+
+By making these changes, the `_add` method will correctly handle adding and replacing annotations, including those defined within mixin classes, thereby resolving the issue described in the question.
+</think>
+
+Your issue stems from a subtle problem in how Jackson handles annotations on mix-in classes, especially when combined with `@JacksonAnnotationsInside`. The core of the problem lies in how the internal `_add` method in `AnnotationMap.java` interacts with annotation handling during deserialization and serialization.
+
+---
+
+### 🔍 Root Cause:
+
+The original `_add` method had this structure:
+```java
+protected final boolean _add(Annotation ann) {
+    if (_annotations == null) {
+        _annotations = new HashMap<Class<? extends Annotation>, Annotation>();
+    }
+    Annotation previous = _annotations.put(ann.annotationType(), ann);
+    return (previous != null) && previous.equals(ann);
+}
+```
+
+Here’s what goes wrong:
+- It uses a `HashMap<Class<? extends Annotation>, Annotation>` as the backing map.
+- This approach can misbehave when trying to differentiate between **different instances** of the **same annotation type**, particularly when mixed with **annotation bundling** (`@JacksonAnnotationsInside`) and **mixins**.
+- When two identical annotations (e.g., from different sources, like mix-ins and the actual class) are attempted to be added, the old value isn’t replaced unless the objects match exactly — a behavior that can break expected logic during reflection-based processing (like JSON serialization).
+
+---
+
+### ✅ Solution: Fixing `_add` Method
+
+We need to make several key adjustments to ensure the `_add` method behaves predictably under all circumstances:
+
+#### ✅ Improved Version of `_add`:
+
+```java
+protected final boolean _add(Annotation ann) {
+    if (_annotations == null) {
+        _annotations = new HashMap<>(); // Use raw type to avoid issues
+    }
+
+    Class<? extends Annotation> annoType = ann.annotationType();
+
+    // Check if annotation of this type already exists
+    Annotation previous = _annotations.get(annoType);
+
+    if (previous != null) {
+        // Only replace if the current annotation is NOT the same as the stored one
+        if (!previous.equals(ann)) {
+            _annotations.put(annoType, ann);
+            return true; // Annotation was replaced
+        }
+        return false; // No replacement needed
+    } else {
+        _annotations.put(annoType, ann);
+        return true; // Annotation was added
+    }
+}
+```
+
+---
+
+### 🧠 Why This Fix Works
+
+1. **Avoids Type Inference Problems**: By using a raw-type `HashMap`, we sidestep potential confusion around generics and improve compatibility with various reflection paths (including mix-in annotations).
+   
+2. **Respects Equality Semantics**: We compare annotations using `.equals()` instead of relying on object identity, which aligns with standard Java semantics and ensures correct behavioral consistency across platforms (including mixins vs direct annotations).
+
+3. **Ensures Consistent Behavior**: Whether annotations come from a class, a mix-in, or bundled via `@JacksonAnnotationsInside`, the updated `_add` ensures each is properly accounted for and processed correctly during serialization/deserialization.
+
+---
+
+### 💡 Additional Recommendations
+
+If you're still encountering problems with mix-in annotations or `@JacksonAnnotationsInside`, consider the following best practices:
+
+- **Validate Mixing Logic**: Ensure your mix-in class is being correctly applied. Verify that your `ObjectMapper` instance includes it via `addMixIn()` or similar methods.
+  
+- **Use Explicit Annotations**: Avoid over-reliance on `@JacksonAnnotationsInside` when possible,

@@ -1,0 +1,205 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Resetting the default namespace causes a serious endless loop when requesting .asPath() on a node.
+sample smaller case:
+
+<...>
+ <b:foo xmlns:b="bla" xmlns="test111">    <!--  No nodes are placed in the tree within ns "test111" but the attribute is still there.-->
+  <b:bar>a</b:bar>                         <!-- is in ns 'bla' -->
+  <test xmlns=""></test>                   <!-- does not have a namespace -->
+ </b:foo>
+</...>
+
+when requesting .asPath() on the 'test' node, it loops in org.apache.commons.jxpath.ri.NamespaceResolver.getPrefix(NodePointer, String), 
+and if it didn't loop it would create a wrong xpath '//b:fo/null:test' DOMNodePointer.asPath().
+So I think that the fix should be in org.apache.commons.jxpath.ri.model.dom.DOMNodePointer.asPath()
+
+....
+                    String ln = DOMNodePointer.getLocalName(node);
+                    String nsURI = getNamespaceURI();
+                    if (nsURI == null) {
+                        buffer.append(ln);
+                        buffer.append('[');
+                        buffer.append(getRelativePositionByName()).append(']');
+                    }
+                    else {
+                        String prefix = getNamespaceResolver().getPrefix(nsURI);
+                        if (prefix != null) {
+...
+
+should become
+
+...
+                    String ln = DOMNodePointer.getLocalName(node);
+                    String nsURI = getNamespaceURI();
+                    if (nsURI == null || nsURI.length() == 0) { // check for empty string which means that the node doesn't have a namespace.
+                        buffer.append(ln);
+                        buffer.append('[');
+                        buffer.append(getRelativePositionByName()).append(']');
+                    }
+                    else {
+                        String prefix = getNamespaceResolver().getPrefix(nsURI);
+                        if (prefix != null) {
+...
+This is an incorrect Java code (src/java/org/apache/commons/jxpath/ri/model/dom/DOMNodePointer.java):
+```java
+public static String getNamespaceURI(Node node) {
+    if (node instanceof Document) {
+        node = ((Document) node).getDocumentElement();
+    }
+
+    Element element = (Element) node;
+
+    String uri = element.getNamespaceURI();
+    if (uri == null) {
+        String prefix = getPrefix(node);
+        String qname = prefix == null ? "xmlns" : "xmlns:" + prefix;
+
+        Node aNode = node;
+        while (aNode != null) {
+            if (aNode.getNodeType() == Node.ELEMENT_NODE) {
+                Attr attr = ((Element) aNode).getAttributeNode(qname);
+                if (attr != null) {
+                    return attr.getValue();
+                }
+            }
+            aNode = aNode.getParentNode();
+        }
+        return null;
+    }
+    return uri;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public static String getNamespaceURI(Node node) {
+    if (node instanceof Document) {
+        node = ((Document) node).getDocumentElement();
+    }
+
+    if (node.getNodeType() != Node.ELEMENT_NODE) {
+        return null; // Or handle as appropriate
+    }
+
+    Element element = (Element) node;
+
+    String uri = element.getNamespaceURI();
+    if (uri == null) {
+        String prefix = getPrefix(node);
+        String qname = prefix == null ? "xmlns" : "xmlns:" + prefix;
+
+        Node aNode = node;
+        while (aNode != null) {
+            if (aNode.getNodeType() == Node.ELEMENT_NODE) {
+                Attr attr = ((Element) aNode).getAttributeNode(qname);
+                if (attr != null) {
+                    return attr.getValue();
+                }
+            }
+            aNode = aNode.getParentNode();
+        }
+        return null;
+    }
+    return uri;
+}
+```
+
+The problem here is that `element` could be a non-element node, such as a text node or comment node, and trying to cast it to an `Element` will cause a `ClassCastException`. The original code checks if the node is an instance of `Document`, then casts it to an `Element`, which is incorrect.
+
+In the repaired code, we first check if the node is an `ELEMENT_NODE`, and only then proceed to cast it to an `Element`. This prevents the `ClassCastException` and ensures that we're working with actual elements when retrieving their namespace URI.
+</think>
+
+To address the issue where calling `.asPath()` on a node results in an infinite loop due to improper handling of namespaces—specifically when a node has an empty or unspecified namespace—we need to ensure that both the logic for computing the XPath path and the namespace resolution methods correctly handle these edge cases.
+
+---
+
+### ✅ **Root Cause Analysis**
+
+1. **Incorrect Namespace Handling**:
+   - In certain XML documents, the `xmlns` declaration may be missing for a node’s namespace, yet the `namespaceURI` can still be set to an empty string (`""`). This leads to ambiguous namespace resolution during XPath generation.
+
+2. **XPath Path Construction**:
+   - If the method fails to detect that the namespace URI is an empty string, it defaults to using prefixes that don’t exist, leading to:
+     - Infinite recursion or logical errors in resolving the correct path.
+     - Incorrectly formed XPath expressions like `'//b:foo/null:test'`.
+
+3. **Issue in `DOMNodePointer.getNamespaceURI()`**:
+   - The function attempts to find the namespace URI but doesn't properly distinguish between an undefined namespace (`null`) and an explicitly declared empty one (`""`).
+   - It also assumes the node is always an `Element`, which is not guaranteed in all contexts.
+
+---
+
+### ✅ **Fix Summary**
+
+We'll improve two core areas:
+- Fix the `getNamespaceURI(Node)` method so it behaves consistently and safely across different types of nodes.
+- Ensure that the `.asPath()` method handles `""` as a valid (but default) namespace.
+
+---
+
+## 🔧 Fixed Code Implementation
+
+Here's the corrected version of `getNamespaceURI(Node)` and related logic to prevent infinite loops and malformed paths.
+
+```java
+/**
+ * Returns the namespace URI of a given node.
+ *
+ * @param node the node whose namespace URI is needed
+ * @return the namespace URI or null if unknown
+ */
+public static String getNamespaceURI(Node node) {
+    // Handle document root element
+    if (node instanceof Document) {
+        node = ((Document) node).getDocumentElement();
+    }
+
+    // Only process element nodes
+    if (node.getNodeType() != Node.ELEMENT_NODE) {
+        return null; // Not an element node – no namespace URI to retrieve
+    }
+
+    Element element = (Element) node;
+
+    // First try to get the namespace URI directly from the element
+    String uri = element.getNamespaceURI();
+
+    // If it's not provided, look up via declared attributes
+    if (uri == null) {
+        String prefix = getPrefix(node); // e.g., "x", "y", etc.
+        String qname = (prefix == null) ? "xmlns" : "xmlns:" + prefix;
+
+        Node parent = node.getParentNode();
+        Node current = parent;
+
+        while (current != null) {
+            if (current.getNodeType() == Node.ELEMENT_NODE) {
+                Attr attr = ((Element) current).getAttributeNode(qname);
+                if (attr != null) {
+                    return attr.getValue(); // Return the value of the namespace attribute
+                }
+            }
+            current = current.getParentNode();
+        }
+        return null;
+    } else if (uri.isEmpty()) {
+        // Empty URI indicates no namespace was defined
+        return null;
+    }
+
+    return uri;
+}
+```
+
+---
+
+## 📌 Key Fixes Applied
+
+| Issue | Fix |
+|------|-----|
+| `node`

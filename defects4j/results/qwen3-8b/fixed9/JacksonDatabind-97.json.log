@@ -1,0 +1,178 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Context attributes are not passed/available to custom serializer if object is in POJO
+Below is a test case where I create a custom serializer and use it to serialize an object 1) in a HashMap and 2) in an ObjectNode. In both cases I pass attribute to the serializer like this:
+mapper.writer().withAttribute("myAttr", "Hello!")
+Serializing HashMap works as expected, but during ObjectNode serialization the attribute is null . It seems that in both cases the custom serializer should get access to the passed attribute and so both lines in the output should contain "Hello!"
+Produced output from running testCase.test()
+{"data":{"aStr":"The value is: Hello!"}}
+{"data":{"aStr":"The value is: NULL"}}
+
+Test case:
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializerProvider;
+import com.fasterxml.jackson.databind.annotation.JsonSerialize;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.fasterxml.jackson.databind.ser.std.StdSerializer;
+
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
+
+public class TestCase {
+  public final static ObjectMapper mapper = new ObjectMapper();
+
+  @JsonSerialize(using = TestCase.CustomSer.class)
+  public static class Data {
+    public String aStr;
+  }
+
+  public static class CustomSer extends StdSerializer<Data> {
+    public CustomSer() {
+      super(Data.class);
+    }
+
+    @Override
+    public void serialize(Data value, JsonGenerator gen, SerializerProvider provider) throws IOException {
+      String attrStr = (String) provider.getAttribute("myAttr");
+      gen.writeStartObject();
+      gen.writeObjectField("aStr", "The value is: " + (attrStr == null ? "NULL" : attrStr));
+      gen.writeEndObject();
+    }
+  }
+
+  public static void test() throws IOException {
+    Data data = new Data();
+    data.aStr = "Hello";
+
+    Map<String, Object> mapTest = new HashMap<>();
+    mapTest.put("data", data);
+
+    ObjectNode treeTest = mapper.createObjectNode();
+    treeTest.putPOJO("data", data);
+
+    String mapOut = mapper.writer().withAttribute("myAttr", "Hello!").writeValueAsString(mapTest);
+    System.out.println(mapOut);
+
+    String treeOut = mapper.writer().withAttribute("myAttr", "Hello!").writeValueAsString(treeTest);
+    System.out.println(treeOut);
+  }
+}
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/node/POJONode.java):
+```java
+public final void serialize(JsonGenerator gen, SerializerProvider ctxt) throws IOException
+{
+    if (_value == null) {
+        ctxt.defaultSerializeNull(gen);
+    } else if (_value instanceof JsonSerializable) {
+        ((JsonSerializable) _value).serialize(gen, ctxt);
+    } else {
+        // 25-May-2018, tatu: [databind#1991] do not call via generator but through context;
+        //    this to preserve contextual information
+        gen.writeObject(_value);
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public final void serialize(JsonGenerator gen, SerializerProvider ctxt) throws IOException
+{
+    if (_value == null) {
+        ctxt.defaultSerializeNull(gen);
+    } else if (_value instanceof JsonSerializable) {
+        ((JsonSerializable) _value).serialize(gen, ctxt);
+    } else {
+        // 25-May-2018, taru: [databind#1991] do not call via generator but through context;
+        //    this to preserve contextual information
+        // Call the serializer for the value with the current context
+        ctxt.findAndRegister_serializer(_value.getClass(), true).serialize(_value, gen, ctxt);
+    }
+}
+```
+
+In the original code, when serializing non-serializable objects, it directly calls `gen.writeObject()` which does not pass along any context attributes. This results in lost attributes when using custom serializers.
+
+The repaired version uses `ctxt.findAndRegister_serializer(...).serialize(...)`, which ensures that the custom serializer for the object's type is used and has access to the context attributes set via `withAttribute()`.
+
+This change preserves the contextual information needed for proper serialization of custom types.
+</think>
+
+To resolve the issue where **context attributes** such as those set via `writer().withAttribute("myAttr", "Hello!")` are **not available** when serializing certain objects — specifically, when using `ObjectNode.putPOJO(...)` — we need to ensure that the **serializer chain respects context attributes** even when a different approach than direct `writeObject()` is used.
+
+---
+
+### 🧠 Problem Analysis:
+
+In your provided code, the key line causing the problem was:
+
+```java
+gen.writeObject(_value);
+```
+
+This method skips passing the current context (`SerializerProvider`) that contains user-set attributes like `"myAttr"`.
+
+The `ObjectNode.serialize(...)` method uses `gen.writeObject(...)` on non-serializable values, which bypasses the contextual attribute propagation — **even though a custom serializer exists for that class**.
+
+So, even though `Data` is marked with `@JsonSerialize(using = CustomSer.class)`, that serializer is never used due to the call to `gen.writeObject()`.
+
+---
+
+### ✅ Solution:
+
+We can fix this behavior by **ensuring that even when the object is added as a POJO**, its **custom serializer is invoked**, and the **current `SerializerProvider` is correctly propagated**, including all context attributes.
+
+The correct way to do this is by calling:
+
+```java
+ctxt.findAndRegister_serializer(value.getClass(), true).serialize(value, gen, ctxt);
+```
+
+This explicitly ensures:
+- The **correct serializer** for the given object class is found,
+- And that the **serializer receives the full context**, including any attributes set via `.withAttribute()`.
+
+---
+
+### 🔧 Corrected Code
+
+Replace the problematic section of the `_value` handling with:
+
+```java
+else {
+    // Ensure the custom serializer is used and has access to context attributes
+    ctxt.findAndRegister_serializer(_value.getClass(), true).serialize(_value, gen, ctxt);
+}
+```
+
+Complete updated block:
+
+```java
+public final void serialize(JsonGenerator gen, SerializerProvider ctxt) throws IOException
+{
+    if (_value == null) {
+        ctxt.defaultSerializeNull(gen);
+    } else if (_value instanceof JsonSerializable) {
+        ((JsonSerializable) _value).serialize(gen, ctxt);
+    } else {
+        // Use the registered serializer for the object's class, ensuring it gets the full context
+        ctxt.findAndRegister_serializer(_value.getClass(), true).serialize(_value, gen, ctxt);
+    }
+}
+```
+
+---
+
+### 📌 Summary
+
+By switching from `gen.writeObject(...)` to `ctxt.findAndRegister_serializer(...).serialize(...)`, we ensure that:
+- The correct custom serializer is used.
+- All **contextual attributes**, like `withAttribute("myAttr", ...)` are preserved and accessible during serialization.
+- The same consistent behavior occurs whether the object is inside a `HashMap`, `ObjectNode`, or another structure.
+
+This change maintains compatibility and guarantees predictable JSON serialization outcomes across various structures, especially when dealing with custom serializers.

@@ -1,0 +1,172 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Optional argument picking up next regular option as its argument
+I'm not sure if this is a complete fix.  It seems to miss the case where short options are concatenated after an option that takes an optional argument.
+
+A failing test case for this would be to modify {{setUp()}} in BugCLI265Test.java to include short options "a" and "b":
+
+{code:java}
+    @Before
+    public void setUp() throws Exception {
+        parser = new DefaultParser();
+
+        Option TYPE1 = Option.builder("t1").hasArg().numberOfArgs(1).optionalArg(true).argName("t1_path").build();
+        Option OPTION_A = Option.builder("a").hasArg(false).build();
+        Option OPTION_B = Option.builder("b").hasArg(false).build();
+        Option LAST = Option.builder("last").hasArg(false).build();
+
+        options = new Options().addOption(TYPE1).addOption(OPTION_A).addOption(OPTION_B).addOption(LAST);
+    }
+{code}
+
+Add add a test for the concatenated options following an option with optional argument case:
+
+{code:java}
+    @Test
+    public void shouldParseConcatenatedShortOptions() throws Exception {
+      String[] concatenatedShortOptions = new String[] { "-t1", "-ab" };
+
+      final CommandLine commandLine = parser.parse(options, concatenatedShortOptions);
+
+      assertTrue(commandLine.hasOption("t1"));
+      assertEquals(null, commandLine.getOptionValue("t1"));
+      assertTrue(commandLine.hasOption("a"));
+      assertTrue(commandLine.hasOption("b"));
+      assertFalse(commandLine.hasOption("last"));
+    }
+{code}
+
+One possible fix is to check that at least the first character of the option is a short option if all the other cases fail in {{isShortOption(...)}} like so:
+
+{code:java}
+    private boolean isShortOption(String token)
+    {
+        // short options (-S, -SV, -S=V, -SV1=V2, -S1S2)
+        if (!token.startsWith("-") || token.length() == 1)
+        {
+            return false;
+        }
+
+        // remove leading "-" and "=value"
+        int pos = token.indexOf("=");
+        String optName = pos == -1 ? token.substring(1) : token.substring(1, pos);
+        if (options.hasShortOption(optName))
+        {
+            return true;
+        }
+        return optName.length() > 0 && options.hasShortOption(String.valueOf(optName.charAt(0)));
+    }
+{code}
+This is an incorrect Java code (src/main/java/org/apache/commons/cli/DefaultParser.java):
+```java
+private boolean isShortOption(String token)
+{
+    // short options (-S, -SV, -S=V, -SV1=V2, -S1S2)
+    return token.startsWith("-") && token.length() >= 2 && options.hasShortOption(token.substring(1, 2));
+
+    // remove leading "-" and "=value"
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+private boolean isShortOption(String token)
+{
+    // Check if the token starts with '-' and has at least one more character
+    if (!token.startsWith("-") || token.length() < 2) {
+        return false;
+    }
+
+    // Remove leading "-" and any "=value" part to get the actual option name
+    int equalsPos = token.indexOf('=');
+    String optName = equalsPos != -1 ? token.substring(1, equalsPos) : token.substring(1);
+
+    // Check if there's a short option matching the first character of the optName
+    if (optName.isEmpty()) {
+        return false;
+    }
+
+    char firstChar = optName.charAt(0);
+    return options.hasShortOption(String.valueOf(firstChar));
+}
+```
+
+The key changes I made:
+
+1. Fixed the initial condition to check both that the token starts with '-' and has at least two characters
+2. Added proper handling for the "=" value assignment syntax
+3. Made sure we always look for the short option corresponding to the first character of the parsed option name
+4. Added a check to ensure we don't try to access the first character of an empty string
+
+This should handle cases like "-t1-ab" where the optional argument for "t1" is being used, and then the subsequent "-ab" short options are properly recognized.
+</think>
+
+To address the issue of parsing concatenated short options correctly, particularly when an optional argument follows an option with a short flag, we need to improve the `isShortOption` method in the `DefaultParser` class. 
+
+---
+
+### 🔍 **Understanding the Problem**
+
+The current implementation assumes that every option must start directly with a known short option and fails when a short option comes after an optional argument or a longer parameter. For example:
+
+- In a command line like `-t1-ab`, the parser might misinterpret `-ab` as an invalid combination rather than recognizing it as separate options (`-a` and `-b`).
+
+This is especially problematic in scenarios involving:
+- **Optional arguments** like `-t1` followed by another short option.
+- **Consecutive short options**, e.g., `-ab`.
+
+---
+
+### ✅ **Solution Overview**
+
+We want our `isShortOption` function to:
+1. Validate that the token starts with `-`.
+2. Handle optional argument formats such as `-t1=value`.
+3. Extract the primary short option from the token.
+4. Ensure only valid single-character short options are matched, avoiding ambiguous or unregistered options.
+
+---
+
+### 🛠️ **Revised Code Implementation**
+
+```java
+private boolean isShortOption(String token) {
+    // Verify that the token starts with '-' and has at least one other character
+    if (!token.startsWith("-") || token.length() < 2) {
+        return false;
+    }
+
+    // Extract the option name without the leading '-' and up to the '=' if present
+    int equalsIndex = token.indexOf('=');
+    String optName = equalsIndex != -1 
+                     ? token.substring(1, equalsIndex) 
+                     : token.substring(1);
+
+    // Make sure the option name isn't empty
+    if (optName.isEmpty()) {
+        return false;
+    }
+
+    // Only allow single-character short options
+    char firstChar = optName.charAt(0);
+    return options.hasShortOption(String.valueOf(firstChar));
+}
+```
+
+---
+
+### 🧪 **How This Fixes the Issue**
+
+- The code now handles the scenario where a long option like `-t1` comes before short options like `-ab`.
+- If `-t1` is present, the tokenizer extracts `"t1"` and recognizes that it’s not a valid single short option, but still allows the rest (`-ab`) to be processed as individual short options.
+- This avoids issues related to malformed tokens while preserving support for optional arguments and multiple short options.
+
+---
+
+### ✅ **Conclusion**
+
+By improving how `isShortOption` processes tokens and distinguishes between optional parameters and standalone short flags, we make the CLI parser robust against common edge cases in command-line usage. This change ensures consistency across both simple and complex use cases involving multiple short options.

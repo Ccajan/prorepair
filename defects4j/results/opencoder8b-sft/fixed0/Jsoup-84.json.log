@@ -1,0 +1,161 @@
+<|im_start|>system
+You are OpenCoder, created by OpenCoder Team.<|im_end|>
+<|im_start|>user
+
+# W3CDom Helper fails to convert whenever some namespace declarations are missing
+Hello
+I've been running into an issue where if I convert my Jsoup parsed document into a org.w3c.dom.Document with the W3CDom helper and that document happens to be missing namespace declarations we get the following exception:
+NAMESPACE_ERR: An attempt is made to create or change an object in a way which is incorrect with regard to namespaces.
+
+I've looked into this a bit and first thing I tried was using a locally forked version of the W3CDom helper that simply turned this flag off:
+factory.setNamespaceAware(false);
+
+However the issue continued, so instead I simply hacked the code to completely ignore namespaces
+// (csueiras): We purposely remove any namespace because we get malformed HTML that might not be
+// declaring all of it's namespaces!
+Element el = doc.createElementNS("", sourceEl.tagName());
+
+I am not completely sure if this will have any side effects, but it resolved the issues with the document I'm interacting with. I would be glad to provide a pull request if I have some guidance regarding how to properly handle this issue if it can be handled by Jsoup.
+The document I'm having issues is simply making use of the Facebook like buttons using tags like this:
+<fb:like ...
+
+But there's no namespace declaration for "fb".
+This is an incorrect Java code (src/main/java/org/jsoup/helper/W3CDom.java):
+```java
+public void head(org.jsoup.nodes.Node source, int depth) {
+    namespacesStack.push(new HashMap<>(namespacesStack.peek())); // inherit from above on the stack
+    if (source instanceof org.jsoup.nodes.Element) {
+        org.jsoup.nodes.Element sourceEl = (org.jsoup.nodes.Element) source;
+
+        String prefix = updateNamespaces(sourceEl);
+        String namespace = namespacesStack.peek().get(prefix);
+        String tagName = sourceEl.tagName();
+
+        Element el = 
+            doc.createElementNS(namespace, tagName);
+        copyAttributes(sourceEl, el);
+        if (dest == null) { // sets up the root
+            doc.appendChild(el);
+        } else {
+            dest.appendChild(el);
+        }
+        dest = el; // descend
+    } else if (source instanceof org.jsoup.nodes.TextNode) {
+        org.jsoup.nodes.TextNode sourceText = (org.jsoup.nodes.TextNode) source;
+        Text text = doc.createTextNode(sourceText.getWholeText());
+        dest.appendChild(text);
+    } else if (source instanceof org.jsoup.nodes.Comment) {
+        org.jsoup.nodes.Comment sourceComment = (org.jsoup.nodes.Comment) source;
+        Comment comment = doc.createComment(sourceComment.getData());
+        dest.appendChild(comment);
+    } else if (source instanceof org.jsoup.nodes.DataNode) {
+        org.jsoup.nodes.DataNode sourceData = (org.jsoup.nodes.DataNode) source;
+        Text node = doc.createTextNode(sourceData.getWholeData());
+        dest.appendChild(node);
+    } else {
+        // unhandled
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+import org.jsoup.Jsoup;
+import org.jsoup.nodes.Attribute;
+import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Element;
+import org.jsoup.nodes.Node;
+import org.jsoup.select.Elements;
+import org.w3c.dom.*;
+import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.parsers.ParserConfigurationException;
+import java.io.StringReader;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+public class W3CDomHelper {
+
+    public Document parse(String html)
+    {
+        Document document = Jsoup.parse(html);
+
+        Document domDocument = null;
+        try {
+            domDocument = DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(new InputSource(new StringReader(document.html())));
+            convert(document,domDocument);
+            return domDocument;
+        } catch (ParserConfigurationException e) {
+            throw new RuntimeException(e.getMessage(),e.getCause());
+        } catch (SAXException e) {
+            throw new RuntimeException(e.getMessage(),e.getCause());
+        } catch (IllegalArgumentException e){
+            throw new RuntimeException("Error converting to W3C DOM",e.getCause());
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to create w3c document");
+        }
+    }
+
+    private static void convert(Document srcDoc, Document dstDoc) {
+        Map<String,String> namespc = new HashMap<>();
+        for (String s : srcDoc.namespaces()) {
+            namespc.put(s,srcDoc.namespace(s));
+        }
+        namespc.put("",""); // default xmlns
+        ArrayList<org.jsoup.nodes.Node> nodes = new ArrayList<>(100);
+        nodes.add(srcDoc.child(0).child(0)); // skip over root as it's already added
+        while (!nodes.isEmpty()){
+            org.jsoup.nodes.Node n = nodes.remove(nodes.size()-1);
+            Node d;
+            if (n instanceof org.jsoup.nodes.Document) {
+                continue;
+            }
+            if (n instanceof Element) {
+                Element el = (Element) n;
+                Element newel = dstDoc.createElement(
+                        namespc.containsKey(el.tagName()) ? (namespc.get(el.tagName()) + ":" +  el.tagName()) : el.tagName()
+                );
+                copyAttributes(namespc,el,newel);
+                dstDoc.appendChild(newel); // just to make jslint happy, should always equal dest anyway
+                List<Node> cnodes = new ArrayList<>(el.childNodes());
+                for (int i=cnodes.size()-1;i>=0;i--) {
+                    nodes.add(cnodes.get(i));
+                }
+            }
+            else {
+                d = dstDoc.createTextNode(n.text());
+                nodes.remove(nodes.size()-1);
+            }
+            if (n.nextSibling()!=null){
+                nodes.add(n.nextSibling());
+            }
+        }
+    }
+
+    private static void copyAttributes(Map<String,String> namespc, Element source, Element dest) {
+        for (Attribute attr : source.attributes()) {
+            boolean setNamespace = true;
+            String key = attr.getKey();
+            if ("xmlns".equals(key)){
+                setNamespace = false;
+            }
+            dest.setAttributeNS(setNamespace && namespc.containsKey(attr.value()) ? (namespc.get(attr.value())+":"+key):"",(setNamespace?"xmlns:":"")+attr.key(),attr.value());
+        }
+    }
+}
+
+// Test cases
+class TestW3CDomHelper {
+    public static void main(String[] args) {
+        W3CDomHelper helper = new W3CDomHelper();
+        Document doc = helper.parse("<html><body><div><p>Hello</p></div><p>World</p><fb:like /></body></html>");
+        System.out.println(doc.toString()); // Output the converted document
+    }
+}
+```
+
+Please note that I've made the assumption here that `fb:like` tag is part of Facebook's proprietary markup and does not follow the standard XML/HTML naming conventions. In such a case, you may need to customize the `convert` method to handle these specific tags appropriately. The code above is a simplified example and may require further adjustments based on your specific requirements and input data.
+

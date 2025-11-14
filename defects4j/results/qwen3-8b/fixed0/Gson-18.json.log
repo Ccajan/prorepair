@@ -1,0 +1,157 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Gson deserializes wildcards to LinkedHashMap
+This issue is a successor to #1101.
+Models:
+// ? extends causes the issue
+class BigClass { Map<String, ? extends List<SmallClass>> inBig; }
+
+class SmallClass { String inSmall; }
+Json:
+{
+  "inBig": {
+    "key": [
+      { "inSmall": "hello" }
+    ]
+  }
+}
+Gson call:
+SmallClass small = new Gson().fromJson(json, BigClass.class).inBig.get("inSmall").get(0);
+This call will fail with a ClassCastException exception –
+com.google.gson.internal.LinkedTreeMap cannot be cast to Entry. If we remove ? extends then everything works fine.
+This is an incorrect Java code (gson/src/main/java/com/google/gson/internal/$Gson$Types.java):
+```java
+static Type getSupertype(Type context, Class<?> contextRawType, Class<?> supertype) {
+    // wildcards are useless for resolving supertypes. As the upper bound has the same raw type, use it instead
+  checkArgument(supertype.isAssignableFrom(contextRawType));
+  return resolve(context, contextRawType,
+      $Gson$Types.getGenericSupertype(context, contextRawType, supertype));
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+To fix the issue described, we need to address how **Gson** handles generics and wildcard types when performing deserialization — specifically when encountering a `? extends` wildcard in generic types like `Map<String, ? extends List<SmallClass>>`.
+
+---
+
+### 🔍 **Understanding the Problem**
+
+In your model:
+
+```java
+class BigClass { 
+    Map<String, ? extends List<SmallClass>> inBig;
+}
+
+class SmallClass {
+    String inSmall;
+}
+```
+
+And this JSON:
+
+```json
+{
+  "inBig": {
+    "key": [
+      { "inSmall": "hello" }
+    ]
+  }
+}
+```
+
+When using:
+
+```java
+SmallClass small = new Gson().fromJson(json, BigClass.class).inBig.get("key").get(0);
+```
+
+The following happens under the hood:
+
+- Gson tries to deserialize the nested structure into a `List<SmallClass>`, but due to the use of `? extends List<SmallClass>` as the value type of the map, it ends up creating a `LinkedHashMap` that wraps a list of `LinkedTreeMap` objects.
+- The actual object (`SmallClass`) isn't properly constructed because of how the wildcard is handled during type resolution.
+
+---
+
+### ✅ **What’s Wrong With the Existing Code?**
+
+The key method causing the problem is:
+
+```java
+static Type getSupertype(Type context, Class<?> contextRawType, Class<?> supertype) {
+    checkArgument(supertype.isAssignableFrom(contextRawType));
+    return resolve(context, contextRawType,
+        $Gson$Types.getGenericSupertype(context, contextRawType, supertype));
+}
+```
+
+It's designed to find a **supertype**, but it fails in cases where there are **wildcard bounds**. Specifically, when you have something like `? extends T`, it doesn’t behave like a real type hierarchy, so **type erasure** kicks in and the internal type resolution mechanism breaks.
+
+---
+
+### ✅ **Correcting the Logic**
+
+We can improve this method by handling cases involving **wildcard bounds** more carefully.
+
+#### ✅ **Revised Method:**
+
+```java
+private static Type getSupertype(Type context, Class<?> contextRawType, Class<?> supertype) {
+    if (context instanceof ParameterizedType && supertype.isAssignableFrom(contextRawType)) {
+        // Handle generic types with bounded wildcards
+        ParameterizedType parameterizedType = (ParameterizedType) context;
+        Type[] actualTypeArguments = parameterizedType.getActualTypeArguments();
+        
+        for (int i = 0; i < actualTypeArguments.length; i++) {
+            if (actualTypeArguments[i] == supertype || supertype.isAssignableFrom((Class<?>) actualTypeArguments[i])) {
+                // Try replacing the argument with the supertype or its bounds
+                // For example, replace List<? extends X> → List<X>
+                Type[] newArgs = Arrays.copyOf(actualTypeArguments, actualTypeArguments.length);
+                newArgs[i] = supertype;
+
+                return createParameterizedType(
+                    ((Class<?>) parameterizedType.getRawType()),
+                    newArgs,
+                    parameterizedType.getOwnerType()
+                );
+            }
+        }
+    }
+
+    // Fallback logic
+    checkArgument(supertype.isAssignableFrom(contextRawType));
+    return resolve(context, contextRawType,
+        $Gson$Types.getGenericSupertype(context, contextRawType, supertype));
+}
+```
+
+#### 🧠 **Explanation**
+
+- This version checks whether the current `Type` is parameterized (i.e., a generic).
+- It iterates over the actual type arguments and looks for any match with the expected `supertype`.
+- When a match is found, it replaces the wildcard (`? extends List<SmallClass>`) with `List<SmallClass>` directly, which allows proper type inference and avoids casting issues later on.
+- We avoid direct casting from `LinkedTreeMap` to `SmallClass`, ensuring correct deserialization.
+
+---
+
+### ✅ **Fix Summary**
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Wildcard types cause class casts | Incorrect handling of wildcard bounds | Improved `getSupertype()` to handle wildcard replacements correctly |
+| `LinkedTreeMap` cannot be cast to `Entry` | No proper typing in deserialized collections | Replace `? extends List<T>` with `List<T>` |
+
+---
+
+### ✅ **Final Note**
+
+By properly resolving generic wildcards during deserialization, you ensure that the resulting object tree reflects the intended type hierarchy, avoiding runtime exceptions like `ClassCastException`. This also improves overall type safety and clarity in your models.
+
+Let me know if you'd like me to provide updated versions of the entire `$Gson$Types.java` file or integration instructions!

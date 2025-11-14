@@ -1,0 +1,183 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Reference-chain hints use incorrect class-name for inner classes
+``` java
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.databind.JsonMappingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.Test;
+
+import java.io.IOException;
+
+import static com.google.common.truth.Truth.assertThat;
+import static org.junit.jupiter.api.Assertions.expectThrows;
+
+public class ReferenceChainTest {
+    // illustrates that jackson's "reference chain" help-text uses incorrect class-names for inner classes
+    @Test public void incorrectReferenceChain() throws IOException {
+        JsonMappingException jsonMappingException = expectThrows(JsonMappingException.class, () -> {
+            ObjectMapper objectMapper = new ObjectMapper();
+            objectMapper.readValue(objectMapper.writeValueAsBytes(new Outer()), Outer.class);
+        });
+        JsonMappingException.Reference reference = jsonMappingException.getPath().get(0);
+        assertThat(reference.toString()).isEqualTo("ReferenceChainTest$Outer[\"inner\"]");
+    }
+
+    static class Outer {
+        public Inner inner = new Inner();
+    }
+
+    static class Inner {
+        public int x;
+
+        @JsonCreator public static Inner create(@JsonProperty("x") int x) {
+            throw new RuntimeException("test-exception");
+        }
+    }
+}
+
+```
+
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/JsonMappingException.java):
+```java
+public String getDescription() {
+            if (_desc == null) {
+                StringBuilder sb = new StringBuilder();
+
+                if (_from == null) { // can this ever occur?
+                    sb.append("UNKNOWN");
+                } else {
+                    Class<?> cls = (_from instanceof Class<?>) ? (Class<?>)_from : _from.getClass();
+                    // Hmmh. Although Class.getName() is mostly ok, it does look
+                    // butt-ugly for arrays.
+                    // 06-Oct-2016, tatu: as per [databind#1403], `getSimpleName()` not so good
+                    //   as it drops enclosing class. So let's try bit different approach
+                    String pkgName = ClassUtil.getPackageName(cls);
+                    if (pkgName != null) {
+                        sb.append(pkgName);
+                        sb.append('.');
+                    }
+                    sb.append(cls.getSimpleName());
+                }
+                sb.append('[');
+                if (_fieldName != null) {
+                    sb.append('"');
+                    sb.append(_fieldName);
+                    sb.append('"');
+                } else if (_index >= 0) {
+                    sb.append(_index);
+                } else {
+                    sb.append('?');
+                }
+                sb.append(']');
+                _desc = sb.toString();
+            }
+            return _desc;
+        }
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+To fix the issue with **incorrect class names** being shown in the Jackson `ReferenceChain` description when dealing with **inner classes**, we need to adjust how Jackson resolves and displays the enclosing class name.
+
+---
+
+## ✅ Problem Summary
+
+In your test case:
+- `Outer` is an **outer class**.
+- `Inner` is an **inner class** of `Outer`.
+- When deserializing using Jackson, the exception thrown (`JsonMappingException`) shows the wrong class name:  
+  `"ReferenceChainTest$Outer[\"inner\"]"`  
+  which suggests that the **inner class name is incorrectly referenced** or displayed in the stack trace or error message.
+
+The core problem lies in **Jackson's handling of inner class names** during exception description building — specifically, it doesn’t account for nested contexts properly.
+
+---
+
+## 🛠️ Solution Overview
+
+### Key Insight
+Jackson’s method `getDescription()` is where the string representation of a `Reference` object is built. The following line tries to get just the simple name of the class:
+
+```java
+sb.append(cls.getSimpleName());
+```
+
+But when working with inner classes (like `Inner` inside `Outer`), `getSimpleName()` returns only `"Inner"`, not the full context like `"Outer.Inner"`.
+
+### Fix Strategy
+We should use the fully qualified name instead, but avoid including the outer class in cases where the type already represents the actual class (i.e., not a nested class).
+
+However, since we're seeing `ReferenceChainTest$Outer` when the expected was `Inner`, this may be due to **how Jackson interprets internal references** when serializing/deserializing objects.
+
+> 💡 *Note:* This problem might also stem from **Jackson’s naming conventions** when mapping between JSON and Java types, especially involving inner classes.
+
+---
+
+## 🔧 Corrected Code for `getDescription()` Method
+
+Here’s the corrected version of the `getDescription()` method, ensuring proper treatment of **inner class names**:
+
+```java
+public String getDescription() {
+    if (_desc == null) {
+        StringBuilder sb = new StringBuilder();
+
+        if (_from == null) {
+            sb.append("UNKNOWN");
+        } else {
+            Class<?> cls = (_from instanceof Class<?>) ? (Class<?>)_from : _from.getClass();
+
+            // Get the fully qualified name, but avoid enclosing class if necessary
+            String className = cls.getName();  // Use full name to include inner class context
+
+            sb.append(className);
+
+            // Append field/index if available
+            sb.append('[');
+            if (_fieldName != null) {
+                sb.append('"').append(_fieldName).append('"');
+            } else if (_index >= 0) {
+                sb.append(_index);
+            } else {
+                sb.append('?');
+            }
+            sb.append(']');
+        }
+
+        _desc = sb.toString();
+    }
+    return _desc;
+}
+```
+
+---
+
+## ⚠️ Optional Enhancement (Better Naming)
+
+If you want even better debugging output, consider overriding the `toString()` methods in your model classes (e.g., `Outer` and `Inner`) to provide more readable information about their state.
+
+---
+
+## ✅ Summary
+
+| Issue | Description |
+|------|-------------|
+| ❌ Incorrect class name in Reference Chain | Jackson prints `ReferenceChainTest$Outer` instead of `Inner`. |
+| ✅ Fixed by using full class name via `getName()` | Ensures inner classes are named correctly. |
+
+---
+
+## ✅ Final Notes
+
+If you’re using **Java 8+** and have **nested classes**, ensure you’re using **proper naming conventions** in both your models and the **Jackson configuration** to prevent ambiguity.
+
+If the issue persists after applying this fix, consider upgrading Jackson to a newer version (or apply a patch for known issues like **[databind#1403](https://github.com/FasterXML/jackson-databind/issues/1403)**, if present).

@@ -1,0 +1,174 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# W3CDom Helper fails to convert whenever some namespace declarations are missing
+Hello
+I've been running into an issue where if I convert my Jsoup parsed document into a org.w3c.dom.Document with the W3CDom helper and that document happens to be missing namespace declarations we get the following exception:
+NAMESPACE_ERR: An attempt is made to create or change an object in a way which is incorrect with regard to namespaces.
+
+I've looked into this a bit and first thing I tried was using a locally forked version of the W3CDom helper that simply turned this flag off:
+factory.setNamespaceAware(false);
+
+However the issue continued, so instead I simply hacked the code to completely ignore namespaces
+// (csueiras): We purposely remove any namespace because we get malformed HTML that might not be
+// declaring all of it's namespaces!
+Element el = doc.createElementNS("", sourceEl.tagName());
+
+I am not completely sure if this will have any side effects, but it resolved the issues with the document I'm interacting with. I would be glad to provide a pull request if I have some guidance regarding how to properly handle this issue if it can be handled by Jsoup.
+The document I'm having issues is simply making use of the Facebook like buttons using tags like this:
+<fb:like ...
+
+But there's no namespace declaration for "fb".
+This is an incorrect Java code (src/main/java/org/jsoup/helper/W3CDom.java):
+```java
+public void head(org.jsoup.nodes.Node source, int depth) {
+    namespacesStack.push(new HashMap<>(namespacesStack.peek())); // inherit from above on the stack
+    if (source instanceof org.jsoup.nodes.Element) {
+        org.jsoup.nodes.Element sourceEl = (org.jsoup.nodes.Element) source;
+
+        String prefix = updateNamespaces(sourceEl);
+        String namespace = namespacesStack.peek().get(prefix);
+        String tagName = sourceEl.tagName();
+
+        Element el = 
+            doc.createElementNS(namespace, tagName);
+        copyAttributes(sourceEl, el);
+        if (dest == null) { // sets up the root
+            doc.appendChild(el);
+        } else {
+            dest.appendChild(el);
+        }
+        dest = el; // descend
+    } else if (source instanceof org.jsoup.nodes.TextNode) {
+        org.jsoup.nodes.TextNode sourceText = (org.jsoup.nodes.TextNode) source;
+        Text text = doc.createTextNode(sourceText.getWholeText());
+        dest.appendChild(text);
+    } else if (source instanceof org.jsoup.nodes.Comment) {
+        org.jsoup.nodes.Comment sourceComment = (org.jsoup.nodes.Comment) source;
+        Comment comment = doc.createComment(sourceComment.getData());
+        dest.appendChild(comment);
+    } else if (source instanceof org.jsoup.nodes.DataNode) {
+        org.jsoup.nodes.DataNode sourceData = (org.jsoup.nodes.DataNode) source;
+        Text node = doc.createTextNode(sourceData.getWholeData());
+        dest.appendChild(node);
+    } else {
+        // unhandled
+    }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+</think>
+
+You're encountering a well-known issue when converting a **Jsoup**-parsed DOM into a `org.w3c.dom.Document` using `W3CDom`, especially when certain elements use custom namespaces (e.g., `<fb:like>`) without proper namespace declarations.
+
+---
+
+## ✅ Summary of the Issue
+
+When creating a `Document` object with `createElementNS(...)`, the W3C DOM requires the full **namespace URI** to be known for an element. If the namespace isn't declared, the browser engine throws:
+
+```
+NAMESPACE_ERR: An attempt is made to create or change an object in a way which is incorrect with regard to namespaces.
+```
+
+In your case, the `<fb:like>` tag uses the `fb` prefix without a namespace declaration, leading to the error.
+
+---
+
+## 🔧 Root Cause
+
+The issue is in the `head(...)` method of `W3CDom.java`, specifically this line:
+
+```java
+Element el = doc.createElementNS(namespace, tagName);
+```
+
+If the `namespace` value is **empty**, `doc.createElementNS(null, tagName)` will throw an exception (as the default behavior of `createElementNS` is invalid if no namespace is provided).
+
+---
+
+## 🛠️ Recommended Fix
+
+To avoid this error, we should ensure that the namespace used is **not empty**, even if the original JSoup DOM didn't declare one.
+
+We'll modify the logic to fall back to using an empty string as the namespace — which corresponds to the default XML namespace — if none is available.
+
+### ✅ Modified Code Snippet
+
+Here's a safe and robust fix for the `head(...)` method:
+
+```java
+public void head(org.jsoup.nodes.Node source, int depth) {
+    namespacesStack.push(new HashMap<>(namespacesStack.peek())); // inherit from above on the stack
+
+    if (source instanceof org.jsoup.nodes.Element) {
+        org.jsoup.nodes.Element sourceEl = (org.jsoup.nodes.Element) source;
+
+        String prefix = updateNamespaces(sourceEl);
+        String namespace = namespacesStack.peek().get(prefix); // Get the namespace associated with the prefix
+
+        // Ensure that namespace is never empty
+        if (namespace == null || namespace.isEmpty()) {
+            namespace = "";  // Fallback to empty string (no namespace)
+        }
+
+        String tagName = sourceEl.tagName();
+        Element el = doc.createElementNS(namespace, tagName);
+        copyAttributes(sourceEl, el);
+
+        if (dest == null) {
+            doc.appendChild(el);
+        } else {
+            dest.appendChild(el);
+        }
+        dest = el; // Descend
+    } else if (source instanceof org.jsoup.nodes.TextNode) {
+        org.jsoup.nodes.TextNode sourceText = (org.jsoup.nodes.TextNode) source;
+        Text text = doc.createTextNode(sourceText.getWholeText());
+        dest.appendChild(text);
+    } else if (source instanceof org.jsoup.nodes.Comment) {
+        org.jsoup.nodes.Comment sourceComment = (org.jsoup.nodes.Comment) source;
+        Comment comment = doc.createComment(sourceComment.getData());
+        dest.appendChild(comment);
+    } else if (source instanceof org.jsoup.nodes.DataNode) {
+        org.jsoup.nodes.DataNode sourceData = (org.jsoup.nodes.DataNode) source;
+        Text node = doc.createTextNode(sourceData.getWholeData());
+        dest.appendChild(node);
+    } else {
+        // Unhandled type
+    }
+}
+```
+
+---
+
+## ⚠️ Considerations
+
+1. **Namespace Awareness**: By default, `DOMParser` is namespace-aware (`setNamespaceAware(true)`), which may cause mismatch between actual content and expected structure. If you set `setNamespaceAware(false)`, the parser ignores namespaces entirely, potentially hiding such errors.
+
+2. **Namespace Declarations**: If possible, always include proper namespace declarations in the input (e.g., `<fb:like xmlns:fb="http://www.facebook.com/2008/fbml">`), even if they're redundant or non-standard.
+
+3. **Alternative**: If your application does not require strict namespace compliance, consider disabling namespace awareness in the `W3CDom` constructor:
+
+   ```java
+   DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+   factory.setNamespaceAware(false);
+   ```
+
+4. **Custom Namespace Handling**: For very specific cases (like handling `<fb:like>`), you could manually map known prefixes to URIs during conversion.
+
+---
+
+## 📌 Summary
+
+- The original error occurs because the `createElementNS(...)` method requires a valid namespace.
+- A safe workaround is to **fallback to the empty namespace string** (`""`) if the namespace is missing.
+- This ensures compatibility with legacy markup or external libraries like Facebook’s inline tags.
+- A pull request would be great if you want to contribute a clean solution to the `W3CDom` class.
+
+Let me know if you'd like help writing a PR or unit tests! 😊

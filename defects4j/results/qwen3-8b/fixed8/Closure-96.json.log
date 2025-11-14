@@ -1,0 +1,191 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Missing type-checks for var_args notation
+What steps will reproduce the problem?
+1. Compile this:
+//-------------------------------------
+// ==ClosureCompiler==
+// @compilation_level SIMPLE_OPTIMIZATIONS
+// @warning_level VERBOSE
+// @output_file_name default.js
+// @formatting pretty_print
+// ==/ClosureCompiler==
+
+/**
+* @param {...string} var_args
+*/
+function foo(var_args) {
+    return arguments.length;
+}
+
+foo('hello'); // no warning - ok
+foo(123); // warning - ok
+foo('hello', 123); // no warning! error.
+//-------------------------------------
+
+What is the expected output? What do you see instead?
+Should get a type-mismatch warning for the second parameter in the third foo() call.
+
+What version of the product are you using? On what operating system?
+Both online compiler and the 20100616 release.
+
+Please provide any additional information below.
+Seems like the type-checker treats 'var_args' as a single param and thus fails to type check the subsequent parameters.
+
+// Fredrik
+This is an incorrect Java code (src/com/google/javascript/jscomp/TypeCheck.java):
+```java
+private void visitParameterList(NodeTraversal t, Node call,
+    FunctionType functionType) {
+  Iterator<Node> arguments = call.children().iterator();
+  arguments.next(); // skip the function name
+
+  Iterator<Node> parameters = functionType.getParameters().iterator();
+  int ordinal = 0;
+  Node parameter = null;
+  Node argument = null;
+  while (arguments.hasNext() &&
+         parameters.hasNext()) {
+    // If there are no parameters left in the list, then the while loop
+    // above implies that this must be a var_args function.
+      parameter = parameters.next();
+    argument = arguments.next();
+    ordinal++;
+
+    validator.expectArgumentMatchesParameter(t, argument,
+        getJSType(argument), getJSType(parameter), call, ordinal);
+  }
+
+  int numArgs = call.getChildCount() - 1;
+  int minArgs = functionType.getMinArguments();
+  int maxArgs = functionType.getMaxArguments();
+  if (minArgs > numArgs || maxArgs < numArgs) {
+    report(t, call, WRONG_ARGUMENT_COUNT,
+            validator.getReadableJSTypeName(call.getFirstChild(), false),
+            String.valueOf(numArgs), String.valueOf(minArgs),
+            maxArgs != Integer.MAX_VALUE ?
+            " and no more than " + maxArgs + " argument(s)" : "");
+  }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+To fix the issue with the type-checking for variable arguments in the Closure Compiler's TypeCheck.java file, we need to correctly handle cases where a function has `...` (var_args) as its last parameter.
+
+The current implementation seems to treat all parameters as non-var_args and stops checking after matching the number of parameters. However, when there are var_args, we should continue to check each remaining argument against the var_args type.
+
+Here's a revised version of the method:
+
+```java
+private void visitParameterList(NodeTraversal t, Node call,
+    FunctionType functionType) {
+  Iterator<Node> arguments = call.children().iterator();
+  arguments.next(); // skip the function name
+
+  Iterator<Node> parameters = functionType.getParameters().iterator();
+  int ordinal = 0;
+  Node parameter = null;
+  Node argument = null;
+
+  // Check each argument against each parameter
+  while (arguments.hasNext() && parameters.hasNext()) {
+    parameter = parameters.next();
+    argument = arguments.next();
+    ordinal++;
+
+    validator.expectArgumentMatchesParameter(
+        t, argument, getJSType(argument), getJSType(parameter), call, ordinal);
+  }
+
+  // If there are still arguments left, it means we have var_args
+  while (arguments.hasNext()) {
+    // The remaining arguments should match the var_args parameter
+    // So check them against the last parameter (which is the var_args)
+    if (!parameters.hasNext()) {
+      // This shouldn't happen if the function has var_args as its last parameter
+      // But just in case, we can report an error or proceed without checking
+      // For now, we'll just ignore since there's no parameter to check against
+      break;
+    }
+    
+    parameter = parameters.next();
+    argument = arguments.next();
+    ordinal++;
+
+    validator.expectArgumentMatchesParameter(
+        t, argument, getJSType(argument), getJSType(parameter), call, ordinal);
+  }
+
+  int numArgs = call.getChildCount() - 1;
+  int minArgs = functionType.getMinArguments();
+  int maxArgs = functionType.getMaxArguments();
+  if (minArgs > numArgs || maxArgs < numArgs) {
+    report(t, call, WRONG_ARGUMENT_COUNT,
+            validator.getReadableJSTypeName(call.getFirstChild(), false),
+            String.valueOf(numArgs), String.valueOf(minArgs),
+            maxArgs != Integer.MAX_VALUE ?
+            " and no more than " + maxArgs + " argument(s)" : "");
+  }
+}
+```
+
+### Explanation:
+1. **First Loop**: This checks each regular parameter against its corresponding argument. It continues until either all parameters or all arguments are processed.
+
+2. **Second Loop**: After the first loop, if there are still arguments left, they should be matched against the var_args parameter. We continue checking these arguments against the last parameter (the var_args one). If there are no parameters left, we just break out of the loop.
+
+This approach ensures that even when a function has a var_args parameter, all arguments (including those beyond the initial fixed parameters) are checked against the appropriate types.
+</think>
+
+To resolve the type-checking issue with variable arguments (`var_args`) in the Closure Compiler, we need to ensure that the compiler correctly processes functions with a trailing spread parameter (`...`) and checks all provided arguments against the declared var_arg type.
+
+---
+
+## ✅ Problem Summary
+
+In JavaScript, functions can accept arbitrary numbers of arguments via a **variadic parameter** (e.g., `function foo(...args)`). In such cases, every argument passed—both before and after the fixed parameters—should be checked against the type defined on the var_arg parameter.
+
+However, the original logic fails to recognize that a `var_args` declaration includes **all** remaining arguments. Thus, the Closure Compiler does not properly validate the types of extra arguments passed after the fixed parameters.
+
+---
+
+## 🔧 Solution Approach
+
+We will enhance the existing method to:
+1. Match all fixed arguments with their respective parameter types.
+2. Then process the remaining arguments against the `var_args` parameter.
+
+This involves adding a second loop to handle the variable arguments once all fixed parameters have been verified.
+
+---
+
+## 🛠️ Modified Code
+
+```java
+private void visitParameterList(NodeTraversal t, Node call,
+    FunctionType functionType) {
+  // Skip the function name node
+  Iterator<Node> arguments = call.children().iterator();
+  arguments.next();
+
+  Iterator<Node> parameters = functionType.getParameters().iterator();
+  int ordinal = 0;
+  Node parameter = null;
+  Node argument = null;
+
+  // First pass: match fixed arguments against parameters
+  while (arguments.hasNext() && parameters.hasNext()) {
+    parameter = parameters.next();
+    argument = arguments.next();
+    ordinal++;
+    validator.expectArgumentMatchesParameter(
+        t, argument, getJSType(argument), getJSType(parameter), call, ordinal);
+  }
+
+  // Second pass: check any remaining arguments against the var_args parameter
+  // These should all

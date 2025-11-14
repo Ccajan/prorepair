@@ -1,0 +1,208 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# side-effects analysis incorrectly removing function calls with side effects
+Sample Code:
+---
+/** @constructor */
+function Foo() {
+  var self = this;
+  window.setTimeout(function() {
+    window.location = self.location;
+  }, 0);
+}
+
+Foo.prototype.setLocation = function(loc) {
+  this.location = loc;
+};
+
+(new Foo()).setLocation('http://www.google.com/');
+---
+
+The setLocation call will get removed in advanced mode.
+This is an incorrect Java code (src/com/google/javascript/jscomp/NodeUtil.java):
+```java
+static boolean evaluatesToLocalValue(Node value, Predicate<Node> locals) {
+  switch (value.getType()) {
+    case Token.ASSIGN:
+      // A result that is aliased by a non-local name, is the effectively the
+      // same as returning a non-local name, but this doesn't matter if the
+      // value is immutable.
+      return NodeUtil.isImmutableValue(value.getLastChild())
+          || (locals.apply(value)
+              && evaluatesToLocalValue(value.getLastChild(), locals));
+    case Token.COMMA:
+      return evaluatesToLocalValue(value.getLastChild(), locals);
+    case Token.AND:
+    case Token.OR:
+      return evaluatesToLocalValue(value.getFirstChild(), locals)
+         && evaluatesToLocalValue(value.getLastChild(), locals);
+    case Token.HOOK:
+      return evaluatesToLocalValue(value.getFirstChild().getNext(), locals)
+         && evaluatesToLocalValue(value.getLastChild(), locals);
+    case Token.INC:
+    case Token.DEC:
+      if (value.getBooleanProp(Node.INCRDECR_PROP)) {
+        return evaluatesToLocalValue(value.getFirstChild(), locals);
+      } else {
+        return true;
+      }
+    case Token.THIS:
+      return locals.apply(value);
+    case Token.NAME:
+      return isImmutableValue(value) || locals.apply(value);
+    case Token.GETELEM:
+    case Token.GETPROP:
+      // There is no information about the locality of object properties.
+      return locals.apply(value);
+    case Token.CALL:
+      return callHasLocalResult(value)
+          || isToStringMethodCall(value)
+          || locals.apply(value);
+    case Token.NEW:
+      // TODO(nicksantos): This needs to be changed so that it
+      // returns true iff we're sure the value was never aliased from inside
+      // the constructor (similar to callHasLocalResult)
+      return true;
+    case Token.FUNCTION:
+    case Token.REGEXP:
+    case Token.ARRAYLIT:
+    case Token.OBJECTLIT:
+      // Literals objects with non-literal children are allowed.
+      return true;
+    case Token.IN:
+      // TODO(johnlenz): should IN operator be included in #isSimpleOperator?
+      return true;
+    default:
+      // Other op force a local value:
+      //  x = '' + g (x is now an local string)
+      //  x -= g (x is now an local number)
+      if (isAssignmentOp(value)
+          || isSimpleOperator(value)
+          || isImmutableValue(value)) {
+        return true;
+      }
+
+      throw new IllegalStateException(
+          "Unexpected expression node" + value +
+          "\n parent:" + value.getParent());
+  }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public static boolean evaluatesToLocalValue(Node value, Predicate<Node> locals) {
+  switch (value.getType()) {
+    case Token.ASSIGN:
+      // If the assignment is to a variable that's not a local, then the result 
+      // may be considered local if the RHS evaluates to a local value
+      // For example: let x = y; then x is a local and y could be a non-local,
+      // but the result is still a local.
+      // However, if the RHS is an alias of a non-local name, we need to check
+      // whether it's immutable.
+      Node assignTarget = value.getAssignTarget();
+      if (assignTarget == null) {
+        // Assignment without target - maybe a property or array element? Not sure.
+        return false;
+      }
+      if (!locals.test(assignTarget)) {
+        return isImmutableValue(value.getLastChild())
+            || evaluatesToLocalValue(value.getLastChild(), locals);
+      }
+      return evaluatesToLocalValue(value.getLastChild(), locals);
+
+    case Token.COMMA:
+      return evaluatesToLocalValue(value.getLastChild(), locals);
+
+    case Token.AND:
+    case Token.OR:
+      return evaluatesToLocalValue(value.getFirstChild(), locals)
+          && evaluatesToLocalValue(value.getLastChild(), locals);
+
+    case Token.HOOK:
+      return evaluatesToLocalValue(value.getFirstChild().getNext(), locals)
+          && evaluatesToLocalValue(value.getLastChild(), locals);
+
+    case Token.INC:
+    case Token.DEC:
+      if (value.getBooleanProp(Node.INCRDECR_PROP)) {
+        return evaluatesToLocalValue(value.getFirstChild(), locals);
+      } else {
+        return true;
+      }
+
+    case Token.THIS:
+      return locals.apply(value);
+
+    case Token.NAME:
+      return isImmutableValue(value) || locals.apply(value);
+
+    case Token.GETELEM:
+    case Token.GETPROP:
+      // There is no information about the locality of object properties.
+      return locals.apply(value);
+
+    case Token.CALL:
+      return callHasLocalResult(value)
+          || isToStringMethodCall(value)
+          || locals.apply(value);
+
+    case Token.NEW:
+      // We can't know for sure if the value comes from inside the constructor.
+      return true;
+
+    case Token.FUNCTION:
+    case Token.REGEXP:
+    case Token.ARRAYLIT:
+    case Token.OBJECTLIT:
+      // Literals have non-literal children, which may or may not affect locality.
+      return true;
+
+    case Token.IN:
+      // TODO(johnlenz): Should IN operator be included in #isSimpleOperator?
+      return true;
+
+    default:
+      if (isAssignmentOp(value)
+          || isSimpleOperator(value)
+          || isImmutableValue(value)) {
+        return true;
+      }
+
+      // If we don't recognize the operation, assume it does not evaluate to a local
+      // value unless it is an assignment or simple operator.
+      throw new IllegalStateException("Unexpected expression node: "
+          + value + "\n parent:" + value.getParent());
+  }
+}
+```
+
+The key fix here is handling assignments properly. The original implementation didn't account for whether the assignment was to a local or non-local variable.
+
+In the `ASSIGN` case:
+
+1. I added logic to find the assignment target using `getAssignTarget()`, which gets the left-hand side of the assignment
+2. Check if the assignment target is a local variable using `locals.test()`
+3. If it's not a local, then we need to determine if the right-hand side (RHS) evaluates to a local value, but only if it's immutable
+4. If it is a local, then just check if the RHS evaluates to a local value
+
+This change ensures that when we have something like `var x = y;`, where `y` might be a non-local variable, the assignment will still consider the result as a local value because it's being assigned to a local variable.
+
+This helps prevent the incorrect removal of function calls with side effects, like the one in the sample code where `setLocation()` is called in a timeout callback.
+</think>
+
+To address the issue where **side-effect analyses** incorrectly remove function calls—such as `setLocation()` in your example—we must refine how the JavaScript compiler determines whether expressions evaluate to *local values*.
+
+The current code has a flaw in its `evaluatesToLocalValue` method, particularly in the `ASSIGN` case. It fails to distinguish between assignments to **local variables** versus assignments to **non-local** variables (like global or external variables). As a result, it erroneously concludes that the outcome of such operations is *not* a local value, which leads to false positives during dead-code elimination or side-effect pruning.
+
+---
+
+### 🔧 Root Cause
+
+The original `evaluatesToLocalValue` handles `ASSIGN` by looking at the **last child**, assuming it always reflects the final output. But this ignores the context of the assignment itself:
+
+- When an assignment is made to a **local variable**, even if the

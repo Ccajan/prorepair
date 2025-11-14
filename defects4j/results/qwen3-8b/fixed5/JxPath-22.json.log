@@ -1,0 +1,202 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Resetting the default namespace causes a serious endless loop when requesting .asPath() on a node.
+sample smaller case:
+
+<...>
+ <b:foo xmlns:b="bla" xmlns="test111">    <!--  No nodes are placed in the tree within ns "test111" but the attribute is still there.-->
+  <b:bar>a</b:bar>                         <!-- is in ns 'bla' -->
+  <test xmlns=""></test>                   <!-- does not have a namespace -->
+ </b:foo>
+</...>
+
+when requesting .asPath() on the 'test' node, it loops in org.apache.commons.jxpath.ri.NamespaceResolver.getPrefix(NodePointer, String), 
+and if it didn't loop it would create a wrong xpath '//b:fo/null:test' DOMNodePointer.asPath().
+So I think that the fix should be in org.apache.commons.jxpath.ri.model.dom.DOMNodePointer.asPath()
+
+....
+                    String ln = DOMNodePointer.getLocalName(node);
+                    String nsURI = getNamespaceURI();
+                    if (nsURI == null) {
+                        buffer.append(ln);
+                        buffer.append('[');
+                        buffer.append(getRelativePositionByName()).append(']');
+                    }
+                    else {
+                        String prefix = getNamespaceResolver().getPrefix(nsURI);
+                        if (prefix != null) {
+...
+
+should become
+
+...
+                    String ln = DOMNodePointer.getLocalName(node);
+                    String nsURI = getNamespaceURI();
+                    if (nsURI == null || nsURI.length() == 0) { // check for empty string which means that the node doesn't have a namespace.
+                        buffer.append(ln);
+                        buffer.append('[');
+                        buffer.append(getRelativePositionByName()).append(']');
+                    }
+                    else {
+                        String prefix = getNamespaceResolver().getPrefix(nsURI);
+                        if (prefix != null) {
+...
+This is an incorrect Java code (src/java/org/apache/commons/jxpath/ri/model/dom/DOMNodePointer.java):
+```java
+public static String getNamespaceURI(Node node) {
+    if (node instanceof Document) {
+        node = ((Document) node).getDocumentElement();
+    }
+
+    Element element = (Element) node;
+
+    String uri = element.getNamespaceURI();
+    if (uri == null) {
+        String prefix = getPrefix(node);
+        String qname = prefix == null ? "xmlns" : "xmlns:" + prefix;
+
+        Node aNode = node;
+        while (aNode != null) {
+            if (aNode.getNodeType() == Node.ELEMENT_NODE) {
+                Attr attr = ((Element) aNode).getAttributeNode(qname);
+                if (attr != null) {
+                    return attr.getValue();
+                }
+            }
+            aNode = aNode.getParentNode();
+        }
+        return null;
+    }
+    return uri;
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public static String getNamespaceURI(Node node) {
+    if (node instanceof Document) {
+        node = ((Document) node).getDocumentElement();
+    }
+
+    Element element = (Element) node;
+
+    String uri = element.getNamespaceURI();
+    if (uri == null) {
+        // Check if the node has a default namespace declaration
+        String defaultNs = getDefaultNamespaceURI(element);
+        if (defaultNs != null) {
+            return defaultNs;
+        }
+
+        // Fallback to checking attributes for xmlns declarations
+        String prefix = getPrefix(node);
+        String qname = prefix == null ? "xmlns" : "xmlns:" + prefix;
+
+        Node aNode = node;
+        while (aNode != null) {
+            if (aNode.getNodeType() == Node.ELEMENT_NODE) {
+                Attr attr = ((Element) aNode).getAttributeNode(qname);
+                if (attr != null) {
+                    return attr.getValue();
+                }
+            }
+            aNode = aNode.getParentNode();
+        }
+        return null;
+    }
+    return uri;
+}
+
+private static String getDefaultNamespaceURI(Element element) {
+    // Check for default namespace declaration on the element itself
+    String defaultNs = element.getAttributeNS("http://www.w3.org/2000/xmlns/", "");
+    if (defaultNs != null && !defaultNs.isEmpty()) {
+        return defaultNs;
+    }
+
+    // If no default namespace is found directly, check ancestors
+    Node ancestor = element.getParentNode();
+    while (ancestor != null) {
+        if (ancestor.getNodeType() == Node.ELEMENT_NODE) {
+            defaultNs = ((Element) ancestor).getAttributeNS("http://www.w3.org/2000/xmlns/", "");
+            if (defaultNs != null && !defaultNs.isEmpty()) {
+                return defaultNs;
+            }
+        }
+        ancestor = ancestor.getParentNode();
+    }
+
+    return null;
+}
+```
+
+I've fixed the `getNamespaceURI` method to properly handle default namespaces. The key changes are:
+1. Added a helper method `getDefaultNamespaceURI` to find the default namespace URI
+2. First checks for a direct default namespace declaration on the element
+3. Then checks all ancestors for a default namespace declaration
+4. Uses proper namespace-aware methods (`getAttributeNS`) with the correct XMLNS namespace URI
+5. Handles cases where the default namespace might be declared as an empty string
+
+This solution addresses the issue of the endless loop by correctly identifying the default namespace URI even when it's not explicitly declared on the element.
+
+The main problem was that the original implementation wasn't properly handling the default namespace declarations and was incorrectly trying to find a namespace URI when none existed, leading to infinite recursion in the namespace resolver. The new implementation handles these edge cases more robustly.
+</think>
+
+To address the core issue in your use case — specifically the **infinite loop** caused by incorrect handling of the default namespace in `DOMNodePointer.asPath()` — we need to focus on improving how **namespace URIs are resolved**, especially in scenarios involving **empty strings or undefined namespaces**.
+
+---
+
+### ✅ Problem Summary
+
+- Your XML example involves:
+  - A **default namespace** defined as `xmlns="test111"` on the `<b:foo>` element.
+  - A child element `<test xmlns="">`, which appears **without a namespace declaration**.
+  
+- When calling `.asPath()` on this `<test>` node, JXPath resolves its namespace using a recursive search through the `NamespaceResolver`. Since the empty string (`""`) isn't associated with any valid namespace in the actual document, this leads to a loop because the resolver can’t determine a valid prefix for the empty string namespace URI.
+
+- This results in an error like `//b:fo/null:test`.
+
+---
+
+### 🔧 Core Fix
+
+The root cause lies in how **`DOMNodePointer.getNamespaceURI(Node)`** retrieves the namespace URI from an element.
+
+The existing implementation does not correctly distinguish between:
+- An **undefined or missing namespace** (`null`)
+- An **explicit default namespace** with an empty string (`""`)
+
+These two cases must be treated differently to avoid misinterpretation during path construction.
+
+---
+
+### 🛠️ Solution Code
+
+Here’s a corrected and improved version of the `getNamespaceURI` method, now safely handling all typical use cases including empty namespace declarations and unknown namespaces:
+
+```java
+/**
+ * Returns the namespace URI of the given node.
+ */
+public static String getNamespaceURI(Node node) {
+    if (node instanceof Document) {
+        node = ((Document) node).getDocumentElement();
+    }
+
+    Element element = (Element) node;
+
+    String uri = element.getNamespaceURI();
+
+    if (uri == null || uri.trim().isEmpty()) {
+        // Try to find the default namespace URI using the XMLNS mechanism
+        String defaultNs = getDefaultNamespaceURI(element);
+
+        if (defaultNs != null) {
+            return defaultNs;
+        }
+        
+        // Handle cases where the default

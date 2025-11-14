@@ -1,0 +1,190 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Missing type-checks for var_args notation
+What steps will reproduce the problem?
+1. Compile this:
+//-------------------------------------
+// ==ClosureCompiler==
+// @compilation_level SIMPLE_OPTIMIZATIONS
+// @warning_level VERBOSE
+// @output_file_name default.js
+// @formatting pretty_print
+// ==/ClosureCompiler==
+
+/**
+* @param {...string} var_args
+*/
+function foo(var_args) {
+    return arguments.length;
+}
+
+foo('hello'); // no warning - ok
+foo(123); // warning - ok
+foo('hello', 123); // no warning! error.
+//-------------------------------------
+
+What is the expected output? What do you see instead?
+Should get a type-mismatch warning for the second parameter in the third foo() call.
+
+What version of the product are you using? On what operating system?
+Both online compiler and the 20100616 release.
+
+Please provide any additional information below.
+Seems like the type-checker treats 'var_args' as a single param and thus fails to type check the subsequent parameters.
+
+// Fredrik
+This is an incorrect Java code (src/com/google/javascript/jscomp/TypeCheck.java):
+```java
+private void visitParameterList(NodeTraversal t, Node call,
+    FunctionType functionType) {
+  Iterator<Node> arguments = call.children().iterator();
+  arguments.next(); // skip the function name
+
+  Iterator<Node> parameters = functionType.getParameters().iterator();
+  int ordinal = 0;
+  Node parameter = null;
+  Node argument = null;
+  while (arguments.hasNext() &&
+         parameters.hasNext()) {
+    // If there are no parameters left in the list, then the while loop
+    // above implies that this must be a var_args function.
+      parameter = parameters.next();
+    argument = arguments.next();
+    ordinal++;
+
+    validator.expectArgumentMatchesParameter(t, argument,
+        getJSType(argument), getJSType(parameter), call, ordinal);
+  }
+
+  int numArgs = call.getChildCount() - 1;
+  int minArgs = functionType.getMinArguments();
+  int maxArgs = functionType.getMaxArguments();
+  if (minArgs > numArgs || maxArgs < numArgs) {
+    report(t, call, WRONG_ARGUMENT_COUNT,
+            validator.getReadableJSTypeName(call.getFirstChild(), false),
+            String.valueOf(numArgs), String.valueOf(minArgs),
+            maxArgs != Integer.MAX_VALUE ?
+            " and no more than " + maxArgs + " argument(s)" : "");
+  }
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+Here's my analysis of the issue and how I would approach fixing it:
+
+The problem lies in the handling of variable arguments (var_args) in the Closure Compiler's type checking. The current implementation treats all parameters as individual entities when checking against arguments, but fails to account for the special case where the last parameter is marked as a variadic parameter (i.e., one that accepts multiple arguments).
+
+Let me walk through how I'd fix this:
+
+First, we need to understand the existing logic:
+- It processes each argument in sequence
+- For each pair of argument and parameter, it performs type checking
+- When the number of arguments exceeds the number of parameters, it assumes it's a var_args scenario
+
+But this approach isn't sufficient because it doesn't properly handle the cases where the last parameter is a var_args parameter.
+
+My proposed solution would involve several key changes:
+
+1. Identify whether the function has a var_args parameter
+2. Adjust the argument checking accordingly when encountering a var_args parameter
+
+Let me show you the modified code:
+
+```java
+private void visitParameterList(NodeTraversal t, Node call,
+    FunctionType functionType) {
+  Iterator<Node> arguments = call.children().iterator();
+  arguments.next(); // skip the function name
+
+  Iterator<Node> parameters = functionType.getParameters().iterator();
+  int ordinal = 0;
+  Node parameter = null;
+  Node argument = null;
+  boolean sawVarArg = false;
+
+  while (arguments.hasNext() && parameters.hasNext()) {
+    parameter = parameters.next();
+
+    // Check if this is a var_args parameter
+    if (isVarArgsParameter(parameter)) {
+      sawVarArg = true;
+    }
+
+    argument = arguments.next();
+    ordinal++;
+
+    // Perform standard type checking unless we've seen a var_args parameter
+    if (!sawVarArg) {
+      validator.expectArgumentMatchesParameter(t, argument,
+          getJSType(argument), getJSType(parameter), call, ordinal);
+    }
+  }
+
+  // After processing all parameters, check remaining arguments if var_args exists
+  if (sawVarArg) {
+    int numArgs = call.getChildCount() - 1;
+    int minArgs = functionType.getMinArguments();
+    int maxArgs = functionType.getMaxArguments();
+    
+    // Handle remaining arguments after the last defined parameter
+    while (arguments.hasNext()) {
+      argument = arguments.next();
+      ordinal++;
+      
+      // Check if the argument matches the var_args parameter type
+      validator.expectArgumentMatchesParameter(t, argument,
+          getJSType(argument), getJSType(parameter), call, ordinal);
+    }
+    
+    // Also check overall argument count
+    if (minArgs > numArgs || maxArgs < numArgs) {
+      report(t, call, WRONG_ARGUMENT_COUNT,
+              validator.getReadableJSTypeName(call.getFirstChild(), false),
+              String.valueOf(numArgs), String.valueOf(minArgs),
+              maxArgs != Integer.MAX_VALUE ?
+              " and no more than " + maxArgs + " argument(s)" : "");
+    }
+  } else {
+    // Regular argument count validation
+    int numArgs = call.getChildCount() - 1;
+    int minArgs = functionType.getMinArguments();
+    int maxArgs = functionType.getMaxArguments();
+    
+    if (minArgs > numArgs || maxArgs < numArgs) {
+      report(t, call, WRONG_ARGUMENT_COUNT,
+              validator.getReadableJSTypeName(call.getFirstChild(), false),
+              String.valueOf(numArgs), String.valueOf(minArgs),
+              maxArgs != Integer.MAX_VALUE ?
+              " and no more than " + maxArgs + " argument(s)" : "");
+    }
+  }
+}
+
+// Helper method to determine if a parameter is a var_args parameter
+private boolean isVarArgsParameter(Node parameter) {
+  // Implement logic to check if this parameter is a var_args parameter
+  // This might involve checking annotations or metadata associated with the parameter
+  // For example, looking for a specific annotation like @param {...string} var_args
+  // Return true if it's a var_args parameter
+  return false; // This should be replaced with actual implementation
+}
+```
+
+Now let me explain the changes made:
+
+1. Added a `sawVarArg` flag to track whether we've encountered a var_args parameter
+2. Modified the main loop to only perform type checking on non-var_args parameters
+3. Added a separate block to handle remaining arguments after the last defined parameter when a var_args parameter exists
+4. Implemented a helper method `isVarArgsParameter()` to identify var_args parameters
+
+For this to work correctly, I would also need to implement the `isVarArgsParameter()` method to correctly detect which parameters are marked as var_args. This could involve checking for specific annotations, JSDoc tags, or other metadata that indicates a parameter can accept multiple arguments.
+
+This approach ensures that:
+- Parameters before the var_args parameter are checked normally
+- Arguments after the last defined parameter are still validated against the var_args parameter type
+- The overall argument

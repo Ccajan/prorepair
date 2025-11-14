@@ -1,0 +1,106 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+
+# Configuring an ObjectMapper's DateFormat changes time zone when serialising Joda DateTime
+The serialisation of Joda DateTime instances behaves differently in 2.6.0 vs 2.5.4 when the ObjectMapper's had its DateFormat configured. The behaviour change is illustrated by the following code:
+public static void main(String[] args) throws JsonProcessingException {
+    System.out.println(createObjectMapper()
+            .writeValueAsString(new DateTime(1988, 6, 25, 20, 30, DateTimeZone.UTC)));
+}
+
+private static ObjectMapper createObjectMapper() {
+    ObjectMapper mapper = new ObjectMapper();
+    mapper.registerModule(createJodaModule());
+    mapper.configure(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false);
+    System.out.println(mapper.getSerializationConfig().getTimeZone());
+    mapper.setDateFormat(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss"));
+    System.out.println(mapper.getSerializationConfig().getTimeZone());
+    return mapper;
+}
+
+private static SimpleModule createJodaModule() {
+    SimpleModule module = new SimpleModule();
+    module.addSerializer(DateTime.class, new DateTimeSerializer(
+            new JacksonJodaDateFormat(DateTimeFormat.forPattern("yyyy-MM-dd HH:mm:ss")
+                    .withZoneUTC())));
+        return module;
+    }
+When run with Jackson 2.5.4 the output is:
+sun.util.calendar.ZoneInfo[id="GMT",offset=0,dstSavings=0,useDaylight=false,transitions=0,lastRule=null]
+sun.util.calendar.ZoneInfo[id="GMT",offset=0,dstSavings=0,useDaylight=false,transitions=0,lastRule=null]
+"1988-06-25 20:30:00"
+
+When run with Jackson 2.6.0 the output is:
+sun.util.calendar.ZoneInfo[id="GMT",offset=0,dstSavings=0,useDaylight=false,transitions=0,lastRule=null]
+sun.util.calendar.ZoneInfo[id="Europe/London",offset=0,dstSavings=3600000,useDaylight=true,transitions=242,lastRule=java.util.SimpleTimeZone[id=Europe/London,offset=0,dstSavings=3600000,useDaylight=true,startYear=0,startMode=2,startMonth=2,startDay=-1,startDayOfWeek=1,startTime=3600000,startTimeMode=2,endMode=2,endMonth=9,endDay=-1,endDayOfWeek=1,endTime=3600000,endTimeMode=2]]
+"1988-06-25 21:30:00"
+
+It looks like the fix for #824 is the cause. In 2.6, the call to mapper.setDateFormat causes the ObjectMapper's time zone to be set to the JVM's default time zone. In 2.5.x, calling mapper.setDateFormat has no effect on its time zone.
+This is an incorrect Java code (src/main/java/com/fasterxml/jackson/databind/cfg/BaseSettings.java):
+```java
+public BaseSettings withDateFormat(DateFormat df) {
+    if (_dateFormat == df) {
+        return this;
+    }
+    TimeZone tz = (df == null) ? _timeZone : df.getTimeZone();
+    return new BaseSettings(_classIntrospector, _annotationIntrospector, _visibilityChecker, _propertyNamingStrategy, _typeFactory,
+            _typeResolverBuilder, df, _handlerInstantiator, _locale,
+            tz, _defaultBase64);
+}
+```
+You are a software engineer. Can you repair the incorrect Java code?
+<|im_end|>
+<|im_start|>assistant
+
+```java
+public BaseSettings withDateFormat(DateFormat df) {
+    if (_dateFormat == df) {
+        return this;
+    }
+    TimeZone tz = (df == null) ? _timeZone : df.getTimeZone();
+    return new BaseSettings(_classIntrospector, _annotationIntrospector, _visibilityChecker, _propertyNamingStrategy, _typeFactory,
+            _typeResolverBuilder, df, _handlerInstantiator, _locale,
+            tz, _defaultBase64);
+}
+```
+
+I need to fix this code so that setting the date format does not override the time zone. Specifically, I should ensure that the time zone from the existing configuration remains unchanged when the date format is set.
+
+First, I'll review what this method does. It creates a new BaseSettings instance with the provided date format and sets the time zone based on the date format's time zone if it's not null. If the date format is null, it uses the existing time zone.
+
+The problem is that in some versions, this approach was causing the time zone to be changed when it shouldn't be. To fix this, we need to make sure that the time zone isn't being overwritten unless explicitly specified.
+
+So, the fix would be to modify the line where the time zone is assigned. Instead of using the date format's time zone, we should use the current time zone from the settings if the date format is not null. However, since we don't have direct access to the current time zone, we can pass the existing time zone as part of the constructor.
+
+Wait, looking at the parameters passed to the constructor, there is already a `tz` parameter which represents the time zone. So, in our case, we want to keep the existing time zone unless we're specifically told to change it. Therefore, if the date format is not null, we should not update the time zone but instead use the existing one. 
+
+But wait, in the current implementation, when a date format is set, it will take its time zone and use that. That might be changing the time zone unnecessarily. The correct behavior would be to allow the date format to have its own time zone, but only if it's explicitly set. Otherwise, we should keep the existing time zone.
+
+Hmm, perhaps the issue arises because the date format's time zone is being used, which may differ from the existing time zone. But maybe the correct behavior is to always use the date format's time zone when it's set, regardless of previous settings. Or maybe we should leave the time zone as it is unless the date format specifies one. 
+
+Given the original issue where setting the date format in 2.6 caused the time zone to change, but not in 2.5.x, it seems that in 2.6, the time zone was being updated to match the date format's time zone. So the fix would be to ensure that when a date format is set, the time zone is not changed unless the date format specifies one.
+
+Therefore, the solution would be to not assign the `tz` variable if the date format is not null. Wait, but the existing code is:
+
+```java
+TimeZone tz = (df == null) ? _timeZone : df.getTimeZone();
+```
+
+If `df` is not null, then `tz` becomes `df.getTimeZone()`, which could be different from `_timeZone`. This is likely causing the time zone to change when the date format is set. 
+
+To prevent the time zone from changing, we need to make sure that the date format doesn't influence the time zone. One way to do that is to ignore the date format's time zone and always use the existing time zone. Alternatively, if the date format needs to have its own time zone, then we should allow it, but the user must explicitly specify it.
+
+In this context, since the issue is that setting the date format should not change the time zone, the fix would be to remove the dependency on the date format's time zone. Thus, the line:
+
+```java
+TimeZone tz = (df == null) ? _timeZone : df.getTimeZone();
+```
+
+should be modified to always use the existing time zone (`_timeZone`) regardless of the date format. 
+
+However, this approach might not be correct, because some date formats might require their own time zones. Perhaps the better approach is to let the date format have its own time zone while allowing the system to still use the default time zone. 
+
+Alternatively, the current behavior might have been intended to use the date format's time zone when available, but the bug was that this led to unexpected changes in the time zone. 
+
+In conclusion, the issue is that in version 2.6, the time zone was being set based on the date format, whereas in earlier versions, it wasn't. To replicate the old behavior, we need to ensure that the time zone isn't changed when setting the date format. Therefore, the fix would involve modifying the line to not use the date format's time zone
