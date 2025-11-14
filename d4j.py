@@ -322,6 +322,10 @@ MODEL_CONFIGS = {
         'base_model': 'merged_models/qwen8b-paft',
         'adapter_path': None
     },
+    'qwen8b-sft': {
+        'base_model': 'merged_models/qwen8b-sft',
+        'adapter_path': None
+    },
     'opencoder8b': {
         'base_model': 'infly/OpenCoder-8B-Instruct',
         'adapter_path': None
