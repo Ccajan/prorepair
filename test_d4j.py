@@ -1390,14 +1390,14 @@ def print_detailed_diff_comparison(stats1, stats2, model_id1, model_id2):
         ('Avg hunks', 'total_hunks', True),
         ('Avg added lines', 'total_added', True),
         ('Avg deleted lines', 'total_deleted', True),
-        ('Avg total changed lines', 'total_changed_lines', True),
+        ('ATCL', 'total_changed_lines', True),
         ('Avg added tokens', 'total_added_tokens', True),
         ('Avg deleted tokens', 'total_deleted_tokens', True),
-        ('Avg total changed tokens', 'total_changed_tokens', True),
-        ('Avg edit distance', 'total_edit_distance', True),
+        ('ATCT', 'total_changed_tokens', True),
+        ('AED', 'total_edit_distance', True),
         ('Avg edit similarity (%)', 'total_edit_similarity', True),
         ('Avg normalized edit distance', 'total_norm_edit_distance', True),
-        ('Avg preserved ratio (%)', 'total_preserved', True)
+        ('CCR (%)', 'total_preserved', True)
     ]
     
     for metric_name, key, show_diff in metrics:
@@ -1505,7 +1505,7 @@ def calc_diff_stats(buggy, fix):
     - norm_edit_distance_pct: 归一化编辑距离百分比
     - buggy_length: buggy代码字符数
     - fix_length: fix代码字符数
-    - preserved_ratio: 代码保留比例 (%)
+    - preserved_ratio: CCR代码一致性比率 (%)
     """
     if not buggy or not fix:
         return {
@@ -1582,7 +1582,7 @@ def calc_diff_stats(buggy, fix):
 
 def print_diff_stats(diff_stats):
     """打印补丁的差异统计信息"""
-    print(f"[DIFF STATS]   | Added: {diff_stats['added_lines']}, Deleted: {diff_stats['deleted_lines']}, Preserved: {diff_stats['preserved_ratio']}%")
+    print(f"[DIFF STATS]   | Added: {diff_stats['added_lines']}, Deleted: {diff_stats['deleted_lines']}, CCR: {diff_stats['preserved_ratio']}%")
 
 def print_diff_statistics_summary(stats_dict, title):
     """打印diff统计汇总信息（只针对PLAUSIBLE补丁）
@@ -1605,16 +1605,16 @@ def print_diff_statistics_summary(stats_dict, title):
     print(f"{'Hunks per patch':<40} | {stats_dict['total_hunks']/patch_count:>15.2f}")
     print(f"{'Lines added per patch':<40} | {stats_dict['total_added']/patch_count:>15.2f}")
     print(f"{'Lines deleted per patch':<40} | {stats_dict['total_deleted']/patch_count:>15.2f}")
-    print(f"{'Total changed lines per patch':<40} | {stats_dict['total_changed_lines']/patch_count:>15.2f}")
+    print(f"{'ATCL per patch':<40} | {stats_dict['total_changed_lines']/patch_count:>15.2f}")
     print(f"{'Tokens added per patch':<40} | {stats_dict['total_added_tokens']/patch_count:>15.2f}")
     print(f"{'Tokens deleted per patch':<40} | {stats_dict['total_deleted_tokens']/patch_count:>15.2f}")
-    print(f"{'Total changed tokens per patch':<40} | {stats_dict['total_changed_tokens']/patch_count:>15.2f}")
-    print(f"{'Edit distance per patch':<40} | {stats_dict['total_edit_distance']/patch_count:>15.2f}")
+    print(f"{'ATCT per patch':<40} | {stats_dict['total_changed_tokens']/patch_count:>15.2f}")
+    print(f"{'AED per patch':<40} | {stats_dict['total_edit_distance']/patch_count:>15.2f}")
     print(f"{'Edit similarity (%)':<40} | {stats_dict['total_edit_similarity']/patch_count:>15.2f}")
     print(f"{'Normalized edit distance':<40} | {stats_dict['total_norm_edit_distance']/patch_count:>15.4f}")
-    print(f"{'Code preserved ratio (%)':<40} | {stats_dict['total_preserved']/patch_count:>15.2f}")
+    print(f"{'CCR (%)':<40} | {stats_dict['total_preserved']/patch_count:>15.2f}")
     
-    print(f"\n{'Distribution of code preservation ratio:':}")
+    print(f"\n{'Distribution of CCR:':}")
     total = sum(dist.values())
     if total > 0:
         print(f"  Minimal change   (>95% preserved):   {dist['high']:3d} patches ({dist['high']/total*100:5.1f}%)")
