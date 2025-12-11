@@ -953,25 +953,13 @@ def validate_defects4j(model_id, n_generations):
     previous_results = load_previous_results(model_id)
     print(f"[INFO] Loaded {len(previous_results)} previously validated bugs")
     
-    # 找出缺失的bug，并为它们创建空结果（计入分母）
+    # 找出缺失的bug（先不创建占位符，等验证完成后再处理）
+    missing_bugs_initial = set()
     if dataset_bugs:
         validated_bugs = set(previous_results.keys())
-        missing_bugs = dataset_bugs - validated_bugs
-        if missing_bugs:
-            print(f"[WARNING] {len(missing_bugs)} bugs in dataset but not validated:")
-            for bug_id in sorted(missing_bugs):
-                print(f"  - {bug_id}")
-                # 为缺失的bug创建空结果（10个失败的占位符）
-                previous_results[bug_id] = [
-                    {
-                        'patch_code': '/* NO LLM OUTPUT */',
-                        'patch_status': 'NO_OUTPUT',
-                        'failing_tests': {'TRIGGER': [], 'RELEVANT': [], 'TIMEOUT': []},
-                        'val_cnt': 0,
-                        'bug_name': bug_id,
-                        'diff_stats': None
-                    }
-                ] * 10  # 创建10个相同的占位符
+        missing_bugs_initial = dataset_bugs - validated_bugs
+        if missing_bugs_initial:
+            print(f"[INFO] {len(missing_bugs_initial)} bugs in dataset not yet validated")
     
     for bug_id, results in previous_results.items():
         stats.update(bug_id, results)
@@ -1016,7 +1004,8 @@ def validate_defects4j(model_id, n_generations):
                 'loc': None,
                 'start': None,
                 'end': None,
-                'buggy': ''
+                'buggy': '',
+                'has_any_output': False  # 标记是否有任何LLM输出
             }
             
             # 从dataset目录读取buggy代码和位置信息
@@ -1038,6 +1027,7 @@ def validate_defects4j(model_id, n_generations):
             
             patch_added = False
             if os.path.exists(json_file):
+                candidate_patches[bug_id]['has_any_output'] = True  # 标记有LLM输出文件
                 try:
                     with open(json_file) as f:
                         patch_info = json.load(f)
@@ -1072,32 +1062,34 @@ def validate_defects4j(model_id, n_generations):
     # 现在所有bug都应该有10个补丁（真实的或None占位符）
     filtered_candidates = {}
     skipped_bugs = []
-    incomplete_bugs = []  # 记录有缺失补丁的bug
+    bugs_with_partial_output = []  # 有LLM输出但不足10个的bug（会被跳过）
     
     for bug_id, patch_info in candidate_patches.items():
         num_patches = len(patch_info['patches'])
+        none_count = sum(1 for p in patch_info['patches'] if p is None)
         
-        if num_patches == 10:
-            # 检查是否有None占位符
-            none_count = sum(1 for p in patch_info['patches'] if p is None)
-            if none_count > 0:
-                incomplete_bugs.append((bug_id, none_count))
-            
-            # 只要有基本信息就可以验证
+        if num_patches == 10 and none_count == 0:
+            # 有完整的10个补丁，可以验证
             if patch_info['loc'] and patch_info['buggy']:
                 filtered_candidates[bug_id] = patch_info
             else:
                 skipped_bugs.append((bug_id, num_patches, "Missing loc or buggy info"))
+        elif patch_info['has_any_output']:
+            # 有LLM输出但不足10个完整补丁，跳过（不加入分母）
+            real_patches = num_patches - none_count
+            bugs_with_partial_output.append((bug_id, real_patches))
+            skipped_bugs.append((bug_id, real_patches, f"Incomplete: only {real_patches}/10 patches"))
         else:
-            skipped_bugs.append((bug_id, num_patches, f"Expected 10, got {num_patches}"))
+            # 完全没有LLM输出，之后会加NO_OUTPUT占位符
+            pass
     
-    if incomplete_bugs:
-        print("\n[INCOMPLETE BUGS] (some patches missing but will be tested)")
-        print(f"{'Bug ID':20} | {'Missing Patches':16}")
+    if bugs_with_partial_output:
+        print("\n[INCOMPLETE OUTPUT] (bugs with partial LLM output, will be skipped)")
+        print(f"{'Bug ID':20} | {'Valid Patches':16}")
         print("-" * 40)
-        for bug_id, missing_count in sorted(incomplete_bugs):
-            print(f"{bug_id:20} | {missing_count:16}")
-        print(f"\nTotal incomplete: {len(incomplete_bugs)} bugs (will mark missing patches as FAILED)")
+        for bug_id, patch_count in sorted(bugs_with_partial_output):
+            print(f"{bug_id:20} | {patch_count:16}/10")
+        print(f"\nTotal incomplete: {len(bugs_with_partial_output)} bugs (will NOT be included in statistics)")
     
     if skipped_bugs:
         print("\n[SKIPPED BUGS] (cannot be validated)")
@@ -1118,40 +1110,73 @@ def validate_defects4j(model_id, n_generations):
     
     if remaining_bugs == 0:
         print("[INFO] No new bugs to validate")
-        return
-
-    max_workers = min(multiprocessing.cpu_count(), 4)
-    print(f"[INFO] Using {max_workers} workers for parallel validation")
-    
-    validated_count = 0
-    total_count = len(filtered_candidates)
-    results_lock = threading.Lock()
-    
-    with cf.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_bug = {
-            executor.submit(validate_patches_per_bug, (bug_name, patch_info), model_id): bug_name 
-            for bug_name, patch_info in sorted(filtered_candidates.items())
-        }
+    else:
+        max_workers = min(multiprocessing.cpu_count(), 4)
+        print(f"[INFO] Using {max_workers} workers for parallel validation")
         
-        for future in cf.as_completed(future_to_bug):
-            bug_name = future_to_bug[future]
-            try:
-                results = future.result()
-                
-                with results_lock:
-                    validated_count += 1
-                    stats.update(bug_name, results)
+        validated_count = 0
+        total_count = len(filtered_candidates)
+        results_lock = threading.Lock()
+        
+        with cf.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_bug = {
+                executor.submit(validate_patches_per_bug, (bug_name, patch_info), model_id): bug_name 
+                for bug_name, patch_info in sorted(filtered_candidates.items())
+            }
+            
+            for future in cf.as_completed(future_to_bug):
+                bug_name = future_to_bug[future]
+                try:
+                    results = future.result()
                     
-                    top1, top5, top10 = stats.get_success_rate()
-                    print(f"\n[CURRENT PROGRESS] Validated {validated_count}/{total_count} bugs")
-                    pass1, pass5, pass10 = stats.get_pass_at_k()
-                    print(f"[CURRENT SUCCESS RATE] Top-1: {top1:.2f}% | Top-5: {top5:.2f}% | Top-10: {top10:.2f}%")
-                    print(f"[CURRENT PASS@K] pass@1: {pass1:.2f}% | pass@5: {pass5:.2f}% | pass@10: {pass10:.2f}%")
-                    print("=" * 100)
-                    
-            except Exception as e:
-                print(f"Exception when validating {bug_name}: {str(e)}")
-                traceback.print_exc()
+                    with results_lock:
+                        validated_count += 1
+                        stats.update(bug_name, results)
+                        
+                        top1, top5, top10 = stats.get_success_rate()
+                        print(f"\n[CURRENT PROGRESS] Validated {validated_count}/{total_count} bugs")
+                        pass1, pass5, pass10 = stats.get_pass_at_k()
+                        print(f"[CURRENT SUCCESS RATE] Top-1: {top1:.2f}% | Top-5: {top5:.2f}% | Top-10: {top10:.2f}%")
+                        print(f"[CURRENT PASS@K] pass@1: {pass1:.2f}% | pass@5: {pass5:.2f}% | pass@10: {pass10:.2f}%")
+                        print("=" * 100)
+                        
+                except Exception as e:
+                    print(f"Exception when validating {bug_name}: {str(e)}")
+                    traceback.print_exc()
+    
+    # 验证完成后，为完全没有LLM输出的bug添加NO_OUTPUT占位符
+    if dataset_bugs:
+        currently_validated = set(stats.bug_results.keys())
+        bugs_without_any_output = set()
+        
+        # 从dataset中的所有bug里，找出完全没有LLM输出的
+        for bug_id in dataset_bugs:
+            if bug_id not in currently_validated:
+                # 检查是否在candidate_patches中且has_any_output为False
+                if bug_id in candidate_patches:
+                    if not candidate_patches[bug_id]['has_any_output']:
+                        bugs_without_any_output.add(bug_id)
+                else:
+                    # 不在candidate_patches中，说明完全没有发现任何输出文件
+                    bugs_without_any_output.add(bug_id)
+        
+        if bugs_without_any_output:
+            print(f"\n[INFO] Adding NO_OUTPUT placeholders for {len(bugs_without_any_output)} bugs without any LLM output:")
+            for bug_id in sorted(bugs_without_any_output):
+                print(f"  - {bug_id}")
+            
+            no_output_result = [
+                {
+                    'patch_code': '/* NO LLM OUTPUT */',
+                    'patch_status': 'NO_OUTPUT',
+                    'failing_tests': {'TRIGGER': [], 'RELEVANT': [], 'TIMEOUT': []},
+                    'val_cnt': 0,
+                    'bug_name': '',
+                    'diff_stats': None
+                }
+            ] * 10
+            for bug_id in bugs_without_any_output:
+                stats.update(bug_id, no_output_result)
     
     pass1, pass5, pass10 = stats.get_pass_at_k()
     
@@ -1207,7 +1232,7 @@ def load_and_compare_results(model_id1, model_id2, min_patches=1):
     except Exception as e:
         print(f"[WARNING] Failed to load time.jsonl: {e}")
 
-    # 加载dataset中所有的bug
+    # 加载dataset中所有的bug（用于统计覆盖率）
     dataset_dir = 'defects4j/dataset'
     dataset_bugs = set()
     if os.path.exists(dataset_dir):
@@ -1218,27 +1243,13 @@ def load_and_compare_results(model_id1, model_id2, min_patches=1):
     results1 = load_previous_results(model_id1)
     results2 = load_previous_results(model_id2)
     
-    # 为缺失的bug添加NO_OUTPUT占位符（确保所有dataset中的bug都在分母中）
-    no_output_placeholder = [
-        {
-            'patch_code': '/* NO LLM OUTPUT */',
-            'patch_status': 'NO_OUTPUT',
-            'failing_tests': {'TRIGGER': [], 'RELEVANT': [], 'TIMEOUT': []},
-            'val_cnt': 0,
-            'bug_name': '',
-            'diff_stats': None
-        }
-    ] * 10
+    # 不再为缺失的bug添加NO_OUTPUT占位符
+    # 只统计真正有完整10个补丁的bug
     
-    for bug_id in dataset_bugs:
-        if bug_id not in results1:
-            results1[bug_id] = no_output_placeholder.copy()
-        if bug_id not in results2:
-            results2[bug_id] = no_output_placeholder.copy()
-    
+    # 只取恰好有 min_patches 个补丁的bugs（默认10个）
     filtered_results1 = {bug_id: results for bug_id, results in results1.items() 
-                        if len(results) >= min_patches}
-    filtered_results2 = {bug_id: results for bug_id, results in results2.items() if len(results) >= min_patches}
+                        if len(results) == min_patches}
+    filtered_results2 = {bug_id: results for bug_id, results in results2.items() if len(results) == min_patches}
     
     bug_lengths = {}
     for bug_id in filtered_results1.keys() | filtered_results2.keys():
@@ -1260,13 +1271,15 @@ def load_and_compare_results(model_id1, model_id2, min_patches=1):
             except Exception as e2:
                 print(f"[WARNING] Failed to load patch info for {bug_id}: {e2}")
     
-    # 包含所有有任一模型输出的bug（不要求共同）
-    all_bugs = sorted(set(filtered_results1.keys()) | set(filtered_results2.keys()))
+    # 计算共同的bugs和各自独有的bugs
     common_bugs = set(filtered_results1.keys()) & set(filtered_results2.keys())
+    only_in_1 = set(filtered_results1.keys()) - set(filtered_results2.keys())
+    only_in_2 = set(filtered_results2.keys()) - set(filtered_results1.keys())
+    all_bugs = sorted(set(filtered_results1.keys()) | set(filtered_results2.keys()))
     
     print("\n[VALIDATION COMPARISON SUMMARY]")
     print("=" * 145)
-    print(f"Total bugs: {len(all_bugs)} (Common: {len(common_bugs)}, Only {model_id1}: {len(set(filtered_results1.keys()) - set(filtered_results2.keys()))}, Only {model_id2}: {len(set(filtered_results2.keys()) - set(filtered_results1.keys()))})")
+    print(f"Total bugs: {len(all_bugs)} (Common: {len(common_bugs)}, Only {model_id1}: {len(only_in_1)}, Only {model_id2}: {len(only_in_2)})")
     print("=" * 145)
     print(f"{'Bug ID':20} | {'Date':10} | {'Length':8} | {model_id1:^15} | {model_id2:^15} | {'Notes':20}")
     print("-" * 145)
@@ -1281,39 +1294,29 @@ def load_and_compare_results(model_id1, model_id2, min_patches=1):
         position1 = ""
         if bug_id in filtered_results1:
             results = filtered_results1[bug_id]
-            # 检查是否是NO_OUTPUT
-            if results and results[0].get('patch_status') == 'NO_OUTPUT':
-                status1 = "NO_OUTPUT"
-            else:
-                for idx, patch in enumerate(results, 1):
-                    if patch.get('patch_status') == 'PLAUSIBLE':
-                        status1 = f"PLAUSIBLE({idx})"
-                        break
-                if status1 == "N/A":
-                    status1 = "FAILED"
+            for idx, patch in enumerate(results, 1):
+                if patch.get('patch_status') == 'PLAUSIBLE':
+                    status1 = f"PLAUSIBLE({idx})"
+                    break
+            if status1 == "N/A":
+                status1 = "FAILED"
         
         status2 = "N/A"
         position2 = ""
         if bug_id in filtered_results2:
             results = filtered_results2[bug_id]
-            # 检查是否是NO_OUTPUT
-            if results and results[0].get('patch_status') == 'NO_OUTPUT':
-                status2 = "NO_OUTPUT"
-            else:
-                for idx, patch in enumerate(results, 1):
-                    if patch.get('patch_status') == 'PLAUSIBLE':
-                        status2 = f"PLAUSIBLE({idx})"
-                        break
-                if status2 == "N/A":
-                    status2 = "FAILED"
+            for idx, patch in enumerate(results, 1):
+                if patch.get('patch_status') == 'PLAUSIBLE':
+                    status2 = f"PLAUSIBLE({idx})"
+                    break
+            if status2 == "N/A":
+                status2 = "FAILED"
         
         notes = ""
-        if status1 == "NO_OUTPUT" and status2 == "NO_OUTPUT":
-            notes = "Both no output"
-        elif status1 == "NO_OUTPUT":
-            notes = f"Only {model_id2} output"
-        elif status2 == "NO_OUTPUT":
-            notes = f"Only {model_id1} output"
+        if status1 == "N/A" and status2 != "N/A":
+            notes = f"Only in {model_id2}"
+        elif status1 != "N/A" and status2 == "N/A":
+            notes = f"Only in {model_id1}"
         elif 'PLAUSIBLE' in status1 and 'PLAUSIBLE' in status2:
             notes = "Fixed by both"
         elif 'PLAUSIBLE' in status1:
@@ -1321,18 +1324,16 @@ def load_and_compare_results(model_id1, model_id2, min_patches=1):
         elif 'PLAUSIBLE' in status2:
             notes = f"Only fixed by {model_id2}"
         
-        status1_color = '\033[92m' if 'PLAUSIBLE' in status1 else '\033[91m' if status1 == 'FAILED' else '\033[93m' if status1 == 'NO_OUTPUT' else '\033[0m'
-        status2_color = '\033[92m' if 'PLAUSIBLE' in status2 else '\033[91m' if status2 == 'FAILED' else '\033[93m' if status2 == 'NO_OUTPUT' else '\033[0m'
+        status1_color = '\033[92m' if 'PLAUSIBLE' in status1 else '\033[91m' if status1 == 'FAILED' else '\033[0m'
+        status2_color = '\033[92m' if 'PLAUSIBLE' in status2 else '\033[91m' if status2 == 'FAILED' else '\033[0m'
         
         print(f"{bug_id:20} | {date:10} | {length:>8} | {status1_color}{status1:^15}\033[0m | {status2_color}{status2:^15}\033[0m | {notes:20}")
     
     print("=" * 145)
     
-    # 排除NO_OUTPUT的bug进行统计
-    bugs_with_output1 = {bug_id for bug_id, results in filtered_results1.items()
-                        if not (results and results[0].get('patch_status') == 'NO_OUTPUT')}
-    bugs_with_output2 = {bug_id for bug_id, results in filtered_results2.items()
-                        if not (results and results[0].get('patch_status') == 'NO_OUTPUT')}
+    # filtered_results只包含有完整 min_patches 个补丁的bug
+    bugs_with_patches1 = set(filtered_results1.keys())
+    bugs_with_patches2 = set(filtered_results2.keys())
     
     fixed_bugs1 = {bug_id for bug_id, results in filtered_results1.items() 
                   if any(patch.get('patch_status') == 'PLAUSIBLE' for patch in results)}
@@ -1344,9 +1345,9 @@ def load_and_compare_results(model_id1, model_id2, min_patches=1):
     only_fixed_by_2 = fixed_bugs2 - fixed_bugs1
     
     print(f"\n[DATA COVERAGE]")
-    print(f"Model {model_id1} bugs with LLM output: {len(bugs_with_output1)}")
-    print(f"Model {model_id2} bugs with LLM output: {len(bugs_with_output2)}")
-    print(f"Common bugs (both have output): {len(bugs_with_output1 & bugs_with_output2)}")
+    print(f"Model {model_id1} bugs with {min_patches} complete patches: {len(bugs_with_patches1)}")
+    print(f"Model {model_id2} bugs with {min_patches} complete patches: {len(bugs_with_patches2)}")
+    print(f"Common bugs (both have {min_patches} patches): {len(common_bugs)}")
     print(f"Total bugs in dataset: {len(dataset_bugs)}")
     
     print(f"\n[FIX STATISTICS]")
@@ -1358,14 +1359,13 @@ def load_and_compare_results(model_id1, model_id2, min_patches=1):
     
     filtered_stats1, filtered_stats2 = ValidationStats(), ValidationStats()
     
-    # 统计所有有输出的bug（不只是common的）
-    for bug_id in all_bugs:
-        if bug_id in filtered_results1 and bug_id in bugs_with_output1:
-            filtered_stats1.update(bug_id, filtered_results1[bug_id])
-        if bug_id in filtered_results2 and bug_id in bugs_with_output2:
-            filtered_stats2.update(bug_id, filtered_results2[bug_id])
+    # 【关键修改】只在两个模型共同拥有的bugs上统计，确保公平对比
+    # 这样两个模型的 pass@k 使用相同的分母，差值将是 1/len(common_bugs) 的整数倍
+    for bug_id in sorted(common_bugs):
+        filtered_stats1.update(bug_id, filtered_results1[bug_id])
+        filtered_stats2.update(bug_id, filtered_results2[bug_id])
     
-    return filtered_stats1, filtered_stats2
+    return filtered_stats1, filtered_stats2, len(dataset_bugs)
 
 def print_detailed_diff_comparison(stats1, stats2, model_id1, model_id2):
     """打印两个模型的详细diff统计对比"""
@@ -1428,13 +1428,29 @@ def print_detailed_diff_comparison(stats1, stats2, model_id1, model_id2):
     
     print("=" * 120)
 
-def print_comparison_results(stats1, stats2, model_id1, model_id2):
+def print_comparison_results(stats1, stats2, model_id1, model_id2, dataset_bugs_count):
     # 先打印详细的diff统计对比
     print_detailed_diff_comparison(stats1, stats2, model_id1, model_id2)
     
     # 再打印 Pass@k 对比
     print("\n[COMPARISON RESULTS - Pass@k]")
     print("=" * 80)
+    
+    # 统计有完整10个补丁的bug数（现在两个stats对象应该包含相同的bugs）
+    bugs_with_10_patches_1 = sum(1 for bug_id, results in stats1.bug_results.items() if len(results) == 10)
+    bugs_with_10_patches_2 = sum(1 for bug_id, results in stats2.bug_results.items() if len(results) == 10)
+    
+    print(f"Dataset total bugs: {dataset_bugs_count}")
+    print(f"")
+    print(f"  {model_id1}: {bugs_with_10_patches_1} bugs with 10 complete patches (used in pass@k)")
+    print(f"  {model_id2}: {bugs_with_10_patches_2} bugs with 10 complete patches (used in pass@k)")
+    
+    # 验证两个模型统计的是相同的bugs集合
+    if bugs_with_10_patches_1 == bugs_with_10_patches_2:
+        print(f"  Note: Comparison is based on {bugs_with_10_patches_1} common bugs where both models have 10 patches")
+    else:
+        print(f"  WARNING: Bug counts don't match! This suggests a logic error.")
+    print("-" * 80)
     print(f"{'Metric':15} | {model_id1:>15} | {model_id2:>15} | {'Diff':>10}")
     print("-" * 80)
     
@@ -1454,7 +1470,7 @@ def print_comparison_results(stats1, stats2, model_id1, model_id2):
         print(f"{metric_name:15} | {val1:>14.2f}% | {val2:>14.2f}% | {color}{diff_str:>10}\033[0m")
     
     print("=" * 80)
-    print(f"Total bugs compared: {stats1.total_bugs}")
+    print(f"Note: pass@k is calculated based on common bugs where both models have 10 complete patches")
 
 def count_tokens(text):
     """简单的token计数，使用空格和常见分隔符分割"""
@@ -1711,8 +1727,8 @@ if __name__ == '__main__':
         print(f"\n[COMPARE MODE] Comparing {args.model_id} vs {args.compare}")
         print(f"[FILTER] Only comparing bugs with >={args.min_patches} patches\n")
         
-        stats1, stats2 = load_and_compare_results(args.model_id, args.compare, args.min_patches)
-        print_comparison_results(stats1, stats2, args.model_id, args.compare)
+        stats1, stats2, dataset_bugs_count = load_and_compare_results(args.model_id, args.compare, args.min_patches)
+        print_comparison_results(stats1, stats2, args.model_id, args.compare, dataset_bugs_count)
         
     elif args.recalc:
         # 重新计算diff统计和Pass@k

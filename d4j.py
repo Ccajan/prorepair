@@ -384,6 +384,18 @@ MODEL_CONFIGS = {
         'base_model': 'merged_models/sft_deepseek7b_prorepair',
         'adapter_path': None
     },
+    'deepseek-6.7b-trained-prorepair-0.0': {
+        'base_model': 'merged_models/sft_deepseek7b_prorepair_0.0',
+        'adapter_path': None
+    },
+    'deepseek-6.7b-trained-prorepair-0.5': {
+        'base_model': 'merged_models/sft_deepseek7b_prorepair_0.5',
+        'adapter_path': None
+    },
+    'deepseek-6.7b-trained-prorepair-4.0': {
+        'base_model': 'merged_models/sft_deepseek7b_prorepair_4.0',
+        'adapter_path': None
+    },
     'qwen-4b-trained-prorepair': {
         'base_model': 'merged_models/sft_qwen4b_parepair',
         'adapter_path': None
